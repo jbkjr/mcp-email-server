@@ -938,7 +938,6 @@ class TestEmailClientFolderEdgeCases:
 
     def test_parse_list_response_folder_constructor_exception(self, email_client):
         """Test _parse_list_response handles Folder constructor exception (covers 827-828)."""
-        from mcp_email_server.emails.models import Folder
 
         # Mock Folder to raise an exception
         with patch("mcp_email_server.emails.classic.Folder", side_effect=ValueError("Test error")):
