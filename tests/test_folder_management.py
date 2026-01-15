@@ -22,7 +22,6 @@ from mcp_email_server.emails.models import (
     FolderOperationResponse,
 )
 
-
 # ============================================================================
 # MCP Tool Tests - Permission Checks
 # ============================================================================
@@ -473,7 +472,7 @@ class TestEmailClientFolders:
             assert result[0].name == "INBOX"
             assert result[1].name == "Sent"
             assert "\\Sent" in result[1].flags
-            mock_imap.list.assert_called_once_with('""', '*')
+            mock_imap.list.assert_called_once_with('""', "*")
 
     @pytest.mark.asyncio
     async def test_copy_emails(self, email_client):
