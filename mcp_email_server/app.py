@@ -294,7 +294,9 @@ async def create_folder(
     return await handler.create_folder(folder_name)
 
 
-@mcp.tool(description="Delete a folder/mailbox. The folder must be empty on most IMAP servers. Requires enable_folder_management=true.")
+@mcp.tool(
+    description="Delete a folder/mailbox. The folder must be empty on most IMAP servers. Requires enable_folder_management=true."
+)
 async def delete_folder(
     account_name: Annotated[str, Field(description="The name of the email account.")],
     folder_name: Annotated[str, Field(description="The name of the folder to delete.")],
