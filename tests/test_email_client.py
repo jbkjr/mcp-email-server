@@ -477,6 +477,14 @@ class TestParseDateFromHeader:
         assert isinstance(result, datetime)
         assert result.tzinfo == timezone.utc
 
+    def test_parse_date_exception(self, email_client):
+        """Test exception path in date parsing (covers 219-220)."""
+        # Mock parsedate_tz to raise an exception
+        with patch("email.utils.parsedate_tz", side_effect=Exception("Parse error")):
+            result = email_client._parse_date_from_header("Mon, 1 Jan 2024 12:00:00 +0000")
+            assert isinstance(result, datetime)
+            assert result.tzinfo == timezone.utc
+
     def test_parse_empty_date(self, email_client):
         """Test parsing empty string returns current time."""
         result = email_client._parse_date_from_header("")
@@ -556,6 +564,26 @@ class TestBatchFetchDates:
         assert result[0][0] == "1"
         assert result[0][1].year == 2024
         assert result[1][0] == "2"
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_dates_skips_non_bytes_items(self, email_client):
+        """Test batch fetch dates skips items that aren't bytearray or bytes (covers 267->254)."""
+        mock_imap = AsyncMock()
+        # Include None and other non-bytes items that should be skipped
+        date_response = [
+            None,  # Should be skipped (not bytearray or bytes)
+            b"1 FETCH (UID 1 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"),
+            123,  # Should be skipped (not bytearray or bytes)
+            b")",
+        ]
+        mock_imap.uid = AsyncMock(return_value=(None, date_response))
+
+        result = await email_client._batch_fetch_dates(mock_imap, [b"1"])
+
+        assert len(result) == 1
+        assert result[0][0] == "1"
+        assert result[0][1].year == 2024
 
 
 class TestBatchFetchHeaders:
@@ -648,6 +676,28 @@ class TestBatchFetchHeaders:
         assert len(result) == 1
         assert result[0]["email_id"] == "1"
 
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_skips_non_bytes_items(self, email_client):
+        """Test batch fetch headers skips items that aren't bytearray or bytes (covers 321->314)."""
+        mock_imap = AsyncMock()
+        # Include None and other non-bytes items that should be skipped
+        header_response = [
+            None,  # Should be skipped (not bytearray or bytes)
+            b"1 FETCH (UID 1 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            123,  # Should be skipped (not bytearray or bytes)
+            b")",
+        ]
+        mock_imap.uid = AsyncMock(return_value=(None, header_response))
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["1"])
+
+        assert len(result) == 1
+        assert result[0]["email_id"] == "1"
+        assert result[0]["subject"] == "Test"
+
 
 class TestParseHeaderToMetadata:
     """Tests for header parsing helper."""
@@ -679,6 +729,36 @@ class TestParseHeaderToMetadata:
             mock_parser.return_value.parsebytes.side_effect = Exception("Parse error")
             result = email_client._parse_header_to_metadata("123", b"invalid")
             assert result is None
+
+    def test_parse_header_empty_to(self, email_client):
+        """Test parsing headers with empty To field (covers 356->359 branch)."""
+        # Email with no To header - only From, Subject, Date
+        raw_headers = b"From: sender@example.com\r\nSubject: Test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+        result = email_client._parse_header_to_metadata("123", raw_headers)
+
+        assert result["email_id"] == "123"
+        assert result["from"] == "sender@example.com"
+        assert result["to"] == []  # Empty To list when header is missing
+
+
+class TestAppendHeaderMetadata:
+    """Tests for _append_header_metadata helper."""
+
+    def test_append_header_metadata_success(self, email_client):
+        """Test appending valid metadata to results."""
+        results = []
+        raw_headers = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+        email_client._append_header_metadata(results, "123", raw_headers)
+        assert len(results) == 1
+        assert results[0]["email_id"] == "123"
+
+    def test_append_header_metadata_none(self, email_client):
+        """Test that None metadata is not appended (covers 341->exit branch)."""
+        results = []
+        # Mock _parse_header_to_metadata to return None
+        with patch.object(email_client, "_parse_header_to_metadata", return_value=None):
+            email_client._append_header_metadata(results, "123", b"invalid")
+        assert len(results) == 0  # Nothing appended
 
 
 class TestGetEmailsStreamWithSort:
