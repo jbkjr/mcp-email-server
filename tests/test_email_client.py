@@ -915,3 +915,72 @@ class TestGetEmailsStreamWithSort:
 
             # Should still get results via fallback
             assert len(emails) == 2
+
+
+class TestDeleteEmails:
+    """Tests for delete_emails functionality."""
+
+    @pytest.mark.asyncio
+    async def test_delete_emails_success(self, email_client):
+        """Test successful deletion of emails."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid = AsyncMock(return_value=(None, None))
+        mock_imap.expunge = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            deleted_ids, failed_ids = await email_client.delete_emails(["123", "456"])
+            assert deleted_ids == ["123", "456"]
+            assert failed_ids == []
+            mock_imap.expunge.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_emails_partial_failure(self, email_client):
+        """Test delete_emails with some failures."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.expunge = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        call_count = [0]
+
+        def uid_side_effect(*args):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (None, None)
+            else:
+                raise OSError("IMAP error")
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            deleted_ids, failed_ids = await email_client.delete_emails(["123", "456"])
+            assert deleted_ids == ["123"]
+            assert failed_ids == ["456"]
+
+    @pytest.mark.asyncio
+    async def test_delete_emails_logout_error(self, email_client):
+        """Test delete_emails handles logout errors gracefully."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid = AsyncMock(return_value=(None, None))
+        mock_imap.expunge = AsyncMock()
+        mock_imap.logout = AsyncMock(side_effect=OSError("Connection closed"))
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            deleted_ids, failed_ids = await email_client.delete_emails(["123"])
+            assert deleted_ids == ["123"]
+            assert failed_ids == []

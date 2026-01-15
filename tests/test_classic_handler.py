@@ -364,3 +364,41 @@ class TestClassicEmailHandler:
 
             # Verify the client method was called correctly
             mock_get_body.assert_called_once_with("123", "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_returns_none(self, classic_handler):
+        """Test get_emails_content handles None response (covers 1107-1108)."""
+        # Mock the get_email_body_by_id method to return None
+        mock_get_body = AsyncMock(return_value=None)
+
+        with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get_body):
+            result = await classic_handler.get_emails_content(
+                email_ids=["123"],
+                mailbox="INBOX",
+            )
+
+            # Verify the result
+            assert isinstance(result, EmailContentBatchResponse)
+            assert len(result.emails) == 0
+            assert result.requested_count == 1
+            assert result.retrieved_count == 0
+            assert result.failed_ids == ["123"]
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_exception(self, classic_handler):
+        """Test get_emails_content handles exception (covers 1109-1111)."""
+        # Mock the get_email_body_by_id method to raise an exception
+        mock_get_body = AsyncMock(side_effect=Exception("Connection error"))
+
+        with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get_body):
+            result = await classic_handler.get_emails_content(
+                email_ids=["123", "456"],
+                mailbox="INBOX",
+            )
+
+            # Verify the result - both emails should fail
+            assert isinstance(result, EmailContentBatchResponse)
+            assert len(result.emails) == 0
+            assert result.requested_count == 2
+            assert result.retrieved_count == 0
+            assert result.failed_ids == ["123", "456"]
