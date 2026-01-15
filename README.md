@@ -78,6 +78,7 @@ You can also configure the email server using environment variables, which is pa
 | `MCP_EMAIL_SERVER_SMTP_SSL`                   | Enable SMTP SSL                                  | `true`        | No       |
 | `MCP_EMAIL_SERVER_SMTP_START_SSL`             | Enable STARTTLS                                  | `false`       | No       |
 | `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD` | Enable attachment download                       | `false`       | No       |
+| `MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT`   | Enable folder management tools                   | `false`       | No       |
 | `MCP_EMAIL_SERVER_SAVE_TO_SENT`               | Save sent emails to IMAP Sent folder             | `true`        | No       |
 | `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`           | Custom Sent folder name (auto-detect if not set) | -             | No       |
 
@@ -113,6 +114,39 @@ enable_attachment_download = true
 ```
 
 Once enabled, you can use the `download_attachment` tool to save email attachments to a specified path.
+
+### Enabling Folder Management
+
+By default, folder management tools (list, create, delete, rename folders, and move/copy emails) are disabled for security reasons. To enable these features:
+
+**Option 1: Environment Variable**
+
+```json
+{
+  "mcpServers": {
+    "zerolib-email": {
+      "command": "uvx",
+      "args": ["mcp-email-server@latest", "stdio"],
+      "env": {
+        "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT": "true"
+      }
+    }
+  }
+}
+```
+
+**Option 2: TOML Configuration**
+
+Add `enable_folder_management = true` to your TOML configuration file (`~/.config/zerolib/mcp_email_server/config.toml`):
+
+```toml
+enable_folder_management = true
+
+[[emails]]
+# ... your email configuration
+```
+
+Once enabled, you can use the folder management tools: `list_folders`, `create_folder`, `delete_folder`, `rename_folder`, `move_emails`, and `copy_emails`.
 
 ### Saving Sent Emails to IMAP Sent Folder
 
@@ -216,6 +250,50 @@ await send_email(
 ```
 
 The `in_reply_to` parameter sets the `In-Reply-To` header, and `references` sets the `References` header. Both are used by email clients to thread conversations properly.
+
+### Managing Folders
+
+You can list, create, delete, and rename email folders:
+
+```python
+# List all folders
+folders = await list_folders(account_name="work")
+for folder in folders.folders:
+    print(f"{folder.name} (flags: {folder.flags})")
+
+# Create a new folder
+await create_folder(account_name="work", folder_name="Projects/2024")
+
+# Rename a folder
+await rename_folder(account_name="work", old_name="Old Name", new_name="New Name")
+
+# Delete a folder (must be empty on most servers)
+await delete_folder(account_name="work", folder_name="Old Folder")
+```
+
+### Moving and Copying Emails
+
+Move or copy emails between folders:
+
+```python
+# Move emails to a different folder
+await move_emails(
+    account_name="work",
+    email_ids=["123", "456"],
+    destination_folder="Archive",
+    source_mailbox="INBOX"
+)
+
+# Copy emails (preserves original) - useful for applying labels
+await copy_emails(
+    account_name="work",
+    email_ids=["123"],
+    destination_folder="Labels/Important",
+    source_mailbox="INBOX"
+)
+```
+
+**Note for Proton Mail users:** Proton Mail Bridge exposes labels as folders under `Labels/`. Copying an email to a label folder effectively applies that label while keeping the original in place.
 
 ## Development
 
