@@ -224,18 +224,30 @@ async def download_attachment(
     return await handler.download_attachment(email_id, attachment_name, save_path, mailbox)
 
 
+def _check_folder_management_enabled() -> None:
+    """Check if folder management is enabled, raise PermissionError if not."""
+    settings = get_settings()
+    if not settings.enable_folder_management:
+        msg = (
+            "Folder management is disabled. Set 'enable_folder_management=true' in settings "
+            "or 'MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true' environment variable to enable this feature."
+        )
+        raise PermissionError(msg)
+
+
 @mcp.tool(
-    description="List all folders/mailboxes for an email account. Returns folder names, hierarchy delimiters, and IMAP flags.",
+    description="List all folders/mailboxes for an email account. Returns folder names, hierarchy delimiters, and IMAP flags. Requires enable_folder_management=true.",
 )
 async def list_folders(
     account_name: Annotated[str, Field(description="The name of the email account.")],
 ) -> FolderListResponse:
+    _check_folder_management_enabled()
     handler = dispatch_handler(account_name)
     return await handler.list_folders()
 
 
 @mcp.tool(
-    description="Move one or more emails to a different folder. Uses IMAP MOVE command if supported, otherwise falls back to COPY + DELETE.",
+    description="Move one or more emails to a different folder. Uses IMAP MOVE command if supported, otherwise falls back to COPY + DELETE. Requires enable_folder_management=true.",
 )
 async def move_emails(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -248,12 +260,13 @@ async def move_emails(
         str, Field(default="INBOX", description="The source mailbox to move emails from.")
     ] = "INBOX",
 ) -> EmailMoveResponse:
+    _check_folder_management_enabled()
     handler = dispatch_handler(account_name)
     return await handler.move_emails(email_ids, destination_folder, source_mailbox)
 
 
 @mcp.tool(
-    description="Copy one or more emails to a different folder. The original emails remain in the source folder. Useful for applying labels in providers like Proton Mail.",
+    description="Copy one or more emails to a different folder. The original emails remain in the source folder. Useful for applying labels in providers like Proton Mail. Requires enable_folder_management=true.",
 )
 async def copy_emails(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -266,33 +279,37 @@ async def copy_emails(
         str, Field(default="INBOX", description="The source mailbox to copy emails from.")
     ] = "INBOX",
 ) -> EmailMoveResponse:
+    _check_folder_management_enabled()
     handler = dispatch_handler(account_name)
     return await handler.copy_emails(email_ids, destination_folder, source_mailbox)
 
 
-@mcp.tool(description="Create a new folder/mailbox.")
+@mcp.tool(description="Create a new folder/mailbox. Requires enable_folder_management=true.")
 async def create_folder(
     account_name: Annotated[str, Field(description="The name of the email account.")],
     folder_name: Annotated[str, Field(description="The name of the folder to create.")],
 ) -> FolderOperationResponse:
+    _check_folder_management_enabled()
     handler = dispatch_handler(account_name)
     return await handler.create_folder(folder_name)
 
 
-@mcp.tool(description="Delete a folder/mailbox. The folder must be empty on most IMAP servers.")
+@mcp.tool(description="Delete a folder/mailbox. The folder must be empty on most IMAP servers. Requires enable_folder_management=true.")
 async def delete_folder(
     account_name: Annotated[str, Field(description="The name of the email account.")],
     folder_name: Annotated[str, Field(description="The name of the folder to delete.")],
 ) -> FolderOperationResponse:
+    _check_folder_management_enabled()
     handler = dispatch_handler(account_name)
     return await handler.delete_folder(folder_name)
 
 
-@mcp.tool(description="Rename a folder/mailbox.")
+@mcp.tool(description="Rename a folder/mailbox. Requires enable_folder_management=true.")
 async def rename_folder(
     account_name: Annotated[str, Field(description="The name of the email account.")],
     old_name: Annotated[str, Field(description="The current folder name.")],
     new_name: Annotated[str, Field(description="The new folder name.")],
 ) -> FolderOperationResponse:
+    _check_folder_management_enabled()
     handler = dispatch_handler(account_name)
     return await handler.rename_folder(old_name, new_name)

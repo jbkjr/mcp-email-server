@@ -79,6 +79,7 @@ You can also configure the email server using environment variables, which is pa
 | `MCP_EMAIL_SERVER_SMTP_START_SSL`             | Enable STARTTLS                                   | `false`       | No       |
 | `MCP_EMAIL_SERVER_SMTP_VERIFY_SSL`            | Verify SSL certificates (disable for self-signed) | `true`        | No       |
 | `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD` | Enable attachment download                        | `false`       | No       |
+| `MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT`   | Enable folder management tools                    | `false`       | No       |
 | `MCP_EMAIL_SERVER_SAVE_TO_SENT`               | Save sent emails to IMAP Sent folder              | `true`        | No       |
 | `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`           | Custom Sent folder name (auto-detect if not set)  | -             | No       |
 
@@ -114,6 +115,39 @@ enable_attachment_download = true
 ```
 
 Once enabled, you can use the `download_attachment` tool to save email attachments to a specified path.
+
+### Enabling Folder Management
+
+By default, folder management tools (list, create, delete, rename folders, and move/copy emails) are disabled for security reasons. To enable these features:
+
+**Option 1: Environment Variable**
+
+```json
+{
+  "mcpServers": {
+    "zerolib-email": {
+      "command": "uvx",
+      "args": ["mcp-email-server@latest", "stdio"],
+      "env": {
+        "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT": "true"
+      }
+    }
+  }
+}
+```
+
+**Option 2: TOML Configuration**
+
+Add `enable_folder_management = true` to your TOML configuration file (`~/.config/zerolib/mcp_email_server/config.toml`):
+
+```toml
+enable_folder_management = true
+
+[[emails]]
+# ... your email configuration
+```
+
+Once enabled, you can use the folder management tools: `list_folders`, `create_folder`, `delete_folder`, `rename_folder`, `move_emails`, and `copy_emails`.
 
 ### Saving Sent Emails to IMAP Sent Folder
 
