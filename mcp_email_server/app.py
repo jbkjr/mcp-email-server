@@ -15,6 +15,9 @@ from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailContentBatchResponse,
     EmailMetadataPageResponse,
+    EmailMoveResponse,
+    FolderListResponse,
+    FolderOperationResponse,
 )
 
 mcp = FastMCP("email")
@@ -204,3 +207,77 @@ async def download_attachment(
 
     handler = dispatch_handler(account_name)
     return await handler.download_attachment(email_id, attachment_name, save_path, mailbox)
+
+
+@mcp.tool(
+    description="List all folders/mailboxes for an email account. Returns folder names, hierarchy delimiters, and IMAP flags.",
+)
+async def list_folders(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+) -> FolderListResponse:
+    handler = dispatch_handler(account_name)
+    return await handler.list_folders()
+
+
+@mcp.tool(
+    description="Move one or more emails to a different folder. Uses IMAP MOVE command if supported, otherwise falls back to COPY + DELETE.",
+)
+async def move_emails(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_ids: Annotated[
+        list[str],
+        Field(description="List of email_id to move (obtained from list_emails_metadata)."),
+    ],
+    destination_folder: Annotated[str, Field(description="The destination folder name.")],
+    source_mailbox: Annotated[
+        str, Field(default="INBOX", description="The source mailbox to move emails from.")
+    ] = "INBOX",
+) -> EmailMoveResponse:
+    handler = dispatch_handler(account_name)
+    return await handler.move_emails(email_ids, destination_folder, source_mailbox)
+
+
+@mcp.tool(
+    description="Copy one or more emails to a different folder. The original emails remain in the source folder. Useful for applying labels in providers like Proton Mail.",
+)
+async def copy_emails(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_ids: Annotated[
+        list[str],
+        Field(description="List of email_id to copy (obtained from list_emails_metadata)."),
+    ],
+    destination_folder: Annotated[str, Field(description="The destination folder name.")],
+    source_mailbox: Annotated[
+        str, Field(default="INBOX", description="The source mailbox to copy emails from.")
+    ] = "INBOX",
+) -> EmailMoveResponse:
+    handler = dispatch_handler(account_name)
+    return await handler.copy_emails(email_ids, destination_folder, source_mailbox)
+
+
+@mcp.tool(description="Create a new folder/mailbox.")
+async def create_folder(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    folder_name: Annotated[str, Field(description="The name of the folder to create.")],
+) -> FolderOperationResponse:
+    handler = dispatch_handler(account_name)
+    return await handler.create_folder(folder_name)
+
+
+@mcp.tool(description="Delete a folder/mailbox. The folder must be empty on most IMAP servers.")
+async def delete_folder(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    folder_name: Annotated[str, Field(description="The name of the folder to delete.")],
+) -> FolderOperationResponse:
+    handler = dispatch_handler(account_name)
+    return await handler.delete_folder(folder_name)
+
+
+@mcp.tool(description="Rename a folder/mailbox.")
+async def rename_folder(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    old_name: Annotated[str, Field(description="The current folder name.")],
+    new_name: Annotated[str, Field(description="The new folder name.")],
+) -> FolderOperationResponse:
+    handler = dispatch_handler(account_name)
+    return await handler.rename_folder(old_name, new_name)
