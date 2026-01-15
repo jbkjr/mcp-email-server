@@ -640,3 +640,409 @@ class TestBatchFetchHeaders:
         assert len(result) == 2
         assert result["100"]["subject"] == "First"
         assert result["200"]["subject"] == "Second"
+
+
+class TestParseHeaderToMetadata:
+    """Tests for header parsing helper."""
+
+    def test_parse_header_success(self, email_client):
+        """Test successful header parsing."""
+        raw_headers = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+        result = email_client._parse_header_to_metadata("123", raw_headers)
+
+        assert result["email_id"] == "123"
+        assert result["from"] == "sender@example.com"
+        assert result["subject"] == "Test"
+        assert result["to"] == ["recipient@example.com"]
+        assert result["attachments"] == []
+
+    def test_parse_header_with_cc(self, email_client):
+        """Test parsing headers with CC recipients."""
+        raw_headers = b"From: sender@example.com\r\nTo: to@example.com\r\nCc: cc1@example.com, cc2@example.com\r\nSubject: Test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+        result = email_client._parse_header_to_metadata("123", raw_headers)
+
+        assert "to@example.com" in result["to"]
+        assert "cc1@example.com" in result["to"]
+        assert "cc2@example.com" in result["to"]
+
+    def test_parse_header_invalid(self, email_client):
+        """Test parsing invalid headers returns None."""
+        # Create a scenario where parsing fails
+        with patch("mcp_email_server.emails.classic.BytesParser") as mock_parser:
+            mock_parser.return_value.parsebytes.side_effect = Exception("Parse error")
+            result = email_client._parse_header_to_metadata("123", b"invalid")
+            assert result is None
+
+
+class TestGetEmailsStreamWithSort:
+    """Tests for get_emails_metadata_stream with SORT capability."""
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_with_sort(self, email_client):
+        """Test getting emails using IMAP SORT when available."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        # Mock protocol.capabilities to include SORT
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = {"SORT", "IMAP4rev1"}
+        mock_imap.protocol = mock_protocol
+
+        # Mock SORT response (already sorted by date desc)
+        sort_response = [b"3 2 1"]  # UIDs in sorted order
+
+        # Mock header fetch for the page
+        header_response = [
+            b"3 FETCH (UID 3 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b"2 FETCH (UID 2 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b"1 FETCH (UID 1 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+        ]
+
+        def uid_side_effect(cmd, *args):
+            if cmd == "sort":
+                return (None, sort_response)
+            else:  # fetch
+                return (None, header_response)
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
+                emails.append(email_data)
+
+            assert len(emails) == 3
+            # Should be in SORT order (3, 2, 1 for desc)
+            assert emails[0]["email_id"] == "3"
+            assert emails[1]["email_id"] == "2"
+            assert emails[2]["email_id"] == "1"
+
+            # Verify SORT was called
+            calls = mock_imap.uid.call_args_list
+            assert calls[0][0][0] == "sort"
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_sort_fallback_on_error(self, email_client):
+        """Test fallback to batch fetch when SORT fails."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2"]))
+        mock_imap.logout = AsyncMock()
+
+        # Mock protocol.capabilities to include SORT
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = {"SORT", "IMAP4rev1"}
+        mock_imap.protocol = mock_protocol
+
+        call_count = [0]
+
+        # Mock responses - SORT fails, then fallback works
+        date_response = [
+            b"1 FETCH (UID 1 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"),
+            b"2 FETCH (UID 2 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Tue, 2 Jan 2024 00:00:00 +0000\r\n"),
+        ]
+        header_response = [
+            b"2 FETCH (UID 2 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b"1 FETCH (UID 1 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+        ]
+
+        def uid_side_effect(cmd, *args):
+            call_count[0] += 1
+            if cmd == "sort":
+                raise RuntimeError("SORT not supported")
+            elif "HEADER.FIELDS" in args[-1] if args else False:
+                return (None, date_response)
+            else:
+                return (None, header_response)
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
+                emails.append(email_data)
+
+            # Should still get results via fallback
+            assert len(emails) == 2
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_empty_search(self, email_client):
+        """Test handling of empty search results."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b""]))
+        mock_imap.logout = AsyncMock()
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = set()
+        mock_imap.protocol = mock_protocol
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
+                emails.append(email_data)
+
+            assert len(emails) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_asc_order(self, email_client):
+        """Test getting emails in ascending order."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2 3"]))
+        mock_imap.logout = AsyncMock()
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = set()
+        mock_imap.protocol = mock_protocol
+
+        date_response = [
+            b"1 FETCH (UID 1 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"),
+            b"2 FETCH (UID 2 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Tue, 2 Jan 2024 00:00:00 +0000\r\n"),
+            b"3 FETCH (UID 3 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Wed, 3 Jan 2024 00:00:00 +0000\r\n"),
+        ]
+        header_response = [
+            b"1 FETCH (UID 1 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b"2 FETCH (UID 2 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b"3 FETCH (UID 3 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+        ]
+
+        def uid_side_effect(cmd, uid_list, fetch_type):
+            if "HEADER.FIELDS" in fetch_type:
+                return (None, date_response)
+            else:
+                return (None, header_response)
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10, order="asc"):
+                emails.append(email_data)
+
+            assert len(emails) == 3
+            # Ascending order: oldest first
+            assert emails[0]["email_id"] == "1"
+            assert emails[1]["email_id"] == "2"
+            assert emails[2]["email_id"] == "3"
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_pagination(self, email_client):
+        """Test pagination works correctly."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2 3 4 5"]))
+        mock_imap.logout = AsyncMock()
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = set()
+        mock_imap.protocol = mock_protocol
+
+        date_response = [
+            b"1 FETCH (UID 1 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"),
+            b"2 FETCH (UID 2 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Tue, 2 Jan 2024 00:00:00 +0000\r\n"),
+            b"3 FETCH (UID 3 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Wed, 3 Jan 2024 00:00:00 +0000\r\n"),
+            b"4 FETCH (UID 4 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Thu, 4 Jan 2024 00:00:00 +0000\r\n"),
+            b"5 FETCH (UID 5 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Fri, 5 Jan 2024 00:00:00 +0000\r\n"),
+        ]
+        # Only return headers for page 2 (emails 3 and 2 in desc order)
+        header_response = [
+            b"3 FETCH (UID 3 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b"2 FETCH (UID 2 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+        ]
+
+        def uid_side_effect(cmd, uid_list, fetch_type):
+            if "HEADER.FIELDS" in fetch_type:
+                return (None, date_response)
+            else:
+                return (None, header_response)
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            # Page 2, page_size 2 with desc order means emails at positions 2-3 (0-indexed)
+            # With 5 emails sorted desc: 5,4,3,2,1 -> page 2 gets 3,2
+            async for email_data in email_client.get_emails_metadata_stream(page=2, page_size=2):
+                emails.append(email_data)
+
+            assert len(emails) == 2
+            assert emails[0]["email_id"] == "3"
+            assert emails[1]["email_id"] == "2"
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_date_fetch_fallback(self, email_client):
+        """Test fallback to full header fetch when date fetch fails."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2"]))
+        mock_imap.logout = AsyncMock()
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = set()
+        mock_imap.protocol = mock_protocol
+
+        header_response = [
+            b"1 FETCH (UID 1 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b"2 FETCH (UID 2 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+        ]
+
+        call_count = [0]
+
+        def uid_side_effect(cmd, uid_list, fetch_type):
+            call_count[0] += 1
+            if "HEADER.FIELDS" in fetch_type:
+                # Return empty to trigger fallback
+                return (None, [])
+            else:
+                return (None, header_response)
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
+                emails.append(email_data)
+
+            # Should still get results via fallback
+            assert len(emails) == 2
+
+
+class TestDeleteEmails:
+    """Tests for delete_emails functionality."""
+
+    @pytest.mark.asyncio
+    async def test_delete_emails_success(self, email_client):
+        """Test successful deletion of emails."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid = AsyncMock(return_value=(None, None))
+        mock_imap.expunge = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            deleted_ids, failed_ids = await email_client.delete_emails(["123", "456"])
+            assert deleted_ids == ["123", "456"]
+            assert failed_ids == []
+            mock_imap.expunge.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_emails_partial_failure(self, email_client):
+        """Test delete_emails with some failures."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.expunge = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        call_count = [0]
+
+        def uid_side_effect(*args):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (None, None)
+            else:
+                raise OSError("IMAP error")
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            deleted_ids, failed_ids = await email_client.delete_emails(["123", "456"])
+            assert deleted_ids == ["123"]
+            assert failed_ids == ["456"]
+
+    @pytest.mark.asyncio
+    async def test_delete_emails_logout_error(self, email_client):
+        """Test delete_emails handles logout errors gracefully."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid = AsyncMock(return_value=(None, None))
+        mock_imap.expunge = AsyncMock()
+        mock_imap.logout = AsyncMock(side_effect=OSError("Connection closed"))
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            deleted_ids, failed_ids = await email_client.delete_emails(["123"])
+            assert deleted_ids == ["123"]
+            assert failed_ids == []
