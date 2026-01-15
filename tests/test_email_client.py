@@ -172,11 +172,17 @@ class TestEmailClient:
         # For batch header fetch: returns full headers for each email
         header_response = [
             b"1 FETCH (UID 1 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"2 FETCH (UID 2 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"3 FETCH (UID 3 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
         ]
 
         # Mock uid to return different responses based on the fetch type
