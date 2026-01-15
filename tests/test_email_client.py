@@ -141,7 +141,7 @@ class TestEmailClient:
 
     @pytest.mark.asyncio
     async def test_get_emails_stream(self, email_client):
-        """Test getting emails stream."""
+        """Test getting emails stream with batch fetch optimization."""
         # Mock IMAP client
         mock_imap = AsyncMock()
         mock_imap._client_task = asyncio.Future()
@@ -151,48 +151,65 @@ class TestEmailClient:
         mock_imap.select = AsyncMock()
         mock_imap.search = AsyncMock(return_value=(None, [b"1 2 3"]))
         mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2 3"]))
-        mock_imap.fetch = AsyncMock(return_value=(None, [b"HEADER", bytearray(b"EMAIL CONTENT")]))
-        # Create a simple email with headers for testing
-        test_email = b"""From: sender@example.com\r
-To: recipient@example.com\r
-Subject: Test Subject\r
-Date: Mon, 1 Jan 2024 00:00:00 +0000\r
-\r
-This is the email body."""
-        mock_imap.uid = AsyncMock(
-            return_value=(None, [b"1 FETCH (UID 1 RFC822 {%d}" % len(test_email), bytearray(test_email)])
-        )
         mock_imap.logout = AsyncMock()
+
+        # Mock protocol.capabilities to not include SORT (test fallback path)
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = set()  # No SORT capability
+        mock_imap.protocol = mock_protocol
+
+        # Create batch fetch responses for dates and full headers
+        # For batch date fetch: returns UID responses followed by date content
+        date_response = [
+            b"1 FETCH (UID 1 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"),
+            b"2 FETCH (UID 2 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Tue, 2 Jan 2024 00:00:00 +0000\r\n"),
+            b"3 FETCH (UID 3 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Wed, 3 Jan 2024 00:00:00 +0000\r\n"),
+        ]
+
+        # For batch header fetch: returns full headers for each email
+        header_response = [
+            b"1 FETCH (UID 1 BODY[HEADER] {100}",
+            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            b"2 FETCH (UID 2 BODY[HEADER] {100}",
+            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            b"3 FETCH (UID 3 BODY[HEADER] {100}",
+            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Subject 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"),
+        ]
+
+        # Mock uid to return different responses based on the fetch type
+        def uid_side_effect(cmd, uid_list, fetch_type):
+            if "HEADER.FIELDS" in fetch_type:
+                return (None, date_response)
+            else:
+                return (None, header_response)
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
 
         # Mock IMAP class
         with patch.object(email_client, "imap_class", return_value=mock_imap):
-            # Mock _parse_email_data
-            with patch.object(email_client, "_parse_email_data") as mock_parse:
-                mock_parse.return_value = {
-                    "subject": "Test Subject",
-                    "from": "sender@example.com",
-                    "body": "Test Body",
-                    "date": datetime.now(timezone.utc),
-                    "attachments": [],
-                }
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
+                emails.append(email_data)
 
-                emails = []
-                async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
-                    emails.append(email_data)
+            # We should get 3 emails (from the mocked search result "1 2 3")
+            assert len(emails) == 3
+            # With desc order (default), newest first (email 3)
+            assert emails[0]["email_id"] == "3"
+            assert emails[1]["email_id"] == "2"
+            assert emails[2]["email_id"] == "1"
 
-                # We should get 3 emails (from the mocked search result "1 2 3")
-                assert len(emails) == 3
-                assert emails[0]["subject"] == "Test Subject"
-                assert emails[0]["from"] == "sender@example.com"
-
-                # Verify IMAP methods were called correctly
-                mock_imap.login.assert_called_once_with(
-                    email_client.email_server.user_name, email_client.email_server.password
-                )
-                mock_imap.select.assert_called_once_with('"INBOX"')
-                mock_imap.uid_search.assert_called_once_with("ALL")
-                assert mock_imap.uid.call_count == 3
-                mock_imap.logout.assert_called_once()
+            # Verify IMAP methods were called correctly
+            mock_imap.login.assert_called_once_with(
+                email_client.email_server.user_name, email_client.email_server.password
+            )
+            mock_imap.select.assert_called_once_with('"INBOX"')
+            mock_imap.uid_search.assert_called_once_with("ALL")
+            # Batch fetch: 2 calls (dates + headers) instead of 3 individual calls
+            assert mock_imap.uid.call_count == 2
+            mock_imap.logout.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_get_email_count(self, email_client):
