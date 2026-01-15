@@ -335,9 +335,7 @@ class EmailClient:
             logger.error(f"Error in batch fetch headers: {e}")
             return []
 
-    def _append_header_metadata(
-        self, results: list[dict[str, Any]], uid: str, headers: bytes
-    ) -> None:
+    def _append_header_metadata(self, results: list[dict[str, Any]], uid: str, headers: bytes) -> None:
         """Parse headers and append to results if successful."""
         metadata = self._parse_header_to_metadata(uid, headers)
         if metadata:
