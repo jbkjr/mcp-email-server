@@ -10,6 +10,7 @@ from mcp_email_server.app import (
     get_emails_content,
     list_available_accounts,
     list_emails_metadata,
+    mark_emails,
     send_email,
 )
 from mcp_email_server.config import EmailServer, EmailSettings, ProviderSettings
@@ -17,6 +18,7 @@ from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
     EmailContentBatchResponse,
+    EmailMarkResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
 )
@@ -435,6 +437,102 @@ class TestMcpTools:
 
             assert result == "Successfully deleted 1 email(s)"
             mock_handler.delete_emails.assert_called_once_with(["12345"], "Trash")
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read(self):
+        """Test mark_emails MCP tool for marking as read."""
+        mock_response = EmailMarkResponse(
+            success=True,
+            marked_ids=["12345", "12346"],
+            failed_ids=[],
+            mailbox="INBOX",
+            marked_as="read",
+        )
+        mock_handler = AsyncMock()
+        mock_handler.mark_emails.return_value = mock_response
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await mark_emails(
+                account_name="test_account",
+                email_ids=["12345", "12346"],
+                mark_as="read",
+            )
+
+            assert result.success is True
+            assert result.marked_ids == ["12345", "12346"]
+            assert result.marked_as == "read"
+            mock_handler.mark_emails.assert_called_once_with(["12345", "12346"], "read", "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_unread(self):
+        """Test mark_emails MCP tool for marking as unread."""
+        mock_response = EmailMarkResponse(
+            success=True,
+            marked_ids=["12345"],
+            failed_ids=[],
+            mailbox="INBOX",
+            marked_as="unread",
+        )
+        mock_handler = AsyncMock()
+        mock_handler.mark_emails.return_value = mock_response
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await mark_emails(
+                account_name="test_account",
+                email_ids=["12345"],
+                mark_as="unread",
+            )
+
+            assert result.success is True
+            assert result.marked_as == "unread"
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_with_failures(self):
+        """Test mark_emails MCP tool with some failures."""
+        mock_response = EmailMarkResponse(
+            success=False,
+            marked_ids=["12345"],
+            failed_ids=["12346"],
+            mailbox="INBOX",
+            marked_as="read",
+        )
+        mock_handler = AsyncMock()
+        mock_handler.mark_emails.return_value = mock_response
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await mark_emails(
+                account_name="test_account",
+                email_ids=["12345", "12346"],
+                mark_as="read",
+            )
+
+            assert result.success is False
+            assert result.marked_ids == ["12345"]
+            assert result.failed_ids == ["12346"]
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_custom_mailbox(self):
+        """Test mark_emails MCP tool with custom mailbox."""
+        mock_response = EmailMarkResponse(
+            success=True,
+            marked_ids=["12345"],
+            failed_ids=[],
+            mailbox="[Gmail]/All Mail",
+            marked_as="read",
+        )
+        mock_handler = AsyncMock()
+        mock_handler.mark_emails.return_value = mock_response
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await mark_emails(
+                account_name="test_account",
+                email_ids=["12345"],
+                mark_as="read",
+                mailbox="[Gmail]/All Mail",
+            )
+
+            assert result.mailbox == "[Gmail]/All Mail"
+            mock_handler.mark_emails.assert_called_once_with(["12345"], "read", "[Gmail]/All Mail")
 
     @pytest.mark.asyncio
     async def test_download_attachment_disabled(self):

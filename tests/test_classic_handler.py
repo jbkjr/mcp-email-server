@@ -275,6 +275,42 @@ class TestClassicEmailHandler:
             mock_delete.assert_called_once_with(["789"], "Archive")
 
     @pytest.mark.asyncio
+    async def test_mark_emails(self, classic_handler):
+        """Test mark_emails method."""
+        mock_mark = AsyncMock(return_value=(["123", "456"], []))
+
+        with patch.object(classic_handler.incoming_client, "mark_emails", mock_mark):
+            result = await classic_handler.mark_emails(
+                email_ids=["123", "456"],
+                mark_as="read",
+                mailbox="INBOX",
+            )
+
+            assert result.success is True
+            assert result.marked_ids == ["123", "456"]
+            assert result.failed_ids == []
+            assert result.mailbox == "INBOX"
+            assert result.marked_as == "read"
+            mock_mark.assert_called_once_with(["123", "456"], "read", "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_with_failures(self, classic_handler):
+        """Test mark_emails method with some failures."""
+        mock_mark = AsyncMock(return_value=(["123"], ["456"]))
+
+        with patch.object(classic_handler.incoming_client, "mark_emails", mock_mark):
+            result = await classic_handler.mark_emails(
+                email_ids=["123", "456"],
+                mark_as="unread",
+                mailbox="INBOX",
+            )
+
+            assert result.success is False
+            assert result.marked_ids == ["123"]
+            assert result.failed_ids == ["456"]
+            assert result.marked_as == "unread"
+
+    @pytest.mark.asyncio
     async def test_download_attachment(self, classic_handler, tmp_path):
         """Test download_attachment method."""
         save_path = str(tmp_path / "downloaded_attachment.pdf")
