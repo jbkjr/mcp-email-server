@@ -6,10 +6,12 @@ if TYPE_CHECKING:
     from mcp_email_server.emails.models import (
         AttachmentDownloadResponse,
         EmailContentBatchResponse,
+        EmailLabelsResponse,
         EmailMetadataPageResponse,
         EmailMoveResponse,
         FolderListResponse,
         FolderOperationResponse,
+        LabelListResponse,
     )
 
 
@@ -175,6 +177,92 @@ class EmailHandler(abc.ABC):
         Args:
             old_name: The current folder name.
             new_name: The new folder name.
+
+        Returns:
+            FolderOperationResponse with operation result.
+        """
+
+    @abc.abstractmethod
+    async def list_labels(self) -> "LabelListResponse":
+        """
+        List all labels (ProtonMail: folders under Labels/ prefix).
+
+        Returns:
+            LabelListResponse with list of labels.
+        """
+
+    @abc.abstractmethod
+    async def apply_label(
+        self,
+        email_ids: list[str],
+        label_name: str,
+        source_mailbox: str = "INBOX",
+    ) -> "EmailMoveResponse":
+        """
+        Apply a label to emails by copying to the label folder.
+
+        Args:
+            email_ids: List of email UIDs to label.
+            label_name: The label name (without Labels/ prefix).
+            source_mailbox: The source mailbox (default: "INBOX").
+
+        Returns:
+            EmailMoveResponse with operation results.
+        """
+
+    @abc.abstractmethod
+    async def remove_label(
+        self,
+        email_ids: list[str],
+        label_name: str,
+    ) -> "EmailMoveResponse":
+        """
+        Remove a label from emails by deleting from the label folder.
+
+        Args:
+            email_ids: List of email UIDs to unlabel.
+            label_name: The label name (without Labels/ prefix).
+
+        Returns:
+            EmailMoveResponse with operation results.
+        """
+
+    @abc.abstractmethod
+    async def get_email_labels(
+        self,
+        email_id: str,
+        source_mailbox: str = "INBOX",
+    ) -> "EmailLabelsResponse":
+        """
+        Get all labels applied to a specific email.
+
+        Args:
+            email_id: The email UID to check.
+            source_mailbox: The source mailbox (default: "INBOX").
+
+        Returns:
+            EmailLabelsResponse with list of label names.
+        """
+
+    @abc.abstractmethod
+    async def create_label(self, label_name: str) -> "FolderOperationResponse":
+        """
+        Create a new label (creates Labels/name folder).
+
+        Args:
+            label_name: The label name (without Labels/ prefix).
+
+        Returns:
+            FolderOperationResponse with operation result.
+        """
+
+    @abc.abstractmethod
+    async def delete_label(self, label_name: str) -> "FolderOperationResponse":
+        """
+        Delete a label (deletes Labels/name folder).
+
+        Args:
+            label_name: The label name (without Labels/ prefix).
 
         Returns:
             FolderOperationResponse with operation result.

@@ -14,10 +14,12 @@ from mcp_email_server.emails.dispatcher import dispatch_handler
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailContentBatchResponse,
+    EmailLabelsResponse,
     EmailMetadataPageResponse,
     EmailMoveResponse,
     FolderListResponse,
     FolderOperationResponse,
+    LabelListResponse,
 )
 
 mcp = FastMCP("email")
@@ -315,3 +317,84 @@ async def rename_folder(
     _check_folder_management_enabled()
     handler = dispatch_handler(account_name)
     return await handler.rename_folder(old_name, new_name)
+
+
+@mcp.tool(
+    description="List all labels for an email account (ProtonMail: folders under Labels/ prefix). Requires enable_folder_management=true."
+)
+async def list_labels(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+) -> LabelListResponse:
+    _check_folder_management_enabled()
+    handler = dispatch_handler(account_name)
+    return await handler.list_labels()
+
+
+@mcp.tool(
+    description="Apply a label to one or more emails. Copies emails to the label folder while preserving originals. Requires enable_folder_management=true."
+)
+async def apply_label(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_ids: Annotated[
+        list[str],
+        Field(description="List of email_id to label (obtained from list_emails_metadata)."),
+    ],
+    label_name: Annotated[str, Field(description="The label name (without Labels/ prefix).")],
+    source_mailbox: Annotated[
+        str, Field(default="INBOX", description="The source mailbox containing the emails.")
+    ] = "INBOX",
+) -> EmailMoveResponse:
+    _check_folder_management_enabled()
+    handler = dispatch_handler(account_name)
+    return await handler.apply_label(email_ids, label_name, source_mailbox)
+
+
+@mcp.tool(
+    description="Remove a label from one or more emails. Deletes from label folder while preserving original emails. Requires enable_folder_management=true."
+)
+async def remove_label(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_ids: Annotated[
+        list[str],
+        Field(description="List of email_id to unlabel (obtained from list_emails_metadata)."),
+    ],
+    label_name: Annotated[str, Field(description="The label name (without Labels/ prefix).")],
+) -> EmailMoveResponse:
+    _check_folder_management_enabled()
+    handler = dispatch_handler(account_name)
+    return await handler.remove_label(email_ids, label_name)
+
+
+@mcp.tool(description="Get all labels applied to a specific email. Requires enable_folder_management=true.")
+async def get_email_labels(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_id: Annotated[str, Field(description="The email_id to check (obtained from list_emails_metadata).")],
+    source_mailbox: Annotated[
+        str, Field(default="INBOX", description="The source mailbox containing the email.")
+    ] = "INBOX",
+) -> EmailLabelsResponse:
+    _check_folder_management_enabled()
+    handler = dispatch_handler(account_name)
+    return await handler.get_email_labels(email_id, source_mailbox)
+
+
+@mcp.tool(description="Create a new label (creates Labels/name folder). Requires enable_folder_management=true.")
+async def create_label(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    label_name: Annotated[str, Field(description="The label name to create (without Labels/ prefix).")],
+) -> FolderOperationResponse:
+    _check_folder_management_enabled()
+    handler = dispatch_handler(account_name)
+    return await handler.create_label(label_name)
+
+
+@mcp.tool(
+    description="Delete a label (deletes Labels/name folder). The label must be empty on most IMAP servers. Requires enable_folder_management=true."
+)
+async def delete_label(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    label_name: Annotated[str, Field(description="The label name to delete (without Labels/ prefix).")],
+) -> FolderOperationResponse:
+    _check_folder_management_enabled()
+    handler = dispatch_handler(account_name)
+    return await handler.delete_label(label_name)
