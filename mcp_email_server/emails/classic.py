@@ -313,34 +313,35 @@ class EmailClient:
 
             for item in data:
                 if isinstance(item, bytearray):
-                    # Store headers
+                    # Store headers; emit if we already have a UID
                     pending_headers = bytes(item)
-                    # If we already have a UID (from before the data), emit result
                     if pending_uid is not None:
-                        metadata = self._parse_header_to_metadata(pending_uid, pending_headers)
-                        if metadata:
-                            results.append(metadata)
-                        pending_uid = None
-                        pending_headers = None
+                        self._append_header_metadata(results, pending_uid, pending_headers)
+                        pending_uid, pending_headers = None, None
                 elif isinstance(item, bytes):
-                    item_str = item.decode("utf-8", errors="replace")
-                    # Look for UID in any bytes item
-                    uid_match = re.search(r"UID\s+(\d+)", item_str)
-                    if uid_match:
-                        if pending_headers is not None:
-                            # UID came after the data
-                            metadata = self._parse_header_to_metadata(uid_match.group(1), pending_headers)
-                            if metadata:
-                                results.append(metadata)
-                            pending_headers = None
-                        else:
-                            # UID came before the data - save it
-                            pending_uid = uid_match.group(1)
+                    uid_match = re.search(r"UID\s+(\d+)", item.decode("utf-8", errors="replace"))
+                    if not uid_match:
+                        continue
+                    if pending_headers is not None:
+                        # UID came after the data
+                        self._append_header_metadata(results, uid_match.group(1), pending_headers)
+                        pending_headers = None
+                    else:
+                        # UID came before the data - save it
+                        pending_uid = uid_match.group(1)
 
             return results
         except Exception as e:
             logger.error(f"Error in batch fetch headers: {e}")
             return []
+
+    def _append_header_metadata(
+        self, results: list[dict[str, Any]], uid: str, headers: bytes
+    ) -> None:
+        """Parse headers and append to results if successful."""
+        metadata = self._parse_header_to_metadata(uid, headers)
+        if metadata:
+            results.append(metadata)
 
     def _parse_header_to_metadata(self, email_id: str, raw_headers: bytes) -> dict[str, Any] | None:
         """Parse raw email headers into a metadata dictionary."""
