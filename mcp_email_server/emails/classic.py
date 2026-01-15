@@ -20,12 +20,15 @@ from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
     EmailContentBatchResponse,
+    EmailLabelsResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
     EmailMoveResponse,
     Folder,
     FolderListResponse,
     FolderOperationResponse,
+    Label,
+    LabelListResponse,
 )
 from mcp_email_server.log import logger
 
@@ -1217,6 +1220,100 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
+    async def list_labels(self) -> list[Label]:
+        """List all labels (folders under Labels/ prefix)."""
+        folders = await self.list_folders()
+        labels = []
+        for folder in folders:
+            if folder.name.startswith("Labels/"):
+                # Extract label name without prefix
+                label_name = folder.name[7:]  # Remove "Labels/" prefix
+                if label_name:  # Skip if just "Labels/" with no name
+                    labels.append(
+                        Label(
+                            name=label_name,
+                            full_path=folder.name,
+                            delimiter=folder.delimiter,
+                            flags=folder.flags,
+                        )
+                    )
+        return labels
+
+    async def get_email_message_id(self, email_id: str, mailbox: str = "INBOX") -> str | None:
+        """Get the Message-ID header for an email."""
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await _send_imap_id(imap)
+            await imap.select(_quote_mailbox(mailbox))
+
+            _, data = await imap.uid("fetch", email_id, "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]")
+
+            for item in data:
+                if isinstance(item, bytearray):
+                    header_str = bytes(item).decode("utf-8", errors="replace").strip()
+                    if header_str.lower().startswith("message-id:"):
+                        return header_str[11:].strip()
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting Message-ID for email {email_id}: {e}")
+            return None
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
+    async def search_by_message_id(self, message_id: str, mailbox: str) -> str | None:
+        """Search for an email by Message-ID in a specific mailbox. Returns email UID or None."""
+        import re
+
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await _send_imap_id(imap)
+            await imap.select(_quote_mailbox(mailbox))
+
+            # Search by Message-ID header (returns sequence numbers, not UIDs)
+            _, data = await imap.search(f'HEADER MESSAGE-ID "{message_id}"')
+
+            # data[0] contains space-separated sequence numbers
+            if data and data[0]:
+                seq_nums = data[0].decode("utf-8") if isinstance(data[0], bytes) else str(data[0])
+                seq_list = seq_nums.split()
+                if seq_list:
+                    # Fetch the UID for this sequence number
+                    _, fetch_data = await imap.fetch(seq_list[0], "(UID)")
+                    for item in fetch_data:
+                        if isinstance(item, bytes):
+                            item_str = item.decode("utf-8", errors="replace")
+                            uid_match = re.search(r"UID\s+(\d+)", item_str)
+                            if uid_match:
+                                return uid_match.group(1)
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Error searching for Message-ID in {mailbox}: {e}")
+            return None
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
+    async def delete_from_folder(self, email_ids: list[str], folder: str) -> tuple[list[str], list[str]]:
+        """Delete emails from a specific folder. Returns (deleted_ids, failed_ids)."""
+        return await self.delete_emails(email_ids, folder)
+
 
 class ClassicEmailHandler(EmailHandler):
     def __init__(self, email_settings: EmailSettings):
@@ -1413,4 +1510,116 @@ class ClassicEmailHandler(EmailHandler):
             success=success,
             folder_name=new_name,
             message=message,
+        )
+
+    async def list_labels(self) -> LabelListResponse:
+        """List all labels (ProtonMail: folders under Labels/ prefix)."""
+        labels = await self.incoming_client.list_labels()
+        return LabelListResponse(labels=labels, total=len(labels))
+
+    async def apply_label(
+        self,
+        email_ids: list[str],
+        label_name: str,
+        source_mailbox: str = "INBOX",
+    ) -> EmailMoveResponse:
+        """Apply a label to emails by copying to the label folder."""
+        label_folder = f"Labels/{label_name}"
+        copied_ids, failed_ids = await self.incoming_client.copy_emails(email_ids, label_folder, source_mailbox)
+        return EmailMoveResponse(
+            success=len(failed_ids) == 0,
+            moved_ids=copied_ids,
+            failed_ids=failed_ids,
+            source_mailbox=source_mailbox,
+            destination_folder=label_folder,
+        )
+
+    async def remove_label(
+        self,
+        email_ids: list[str],
+        label_name: str,
+    ) -> EmailMoveResponse:
+        """Remove a label from emails by deleting from the label folder.
+
+        This finds the emails in the label folder by their Message-ID and deletes them.
+        The original emails in other folders are preserved.
+        """
+        label_folder = f"Labels/{label_name}"
+        removed_ids = []
+        failed_ids = []
+
+        for email_id in email_ids:
+            # Get the Message-ID from the source email
+            # Note: We need to find this email in the label folder
+            # The email_id provided is from the source mailbox, not the label folder
+            # We need to search by Message-ID to find the copy in the label folder
+            message_id = await self.incoming_client.get_email_message_id(email_id, "INBOX")
+            if not message_id:
+                logger.warning(f"Could not get Message-ID for email {email_id}")
+                failed_ids.append(email_id)
+                continue
+
+            # Find the email in the label folder
+            label_uid = await self.incoming_client.search_by_message_id(message_id, label_folder)
+            if not label_uid:
+                logger.warning(f"Email {email_id} not found in label {label_name}")
+                failed_ids.append(email_id)
+                continue
+
+            # Delete from label folder
+            deleted, _failed = await self.incoming_client.delete_from_folder([label_uid], label_folder)
+            if deleted:
+                removed_ids.append(email_id)
+            else:
+                failed_ids.append(email_id)
+
+        return EmailMoveResponse(
+            success=len(failed_ids) == 0,
+            moved_ids=removed_ids,
+            failed_ids=failed_ids,
+            source_mailbox=label_folder,
+            destination_folder="",
+        )
+
+    async def get_email_labels(
+        self,
+        email_id: str,
+        source_mailbox: str = "INBOX",
+    ) -> EmailLabelsResponse:
+        """Get all labels applied to a specific email."""
+        # Get Message-ID from the source email
+        message_id = await self.incoming_client.get_email_message_id(email_id, source_mailbox)
+        if not message_id:
+            return EmailLabelsResponse(email_id=email_id, labels=[])
+
+        # Get all labels
+        labels = await self.incoming_client.list_labels()
+        applied_labels = []
+
+        # Search each label folder for this email
+        for label in labels:
+            found_uid = await self.incoming_client.search_by_message_id(message_id, label.full_path)
+            if found_uid:
+                applied_labels.append(label.name)
+
+        return EmailLabelsResponse(email_id=email_id, labels=applied_labels)
+
+    async def create_label(self, label_name: str) -> FolderOperationResponse:
+        """Create a new label (creates Labels/name folder)."""
+        label_folder = f"Labels/{label_name}"
+        success, message = await self.incoming_client.create_folder(label_folder)
+        return FolderOperationResponse(
+            success=success,
+            folder_name=label_name,
+            message=message.replace(label_folder, label_name) if success else message,
+        )
+
+    async def delete_label(self, label_name: str) -> FolderOperationResponse:
+        """Delete a label (deletes Labels/name folder)."""
+        label_folder = f"Labels/{label_name}"
+        success, message = await self.incoming_client.delete_folder(label_folder)
+        return FolderOperationResponse(
+            success=success,
+            folder_name=label_name,
+            message=message.replace(label_folder, label_name) if success else message,
         )

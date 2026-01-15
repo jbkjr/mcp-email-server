@@ -103,3 +103,26 @@ class EmailMoveResponse(BaseModel):
     failed_ids: list[str]
     source_mailbox: str
     destination_folder: str
+
+
+class Label(BaseModel):
+    """ProtonMail label information"""
+
+    name: str  # Label name without prefix (e.g., "Important" not "Labels/Important")
+    full_path: str  # Full IMAP path (e.g., "Labels/Important")
+    delimiter: str
+    flags: list[str]
+
+
+class LabelListResponse(BaseModel):
+    """Response for list_labels operation"""
+
+    labels: list[Label]
+    total: int
+
+
+class EmailLabelsResponse(BaseModel):
+    """Response for get_email_labels operation"""
+
+    email_id: str
+    labels: list[str]  # List of label names (without prefix)
