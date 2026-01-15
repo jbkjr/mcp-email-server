@@ -1065,6 +1065,159 @@ class TestGetEmailsStreamWithSort:
             # Should still get results via fallback
             assert len(emails) == 2
 
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_sort_empty_response(self, email_client):
+        """Test handling of empty SORT response (covers 451-453)."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = {"SORT", "IMAP4rev1"}
+        mock_imap.protocol = mock_protocol
+
+        # SORT returns empty/None response
+        mock_imap.uid = AsyncMock(return_value=(None, [None]))
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
+                emails.append(email_data)
+
+            assert len(emails) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_sort_empty_page(self, email_client):
+        """Test handling when pagination results in empty page with SORT (covers 463)."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = {"SORT", "IMAP4rev1"}
+        mock_imap.protocol = mock_protocol
+
+        # Only 2 emails, but request page 10
+        sort_response = [b"1 2"]
+        mock_imap.uid = AsyncMock(return_value=(None, sort_response))
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=10, page_size=10):
+                emails.append(email_data)
+
+            assert len(emails) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_empty_email_ids_after_split(self, email_client):
+        """Test handling when email_ids is empty after split (covers 494-495)."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        # Return non-empty response that splits to empty list
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b"   "]))
+        mock_imap.logout = AsyncMock()
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = set()  # No SORT
+        mock_imap.protocol = mock_protocol
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
+                emails.append(email_data)
+
+            assert len(emails) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_fallback_empty_page(self, email_client):
+        """Test handling when pagination results in empty page in fallback path (covers 518)."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2"]))
+        mock_imap.logout = AsyncMock()
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = set()  # No SORT
+        mock_imap.protocol = mock_protocol
+
+        date_response = [
+            b"1 FETCH (UID 1 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"),
+            b"2 FETCH (UID 2 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Tue, 2 Jan 2024 00:00:00 +0000\r\n"),
+        ]
+
+        mock_imap.uid = AsyncMock(return_value=(None, date_response))
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            # Request page 10 when only 2 emails exist
+            async for email_data in email_client.get_emails_metadata_stream(page=10, page_size=10):
+                emails.append(email_data)
+
+            assert len(emails) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_emails_stream_logout_error(self, email_client):
+        """Test handling of logout error (covers 534-535)."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1"]))
+        # Logout raises an error
+        mock_imap.logout = AsyncMock(side_effect=Exception("Connection lost"))
+
+        mock_protocol = MagicMock()
+        mock_protocol.capabilities = set()
+        mock_imap.protocol = mock_protocol
+
+        date_response = [
+            b"1 FETCH (UID 1 BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"),
+        ]
+        header_response = [
+            b"1 FETCH (UID 1 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+        ]
+
+        def uid_side_effect(cmd, uid_list, fetch_type):
+            if "HEADER.FIELDS" in fetch_type:
+                return (None, date_response)
+            else:
+                return (None, header_response)
+
+        mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            emails = []
+            # Should complete successfully despite logout error
+            async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
+                emails.append(email_data)
+
+            assert len(emails) == 1
+            assert emails[0]["email_id"] == "1"
+
 
 class TestDeleteEmails:
     """Tests for delete_emails functionality."""
