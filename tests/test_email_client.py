@@ -495,9 +495,13 @@ class TestBatchFetchHeaders:
         mock_imap = AsyncMock()
         header_response = [
             b"1 FETCH (UID 1 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"2 FETCH (UID 2 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
         ]
         mock_imap.uid = AsyncMock(return_value=(None, header_response))
 
@@ -583,11 +587,17 @@ class TestGetEmailsStreamWithSort:
         # Mock header fetch for the page
         header_response = [
             b"3 FETCH (UID 3 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"2 FETCH (UID 2 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"1 FETCH (UID 1 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
         ]
 
         def uid_side_effect(cmd, *args):
@@ -641,9 +651,13 @@ class TestGetEmailsStreamWithSort:
         ]
         header_response = [
             b"2 FETCH (UID 2 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"1 FETCH (UID 1 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
         ]
 
         def uid_side_effect(cmd, *args):
@@ -714,11 +728,17 @@ class TestGetEmailsStreamWithSort:
         ]
         header_response = [
             b"1 FETCH (UID 1 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"2 FETCH (UID 2 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"3 FETCH (UID 3 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
         ]
 
         def uid_side_effect(cmd, uid_list, fetch_type):
@@ -771,9 +791,13 @@ class TestGetEmailsStreamWithSort:
         # Only return headers for page 2 (emails 3 and 2 in desc order)
         header_response = [
             b"3 FETCH (UID 3 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 3\r\nDate: Wed, 3 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"2 FETCH (UID 2 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
         ]
 
         def uid_side_effect(cmd, uid_list, fetch_type):
@@ -813,9 +837,13 @@ class TestGetEmailsStreamWithSort:
 
         header_response = [
             b"1 FETCH (UID 1 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
             b"2 FETCH (UID 2 BODY[HEADER] {100}",
-            bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"),
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
         ]
 
         call_count = [0]
