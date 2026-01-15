@@ -247,6 +247,50 @@ await send_email(
 
 The `in_reply_to` parameter sets the `In-Reply-To` header, and `references` sets the `References` header. Both are used by email clients to thread conversations properly.
 
+### Managing Folders
+
+You can list, create, delete, and rename email folders:
+
+```python
+# List all folders
+folders = await list_folders(account_name="work")
+for folder in folders.folders:
+    print(f"{folder.name} (flags: {folder.flags})")
+
+# Create a new folder
+await create_folder(account_name="work", folder_name="Projects/2024")
+
+# Rename a folder
+await rename_folder(account_name="work", old_name="Old Name", new_name="New Name")
+
+# Delete a folder (must be empty on most servers)
+await delete_folder(account_name="work", folder_name="Old Folder")
+```
+
+### Moving and Copying Emails
+
+Move or copy emails between folders:
+
+```python
+# Move emails to a different folder
+await move_emails(
+    account_name="work",
+    email_ids=["123", "456"],
+    destination_folder="Archive",
+    source_mailbox="INBOX"
+)
+
+# Copy emails (preserves original) - useful for applying labels
+await copy_emails(
+    account_name="work",
+    email_ids=["123"],
+    destination_folder="Labels/Important",
+    source_mailbox="INBOX"
+)
+```
+
+**Note for Proton Mail users:** Proton Mail Bridge exposes labels as folders under `Labels/`. Copying an email to a label folder effectively applies that label while keeping the original in place.
+
 ## Development
 
 This project is managed using [uv](https://github.com/ai-zerolab/uv).
