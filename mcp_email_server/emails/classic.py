@@ -229,6 +229,11 @@ class EmailClient:
 
         Returns a list of (email_id, date) tuples.
         This is much more efficient than fetching full headers when we only need dates.
+
+        Note: Different IMAP servers return different response formats:
+        - Some include UID in the FETCH line: b'1 FETCH (UID 1 BODY[...]'
+        - Others (like Proton Bridge) return UID separately: b' UID 1)'
+        This method handles both formats.
         """
         if not email_ids:
             return []
@@ -237,32 +242,40 @@ class EmailClient:
         uid_list = ",".join(uid.decode("utf-8") for uid in email_ids)
 
         try:
+            import re
+
             # Fetch only the Date header field - much smaller than full headers
             _, data = await imap.uid("fetch", uid_list, "BODY.PEEK[HEADER.FIELDS (DATE)]")
 
             results: list[tuple[str, datetime]] = []
-            current_uid = None
+            pending_uid: str | None = None
+            pending_date: datetime | None = None
 
             for item in data:
-                if isinstance(item, bytes):
-                    # Check if this is a UID response line like "1 FETCH (UID 123 ...)"
-                    item_str = item.decode("utf-8", errors="replace")
-                    if "UID" in item_str and "FETCH" in item_str:
-                        # Extract UID from response
-                        import re
-
-                        uid_match = re.search(r"UID\s+(\d+)", item_str)
-                        if uid_match:
-                            current_uid = uid_match.group(1)
-                elif isinstance(item, bytearray) and current_uid:
+                if isinstance(item, bytearray):
                     # This is the date header content
                     date_str = bytes(item).decode("utf-8", errors="replace").strip()
                     # Remove "Date: " prefix if present
                     if date_str.lower().startswith("date:"):
                         date_str = date_str[5:].strip()
-                    date = self._parse_date_from_header(date_str)
-                    results.append((current_uid, date))
-                    current_uid = None
+                    pending_date = self._parse_date_from_header(date_str)
+                    # If we already have a UID (from before the data), emit result
+                    if pending_uid is not None:
+                        results.append((pending_uid, pending_date))
+                        pending_uid = None
+                        pending_date = None
+                elif isinstance(item, bytes):
+                    item_str = item.decode("utf-8", errors="replace")
+                    # Look for UID in any bytes item
+                    uid_match = re.search(r"UID\s+(\d+)", item_str)
+                    if uid_match:
+                        if pending_date is not None:
+                            # UID came after the data
+                            results.append((uid_match.group(1), pending_date))
+                            pending_date = None
+                        else:
+                            # UID came before the data - save it
+                            pending_uid = uid_match.group(1)
 
             return results
         except Exception as e:
@@ -277,6 +290,11 @@ class EmailClient:
         """Batch fetch full headers for a list of email UIDs.
 
         Returns a list of metadata dictionaries.
+
+        Note: Different IMAP servers return different response formats:
+        - Some include UID in the FETCH line: b'1 FETCH (UID 1 BODY[...]'
+        - Others (like Proton Bridge) return UID separately: b' UID 1)'
+        This method handles both formats.
         """
         if not email_ids:
             return []
@@ -285,29 +303,39 @@ class EmailClient:
         uid_list = ",".join(email_ids)
 
         try:
+            import re
+
             _, data = await imap.uid("fetch", uid_list, "BODY.PEEK[HEADER]")
 
             results: list[dict[str, Any]] = []
-            current_uid = None
-            current_headers = None
+            pending_uid: str | None = None
+            pending_headers: bytes | None = None
 
             for item in data:
-                if isinstance(item, bytes):
+                if isinstance(item, bytearray):
+                    # Store headers
+                    pending_headers = bytes(item)
+                    # If we already have a UID (from before the data), emit result
+                    if pending_uid is not None:
+                        metadata = self._parse_header_to_metadata(pending_uid, pending_headers)
+                        if metadata:
+                            results.append(metadata)
+                        pending_uid = None
+                        pending_headers = None
+                elif isinstance(item, bytes):
                     item_str = item.decode("utf-8", errors="replace")
-                    if "UID" in item_str and "FETCH" in item_str:
-                        import re
-
-                        uid_match = re.search(r"UID\s+(\d+)", item_str)
-                        if uid_match:
-                            current_uid = uid_match.group(1)
-                elif isinstance(item, bytearray) and current_uid:
-                    current_headers = bytes(item)
-                    # Parse and add to results
-                    metadata = self._parse_header_to_metadata(current_uid, current_headers)
-                    if metadata:
-                        results.append(metadata)
-                    current_uid = None
-                    current_headers = None
+                    # Look for UID in any bytes item
+                    uid_match = re.search(r"UID\s+(\d+)", item_str)
+                    if uid_match:
+                        if pending_headers is not None:
+                            # UID came after the data
+                            metadata = self._parse_header_to_metadata(uid_match.group(1), pending_headers)
+                            if metadata:
+                                results.append(metadata)
+                            pending_headers = None
+                        else:
+                            # UID came before the data - save it
+                            pending_uid = uid_match.group(1)
 
             return results
         except Exception as e:
