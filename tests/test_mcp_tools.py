@@ -169,6 +169,9 @@ class TestMcpTools:
                 to_address=None,
                 order="desc",
                 mailbox="INBOX",
+                seen=None,
+                flagged=None,
+                answered=None,
             )
 
     @pytest.mark.asyncio
@@ -214,6 +217,9 @@ class TestMcpTools:
                 to_address=None,
                 order="desc",
                 mailbox="Sent",
+                seen=None,
+                flagged=None,
+                answered=None,
             )
 
     @pytest.mark.asyncio

@@ -193,6 +193,9 @@ class EmailClient:
         text: str | None = None,
         from_address: str | None = None,
         to_address: str | None = None,
+        seen: bool | None = None,
+        flagged: bool | None = None,
+        answered: bool | None = None,
     ):
         search_criteria = []
         if before:
@@ -210,11 +213,17 @@ class EmailClient:
         if to_address:
             search_criteria.extend(["TO", to_address])
 
-        # If no specific criteria, search for ALL
-        if not search_criteria:
-            search_criteria = ["ALL"]
+        # Flag-based criteria using mapping to reduce complexity
+        flag_criteria = [
+            (seen, {True: "SEEN", False: "UNSEEN"}),
+            (flagged, {True: "FLAGGED", False: "UNFLAGGED"}),
+            (answered, {True: "ANSWERED", False: "UNANSWERED"}),
+        ]
+        for flag_value, criteria_map in flag_criteria:
+            if flag_value in criteria_map:
+                search_criteria.append(criteria_map[flag_value])
 
-        return search_criteria
+        return search_criteria or ["ALL"]
 
     @staticmethod
     def _parse_date_from_header(date_str: str) -> datetime:
@@ -389,6 +398,9 @@ class EmailClient:
         from_address: str | None = None,
         to_address: str | None = None,
         mailbox: str = "INBOX",
+        seen: bool | None = None,
+        flagged: bool | None = None,
+        answered: bool | None = None,
     ) -> int:
         imap = self.imap_class(self.email_server.host, self.email_server.port)
         try:
@@ -401,7 +413,14 @@ class EmailClient:
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
             search_criteria = self._build_search_criteria(
-                before, since, subject, from_address=from_address, to_address=to_address
+                before,
+                since,
+                subject,
+                from_address=from_address,
+                to_address=to_address,
+                seen=seen,
+                flagged=flagged,
+                answered=answered,
             )
             logger.info(f"Count: Search criteria: {search_criteria}")
             # Search for messages and count them - use UID SEARCH for consistency
@@ -425,6 +444,9 @@ class EmailClient:
         to_address: str | None = None,
         order: str = "desc",
         mailbox: str = "INBOX",
+        seen: bool | None = None,
+        flagged: bool | None = None,
+        answered: bool | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         imap = self.imap_class(self.email_server.host, self.email_server.port)
         try:
@@ -438,7 +460,14 @@ class EmailClient:
             await imap.select(_quote_mailbox(mailbox))
 
             search_criteria = self._build_search_criteria(
-                before, since, subject, from_address=from_address, to_address=to_address
+                before,
+                since,
+                subject,
+                from_address=from_address,
+                to_address=to_address,
+                seen=seen,
+                flagged=flagged,
+                answered=answered,
             )
             logger.info(f"Get metadata: Search criteria: {search_criteria}")
 
@@ -1337,14 +1366,36 @@ class ClassicEmailHandler(EmailHandler):
         to_address: str | None = None,
         order: str = "desc",
         mailbox: str = "INBOX",
+        seen: bool | None = None,
+        flagged: bool | None = None,
+        answered: bool | None = None,
     ) -> EmailMetadataPageResponse:
         emails = []
         async for email_data in self.incoming_client.get_emails_metadata_stream(
-            page, page_size, before, since, subject, from_address, to_address, order, mailbox
+            page,
+            page_size,
+            before,
+            since,
+            subject,
+            from_address,
+            to_address,
+            order,
+            mailbox,
+            seen,
+            flagged,
+            answered,
         ):
             emails.append(EmailMetadata.from_email(email_data))
         total = await self.incoming_client.get_email_count(
-            before, since, subject, from_address=from_address, to_address=to_address, mailbox=mailbox
+            before,
+            since,
+            subject,
+            from_address=from_address,
+            to_address=to_address,
+            mailbox=mailbox,
+            seen=seen,
+            flagged=flagged,
+            answered=answered,
         )
         return EmailMetadataPageResponse(
             page=page,
