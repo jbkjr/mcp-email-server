@@ -535,6 +535,28 @@ class TestBatchFetchDates:
         assert len(result) == 1
         assert result[0][1].year == 2024
 
+    @pytest.mark.asyncio
+    async def test_batch_fetch_dates_uid_after_data(self, email_client):
+        """Test batch fetch dates when UID comes after data (Proton Bridge format)."""
+        mock_imap = AsyncMock()
+        # Proton Bridge returns date data first, then UID in a separate item
+        date_response = [
+            b"1 FETCH (BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n"),
+            b" UID 1)",
+            b"2 FETCH (BODY[HEADER.FIELDS (DATE)] {30}",
+            bytearray(b"Tue, 2 Jan 2024 00:00:00 +0000\r\n"),  # Without "Date:" prefix
+            b" UID 2)",
+        ]
+        mock_imap.uid = AsyncMock(return_value=(None, date_response))
+
+        result = await email_client._batch_fetch_dates(mock_imap, [b"1", b"2"])
+
+        assert len(result) == 2
+        assert result[0][0] == "1"
+        assert result[0][1].year == 2024
+        assert result[1][0] == "2"
+
 
 class TestBatchFetchHeaders:
     """Tests for batch header fetching."""
@@ -578,6 +600,53 @@ class TestBatchFetchHeaders:
 
         result = await email_client._batch_fetch_headers(mock_imap, ["1", "2"])
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_uid_after_data(self, email_client):
+        """Test batch fetch headers when UID comes after data (Proton Bridge format)."""
+        mock_imap = AsyncMock()
+        # Proton Bridge returns header data first, then UID in a separate item
+        header_response = [
+            b"1 FETCH (BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 1\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b" UID 1)",
+            b"2 FETCH (BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test 2\r\nDate: Tue, 2 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b" UID 2)",
+        ]
+        mock_imap.uid = AsyncMock(return_value=(None, header_response))
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["1", "2"])
+
+        assert len(result) == 2
+        assert result[0]["email_id"] == "1"
+        assert result[0]["subject"] == "Test 1"
+        assert result[1]["email_id"] == "2"
+        assert result[1]["subject"] == "Test 2"
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_bytes_without_uid(self, email_client):
+        """Test batch fetch headers ignores bytes items without UID match."""
+        mock_imap = AsyncMock()
+        # Include some bytes items that don't have UID (like status messages)
+        header_response = [
+            b"* OK Still here",  # No UID - should be skipped
+            b"1 FETCH (UID 1 BODY[HEADER] {100}",
+            bytearray(
+                b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n\r\n"
+            ),
+            b"FETCH completed",  # No UID - should be skipped
+        ]
+        mock_imap.uid = AsyncMock(return_value=(None, header_response))
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["1"])
+
+        assert len(result) == 1
+        assert result[0]["email_id"] == "1"
 
 
 class TestParseHeaderToMetadata:
