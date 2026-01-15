@@ -73,7 +73,13 @@ async def list_emails_metadata(
         Literal["asc", "desc"],
         Field(default=None, description="Order emails by field. `asc` or `desc`."),
     ] = "desc",
-    mailbox: Annotated[str, Field(default="INBOX", description="The mailbox to search.")] = "INBOX",
+    mailbox: Annotated[
+        str,
+        Field(
+            default="INBOX",
+            description="IMAP folder path. Standard: INBOX, Sent, Drafts, Trash. Provider-specific: Gmail uses '[Gmail]/...' prefix (e.g., '[Gmail]/Sent Mail'); ProtonMail Bridge exposes folders as 'Folders/<name>' and labels as 'Labels/<name>'.",
+        ),
+    ] = "INBOX",
     seen: Annotated[
         bool | None,
         Field(default=None, description="Filter by read status: True=read, False=unread, None=all."),
@@ -116,7 +122,7 @@ async def get_emails_content(
             description="List of email_id to retrieve (obtained from list_emails_metadata). Can be a single email_id or multiple email_ids."
         ),
     ],
-    mailbox: Annotated[str, Field(default="INBOX", description="The mailbox to retrieve emails from.")] = "INBOX",
+    mailbox: Annotated[str, Field(default="INBOX", description="IMAP folder path. Standard: INBOX, Sent, Drafts, Trash. Provider-specific: Gmail uses '[Gmail]/...' prefix; ProtonMail Bridge uses 'Folders/<name>' and 'Labels/<name>'.")] = "INBOX",
 ) -> EmailContentBatchResponse:
     handler = dispatch_handler(account_name)
     return await handler.get_emails_content(email_ids, mailbox)
@@ -190,7 +196,7 @@ async def delete_emails(
         list[str],
         Field(description="List of email_id to delete (obtained from list_emails_metadata)."),
     ],
-    mailbox: Annotated[str, Field(default="INBOX", description="The mailbox to delete emails from.")] = "INBOX",
+    mailbox: Annotated[str, Field(default="INBOX", description="IMAP folder path. Standard: INBOX, Sent, Drafts, Trash. Provider-specific: Gmail uses '[Gmail]/...' prefix; ProtonMail Bridge uses 'Folders/<name>' and 'Labels/<name>'.")] = "INBOX",
 ) -> str:
     handler = dispatch_handler(account_name)
     deleted_ids, failed_ids = await handler.delete_emails(email_ids, mailbox)
@@ -213,7 +219,7 @@ async def download_attachment(
         str, Field(description="The name of the attachment to download (as shown in the attachments list).")
     ],
     save_path: Annotated[str, Field(description="The absolute path where the attachment should be saved.")],
-    mailbox: Annotated[str, Field(description="The mailbox to search in (default: INBOX).")] = "INBOX",
+    mailbox: Annotated[str, Field(default="INBOX", description="IMAP folder path. Standard: INBOX, Sent, Drafts, Trash. Provider-specific: Gmail uses '[Gmail]/...' prefix; ProtonMail Bridge uses 'Folders/<name>' and 'Labels/<name>'.")] = "INBOX",
 ) -> AttachmentDownloadResponse:
     settings = get_settings()
     if not settings.enable_attachment_download:
