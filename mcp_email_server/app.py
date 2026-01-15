@@ -271,7 +271,7 @@ async def list_folders(
 
 
 @mcp.tool(
-    description="Move one or more emails to a different folder. Uses IMAP MOVE command if supported, otherwise falls back to COPY + DELETE. Requires enable_folder_management=true.",
+    description="Move one or more emails to a different folder (removes from source). Use this to clear emails from INBOX. Uses IMAP MOVE command if supported, otherwise falls back to COPY + DELETE. Requires enable_folder_management=true.",
 )
 async def move_emails(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -353,7 +353,7 @@ async def list_labels(
 
 
 @mcp.tool(
-    description="Apply a label to one or more emails. Copies emails to the label folder while preserving originals. Requires enable_folder_management=true."
+    description="Apply a label to one or more emails. NOTE: This only tags emails - originals stay in INBOX. To remove from INBOX, use move_emails instead. Requires enable_folder_management=true."
 )
 async def apply_label(
     account_name: Annotated[str, Field(description="The name of the email account.")],
