@@ -68,7 +68,19 @@ async def list_emails_metadata(
         Literal["asc", "desc"],
         Field(default=None, description="Order emails by field. `asc` or `desc`."),
     ] = "desc",
-    mailbox: Annotated[str, Field(default="INBOX", description="The mailbox to retrieve emails from.")] = "INBOX",
+    mailbox: Annotated[str, Field(default="INBOX", description="The mailbox to search.")] = "INBOX",
+    seen: Annotated[
+        bool | None,
+        Field(default=None, description="Filter by read status: True=read, False=unread, None=all."),
+    ] = None,
+    flagged: Annotated[
+        bool | None,
+        Field(default=None, description="Filter by flagged/starred status: True=flagged, False=unflagged, None=all."),
+    ] = None,
+    answered: Annotated[
+        bool | None,
+        Field(default=None, description="Filter by replied status: True=replied, False=not replied, None=all."),
+    ] = None,
 ) -> EmailMetadataPageResponse:
     handler = dispatch_handler(account_name)
 
@@ -82,6 +94,9 @@ async def list_emails_metadata(
         to_address=to_address,
         order=order,
         mailbox=mailbox,
+        seen=seen,
+        flagged=flagged,
+        answered=answered,
     )
 
 

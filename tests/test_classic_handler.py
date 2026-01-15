@@ -108,10 +108,18 @@ class TestClassicEmailHandler:
 
                 # Verify the client methods were called correctly
                 classic_handler.incoming_client.get_emails_metadata_stream.assert_called_once_with(
-                    1, 10, now, None, "Test", "sender@example.com", None, "desc", "INBOX"
+                    1, 10, now, None, "Test", "sender@example.com", None, "desc", "INBOX", None, None, None
                 )
                 mock_count.assert_called_once_with(
-                    now, None, "Test", from_address="sender@example.com", to_address=None, mailbox="INBOX"
+                    now,
+                    None,
+                    "Test",
+                    from_address="sender@example.com",
+                    to_address=None,
+                    mailbox="INBOX",
+                    seen=None,
+                    flagged=None,
+                    answered=None,
                 )
 
     @pytest.mark.asyncio
@@ -144,9 +152,19 @@ class TestClassicEmailHandler:
 
                 # Verify mailbox parameter was passed correctly
                 classic_handler.incoming_client.get_emails_metadata_stream.assert_called_once_with(
-                    1, 10, None, None, None, None, None, "desc", "Sent"
+                    1, 10, None, None, None, None, None, "desc", "Sent", None, None, None
                 )
-                mock_count.assert_called_once_with(None, None, None, from_address=None, to_address=None, mailbox="Sent")
+                mock_count.assert_called_once_with(
+                    None,
+                    None,
+                    None,
+                    from_address=None,
+                    to_address=None,
+                    mailbox="Sent",
+                    seen=None,
+                    flagged=None,
+                    answered=None,
+                )
 
     @pytest.mark.asyncio
     async def test_send_email(self, classic_handler):

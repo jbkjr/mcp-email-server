@@ -23,9 +23,26 @@ class EmailHandler(abc.ABC):
         to_address: str | None = None,
         order: str = "desc",
         mailbox: str = "INBOX",
+        seen: bool | None = None,
+        flagged: bool | None = None,
+        answered: bool | None = None,
     ) -> "EmailMetadataPageResponse":
         """
-        Get email metadata only (without body content) for better performance
+        Get email metadata only (without body content) for better performance.
+
+        Args:
+            page: Page number (starting from 1).
+            page_size: Number of emails per page.
+            before: Filter emails before this datetime.
+            since: Filter emails since this datetime.
+            subject: Filter by subject (substring match).
+            from_address: Filter by sender address.
+            to_address: Filter by recipient address.
+            order: Sort order ('asc' or 'desc').
+            mailbox: Mailbox to search (default: 'INBOX').
+            seen: Filter by read status (True=read, False=unread, None=all).
+            flagged: Filter by flagged/starred status (True=flagged, False=unflagged, None=all).
+            answered: Filter by replied status (True=replied, False=not replied, None=all).
         """
 
     @abc.abstractmethod

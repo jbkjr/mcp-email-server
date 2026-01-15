@@ -139,6 +139,56 @@ class TestEmailClient:
         )
         assert criteria == ["SINCE", "01-JAN-2023", "SUBJECT", "Test", "FROM", "test@example.com"]
 
+        # Test with seen=True (read emails)
+        criteria = EmailClient._build_search_criteria(seen=True)
+        assert criteria == ["SEEN"]
+
+        # Test with seen=False (unread emails)
+        criteria = EmailClient._build_search_criteria(seen=False)
+        assert criteria == ["UNSEEN"]
+
+        # Test with seen=None (all emails - no criteria added)
+        criteria = EmailClient._build_search_criteria(seen=None)
+        assert criteria == ["ALL"]
+
+        # Test with flagged=True (starred emails)
+        criteria = EmailClient._build_search_criteria(flagged=True)
+        assert criteria == ["FLAGGED"]
+
+        # Test with flagged=False (non-starred emails)
+        criteria = EmailClient._build_search_criteria(flagged=False)
+        assert criteria == ["UNFLAGGED"]
+
+        # Test with answered=True (replied emails)
+        criteria = EmailClient._build_search_criteria(answered=True)
+        assert criteria == ["ANSWERED"]
+
+        # Test with answered=False (not replied emails)
+        criteria = EmailClient._build_search_criteria(answered=False)
+        assert criteria == ["UNANSWERED"]
+
+        # Test compound criteria: unread emails from a specific sender
+        criteria = EmailClient._build_search_criteria(seen=False, from_address="sender@example.com")
+        assert "UNSEEN" in criteria
+        assert "FROM" in criteria
+        assert "sender@example.com" in criteria
+
+        # Test compound criteria: flagged and answered
+        criteria = EmailClient._build_search_criteria(flagged=True, answered=True)
+        assert "FLAGGED" in criteria
+        assert "ANSWERED" in criteria
+
+        # Test compound criteria: unread, flagged, from specific sender, with subject
+        criteria = EmailClient._build_search_criteria(
+            seen=False, flagged=True, from_address="test@example.com", subject="Important"
+        )
+        assert "UNSEEN" in criteria
+        assert "FLAGGED" in criteria
+        assert "FROM" in criteria
+        assert "test@example.com" in criteria
+        assert "SUBJECT" in criteria
+        assert "Important" in criteria
+
     @pytest.mark.asyncio
     async def test_get_emails_stream(self, email_client):
         """Test getting emails stream."""
