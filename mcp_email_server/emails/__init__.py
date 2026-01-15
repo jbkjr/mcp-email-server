@@ -7,6 +7,7 @@ if TYPE_CHECKING:
         AttachmentDownloadResponse,
         EmailContentBatchResponse,
         EmailLabelsResponse,
+        EmailMarkResponse,
         EmailMetadataPageResponse,
         EmailMoveResponse,
         FolderListResponse,
@@ -266,4 +267,23 @@ class EmailHandler(abc.ABC):
 
         Returns:
             FolderOperationResponse with operation result.
+        """
+
+    @abc.abstractmethod
+    async def mark_emails(
+        self,
+        email_ids: list[str],
+        mark_as: str,
+        mailbox: str = "INBOX",
+    ) -> "EmailMarkResponse":
+        """
+        Mark emails as read or unread.
+
+        Args:
+            email_ids: List of email UIDs to mark.
+            mark_as: Either "read" or "unread".
+            mailbox: The mailbox containing the emails (default: "INBOX").
+
+        Returns:
+            EmailMarkResponse with operation results.
         """
