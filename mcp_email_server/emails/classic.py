@@ -216,8 +216,8 @@ class EmailClient:
             date_tuple = email.utils.parsedate_tz(date_str)
             if date_tuple:
                 return datetime.fromtimestamp(email.utils.mktime_tz(date_tuple), tz=timezone.utc)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to parse date '{date_str}': {e}")
         return datetime.now(timezone.utc)
 
     async def _batch_fetch_dates(
@@ -380,7 +380,7 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
-    async def get_emails_metadata_stream(
+    async def get_emails_metadata_stream(  # noqa: C901
         self,
         page: int = 1,
         page_size: int = 10,

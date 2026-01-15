@@ -663,7 +663,7 @@ class TestGetEmailsStreamWithSort:
         def uid_side_effect(cmd, *args):
             call_count[0] += 1
             if cmd == "sort":
-                raise Exception("SORT not supported")
+                raise RuntimeError("SORT not supported")
             elif "HEADER.FIELDS" in args[-1] if args else False:
                 return (None, date_response)
             else:
