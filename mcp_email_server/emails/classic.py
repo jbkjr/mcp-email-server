@@ -25,6 +25,7 @@ from mcp_email_server.emails.models import (
     EmailBodyResponse,
     EmailContentBatchResponse,
     EmailLabelsResponse,
+    EmailMarkResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
     EmailMoveResponse,
@@ -1258,6 +1259,45 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
+    async def mark_emails(
+        self, email_ids: list[str], mark_as: str, mailbox: str = "INBOX"
+    ) -> tuple[list[str], list[str]]:
+        """Mark emails as read or unread. Returns (marked_ids, failed_ids)."""
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        marked_ids = []
+        failed_ids = []
+
+        # Determine flag operation: +FLAGS for read, -FLAGS for unread
+        if mark_as == "read":
+            flag_op = "+FLAGS"
+        elif mark_as == "unread":
+            flag_op = "-FLAGS"
+        else:
+            raise ValueError(f"Invalid mark_as value: {mark_as}. Must be 'read' or 'unread'.")
+
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await _send_imap_id(imap)
+            await imap.select(_quote_mailbox(mailbox))
+
+            for email_id in email_ids:
+                try:
+                    await imap.uid("store", email_id, flag_op, r"(\Seen)")
+                    marked_ids.append(email_id)
+                except Exception as e:
+                    logger.error(f"Failed to mark email {email_id} as {mark_as}: {e}")
+                    failed_ids.append(email_id)
+
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
+        return marked_ids, failed_ids
+
     async def delete_from_folder(self, email_ids: list[str], folder: str) -> tuple[list[str], list[str]]:
         """Delete emails from a specific folder. Returns (deleted_ids, failed_ids)."""
         return await self.delete_emails(email_ids, folder)
@@ -1592,4 +1632,20 @@ class ClassicEmailHandler(EmailHandler):
             success=success,
             folder_name=label_name,
             message=message.replace(label_folder, label_name) if success else message,
+        )
+
+    async def mark_emails(
+        self,
+        email_ids: list[str],
+        mark_as: str,
+        mailbox: str = "INBOX",
+    ) -> EmailMarkResponse:
+        """Mark emails as read or unread."""
+        marked_ids, failed_ids = await self.incoming_client.mark_emails(email_ids, mark_as, mailbox)
+        return EmailMarkResponse(
+            success=len(failed_ids) == 0,
+            marked_ids=marked_ids,
+            failed_ids=failed_ids,
+            mailbox=mailbox,
+            marked_as=mark_as,
         )

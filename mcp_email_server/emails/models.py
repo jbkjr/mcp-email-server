@@ -126,3 +126,13 @@ class EmailLabelsResponse(BaseModel):
 
     email_id: str
     labels: list[str]  # List of label names (without prefix)
+
+
+class EmailMarkResponse(BaseModel):
+    """Response for mark_emails (read/unread) operations"""
+
+    success: bool
+    marked_ids: list[str]
+    failed_ids: list[str]
+    mailbox: str
+    marked_as: str  # "read" or "unread"
