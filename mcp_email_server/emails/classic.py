@@ -1,5 +1,6 @@
 import email.utils
 import mimetypes
+import ssl
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from email.header import Header
@@ -72,6 +73,20 @@ async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
         logger.warning(f"IMAP ID command failed: {e!s}")
 
 
+def _create_smtp_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
+    """Create SSL context for SMTP connections.
+
+    Returns None for default verification, or permissive context
+    for self-signed certificates when verify_ssl=False.
+    """
+    if verify_ssl:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 class EmailClient:
     def __init__(self, email_server: EmailServer, sender: str | None = None):
         self.email_server = email_server
@@ -81,6 +96,11 @@ class EmailClient:
 
         self.smtp_use_tls = self.email_server.use_ssl
         self.smtp_start_tls = self.email_server.start_ssl
+        self.smtp_verify_ssl = self.email_server.verify_ssl
+
+    def _get_smtp_ssl_context(self) -> ssl.SSLContext | None:
+        """Get SSL context for SMTP connections based on verify_ssl setting."""
+        return _create_smtp_ssl_context(self.smtp_verify_ssl)
 
     def _parse_email_data(self, raw_email: bytes, email_id: str | None = None) -> dict[str, Any]:  # noqa: C901
         """Parse raw email data into a structured dictionary."""
@@ -630,6 +650,7 @@ class EmailClient:
             port=self.email_server.port,
             start_tls=self.smtp_start_tls,
             use_tls=self.smtp_use_tls,
+            tls_context=self._get_smtp_ssl_context(),
         ) as smtp:
             await smtp.login(self.email_server.user_name, self.email_server.password)
 

@@ -1,5 +1,6 @@
 import asyncio
 import email
+import ssl
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -7,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_email_server.config import EmailServer
-from mcp_email_server.emails.classic import EmailClient
+from mcp_email_server.emails.classic import EmailClient, _create_smtp_ssl_context
 
 
 @pytest.fixture
@@ -354,3 +355,85 @@ class TestSendEmailReplyHeaders:
             msg = call_args[0][0]
             assert "In-Reply-To" not in msg
             assert "References" not in msg
+
+
+class TestSmtpSslContext:
+    """Tests for SMTP SSL context creation."""
+
+    def test_create_smtp_ssl_context_with_verification(self):
+        """When verify_ssl=True, should return None (use default verification)."""
+        result = _create_smtp_ssl_context(verify_ssl=True)
+        assert result is None
+
+    def test_create_smtp_ssl_context_without_verification(self):
+        """When verify_ssl=False, should return permissive SSL context."""
+        result = _create_smtp_ssl_context(verify_ssl=False)
+
+        assert result is not None
+        assert isinstance(result, ssl.SSLContext)
+        assert result.check_hostname is False
+        assert result.verify_mode == ssl.CERT_NONE
+
+    def test_email_client_get_smtp_ssl_context_default(self):
+        """EmailClient should use verify_ssl from EmailServer (default True)."""
+        server = EmailServer(
+            user_name="test",
+            password="test",
+            host="smtp.example.com",
+            port=587,
+        )
+        client = EmailClient(server)
+
+        # Default verify_ssl is True, so should return None
+        assert client.smtp_verify_ssl is True
+        assert client._get_smtp_ssl_context() is None
+
+    def test_email_client_get_smtp_ssl_context_disabled(self):
+        """EmailClient should return permissive context when verify_ssl=False."""
+        server = EmailServer(
+            user_name="test",
+            password="test",
+            host="smtp.example.com",
+            port=587,
+            verify_ssl=False,
+        )
+        client = EmailClient(server)
+
+        assert client.smtp_verify_ssl is False
+        ctx = client._get_smtp_ssl_context()
+        assert ctx is not None
+        assert ctx.check_hostname is False
+        assert ctx.verify_mode == ssl.CERT_NONE
+
+    @pytest.mark.asyncio
+    async def test_send_email_passes_tls_context(self):
+        """send_email should pass tls_context to SMTP connection."""
+        server = EmailServer(
+            user_name="test",
+            password="test",
+            host="smtp.example.com",
+            port=587,
+            verify_ssl=False,
+        )
+        client = EmailClient(server, sender="test@example.com")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp) as mock_smtp_class:
+            await client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test",
+                body="Body",
+            )
+
+            # Verify SMTP was called with tls_context
+            call_kwargs = mock_smtp_class.call_args.kwargs
+            assert "tls_context" in call_kwargs
+            ctx = call_kwargs["tls_context"]
+            assert ctx is not None
+            assert ctx.check_hostname is False
+            assert ctx.verify_mode == ssl.CERT_NONE
