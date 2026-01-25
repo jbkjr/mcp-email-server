@@ -26,6 +26,7 @@ def _parse_bool_env(value: str | None, default: bool = False) -> bool:
         return default
     return value.lower() in ("true", "1", "yes", "on")
 
+
 CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH)).expanduser().resolve()
 
 
