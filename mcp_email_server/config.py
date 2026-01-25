@@ -17,9 +17,16 @@ from pydantic_settings import (
 
 from mcp_email_server.log import logger
 
-DEFAILT_CONFIG_PATH = "~/.config/zerolib/mcp_email_server/config.toml"
+DEFAULT_CONFIG_PATH = "~/.config/zerolib/mcp_email_server/config.toml"
 
-CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAILT_CONFIG_PATH)).expanduser().resolve()
+
+def _parse_bool_env(value: str | None, default: bool = False) -> bool:
+    """Parse boolean value from environment variable."""
+    if value is None:
+        return default
+    return value.lower() in ("true", "1", "yes", "on")
+
+CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH)).expanduser().resolve()
 
 
 class EmailServer(BaseModel):
@@ -155,12 +162,6 @@ class EmailSettings(AccountAttributes):
         if not email_address or not password:
             return None
 
-        # Parse boolean values
-        def parse_bool(value: str | None, default: bool = True) -> bool:
-            if value is None:
-                return default
-            return value.lower() in ("true", "1", "yes", "on")
-
         # Get all environment variables with defaults
         account_name = os.getenv("MCP_EMAIL_SERVER_ACCOUNT_NAME", "default")
         full_name = os.getenv("MCP_EMAIL_SERVER_FULL_NAME", email_address.split("@")[0])
@@ -182,17 +183,17 @@ class EmailSettings(AccountAttributes):
                 password=password,
                 imap_host=imap_host,
                 imap_port=int(os.getenv("MCP_EMAIL_SERVER_IMAP_PORT", "993")),
-                imap_ssl=parse_bool(os.getenv("MCP_EMAIL_SERVER_IMAP_SSL"), True),
+                imap_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_IMAP_SSL"), True),
                 smtp_host=smtp_host,
                 smtp_port=int(os.getenv("MCP_EMAIL_SERVER_SMTP_PORT", "465")),
-                smtp_ssl=parse_bool(os.getenv("MCP_EMAIL_SERVER_SMTP_SSL"), True),
-                smtp_start_ssl=parse_bool(os.getenv("MCP_EMAIL_SERVER_SMTP_START_SSL"), False),
-                smtp_verify_ssl=parse_bool(os.getenv("MCP_EMAIL_SERVER_SMTP_VERIFY_SSL"), True),
+                smtp_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SMTP_SSL"), True),
+                smtp_start_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SMTP_START_SSL"), False),
+                smtp_verify_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SMTP_VERIFY_SSL"), True),
                 smtp_user_name=os.getenv("MCP_EMAIL_SERVER_SMTP_USER_NAME", user_name),
                 smtp_password=os.getenv("MCP_EMAIL_SERVER_SMTP_PASSWORD", password),
                 imap_user_name=os.getenv("MCP_EMAIL_SERVER_IMAP_USER_NAME", user_name),
                 imap_password=os.getenv("MCP_EMAIL_SERVER_IMAP_PASSWORD", password),
-                save_to_sent=parse_bool(os.getenv("MCP_EMAIL_SERVER_SAVE_TO_SENT"), True),
+                save_to_sent=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SAVE_TO_SENT"), True),
                 sent_folder_name=os.getenv("MCP_EMAIL_SERVER_SENT_FOLDER_NAME"),
             )
         except (ValueError, TypeError) as e:
@@ -214,13 +215,6 @@ class ProviderSettings(AccountAttributes):
 
     def masked(self) -> AccountAttributes:
         return self.model_copy(update={"api_key": "********"})
-
-
-def _parse_bool_env(value: str | None, default: bool = False) -> bool:
-    """Parse boolean value from environment variable."""
-    if value is None:
-        return default
-    return value.lower() in ("true", "1", "yes", "on")
 
 
 class Settings(BaseSettings):
@@ -350,7 +344,6 @@ def store_settings(settings: Settings | None = None) -> None:
     if not settings:
         settings = get_settings()
     settings.store()
-    return
 
 
 def delete_settings() -> None:
