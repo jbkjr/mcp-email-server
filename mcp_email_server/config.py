@@ -29,6 +29,7 @@ class EmailServer(BaseModel):
     port: int
     use_ssl: bool = True  # Usually port 465
     start_ssl: bool = False  # Usually port 587
+    verify_ssl: bool = True  # Set to False for self-signed certificates (e.g., ProtonMail Bridge)
 
     def masked(self) -> EmailServer:
         return self.model_copy(update={"password": "********"})
@@ -96,6 +97,7 @@ class EmailSettings(AccountAttributes):
         smtp_port: int = 465,
         smtp_ssl: bool = True,
         smtp_start_ssl: bool = False,
+        smtp_verify_ssl: bool = True,
         smtp_user_name: str | None = None,
         smtp_password: str | None = None,
         save_to_sent: bool = True,
@@ -119,6 +121,7 @@ class EmailSettings(AccountAttributes):
                 port=smtp_port,
                 use_ssl=smtp_ssl,
                 start_ssl=smtp_start_ssl,
+                verify_ssl=smtp_verify_ssl,
             ),
             save_to_sent=save_to_sent,
             sent_folder_name=sent_folder_name,
@@ -141,6 +144,7 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_SMTP_PORT (default: 465)
         - MCP_EMAIL_SERVER_SMTP_SSL (default: true)
         - MCP_EMAIL_SERVER_SMTP_START_SSL (default: false)
+        - MCP_EMAIL_SERVER_SMTP_VERIFY_SSL (default: true)
         - MCP_EMAIL_SERVER_SAVE_TO_SENT (default: true)
         - MCP_EMAIL_SERVER_SENT_FOLDER_NAME (default: auto-detect)
         """
@@ -183,6 +187,7 @@ class EmailSettings(AccountAttributes):
                 smtp_port=int(os.getenv("MCP_EMAIL_SERVER_SMTP_PORT", "465")),
                 smtp_ssl=parse_bool(os.getenv("MCP_EMAIL_SERVER_SMTP_SSL"), True),
                 smtp_start_ssl=parse_bool(os.getenv("MCP_EMAIL_SERVER_SMTP_START_SSL"), False),
+                smtp_verify_ssl=parse_bool(os.getenv("MCP_EMAIL_SERVER_SMTP_VERIFY_SSL"), True),
                 smtp_user_name=os.getenv("MCP_EMAIL_SERVER_SMTP_USER_NAME", user_name),
                 smtp_password=os.getenv("MCP_EMAIL_SERVER_SMTP_PASSWORD", password),
                 imap_user_name=os.getenv("MCP_EMAIL_SERVER_IMAP_USER_NAME", user_name),

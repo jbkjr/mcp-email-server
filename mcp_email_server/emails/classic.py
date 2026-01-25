@@ -1,5 +1,9 @@
+import asyncio
 import email.utils
 import mimetypes
+import re
+import ssl
+import time
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from email.header import Header
@@ -80,17 +84,18 @@ async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
         logger.warning(f"IMAP ID command failed: {e!s}")
 
 
-def _has_sort_capability(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> bool:
-    """Check if the IMAP server supports the SORT extension (RFC 5256).
+def _create_smtp_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
+    """Create SSL context for SMTP connections.
 
-    The SORT capability allows server-side sorting of emails, which is much
-    more efficient than fetching all emails and sorting client-side.
+    Returns None for default verification, or permissive context
+    for self-signed certificates when verify_ssl=False.
     """
-    try:
-        capabilities = imap.protocol.capabilities
-        return "SORT" in capabilities
-    except Exception:
-        return False
+    if verify_ssl:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 class EmailClient:
@@ -102,6 +107,11 @@ class EmailClient:
 
         self.smtp_use_tls = self.email_server.use_ssl
         self.smtp_start_tls = self.email_server.start_ssl
+        self.smtp_verify_ssl = self.email_server.verify_ssl
+
+    def _get_smtp_ssl_context(self) -> ssl.SSLContext | None:
+        """Get SSL context for SMTP connections based on verify_ssl setting."""
+        return _create_smtp_ssl_context(self.smtp_verify_ssl)
 
     def _parse_email_data(self, raw_email: bytes, email_id: str | None = None) -> dict[str, Any]:  # noqa: C901
         """Parse raw email data into a structured dictionary."""
@@ -226,140 +236,8 @@ class EmailClient:
 
         return search_criteria or ["ALL"]
 
-    @staticmethod
-    def _parse_date_from_header(date_str: str) -> datetime:
-        """Parse a date string from an email header into a datetime object."""
-        try:
-            date_tuple = email.utils.parsedate_tz(date_str)
-            if date_tuple:
-                return datetime.fromtimestamp(email.utils.mktime_tz(date_tuple), tz=timezone.utc)
-        except Exception as e:
-            logger.debug(f"Failed to parse date '{date_str}': {e}")
-        return datetime.now(timezone.utc)
-
-    async def _batch_fetch_dates(
-        self,
-        imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
-        email_ids: list[bytes],
-    ) -> list[tuple[str, datetime]]:
-        """Batch fetch only Date headers for a list of email UIDs.
-
-        Returns a list of (email_id, date) tuples.
-        This is much more efficient than fetching full headers when we only need dates.
-
-        Note: Different IMAP servers return different response formats:
-        - Some include UID in the FETCH line: b'1 FETCH (UID 1 BODY[...]'
-        - Others (like Proton Bridge) return UID separately: b' UID 1)'
-        This method handles both formats.
-        """
-        if not email_ids:
-            return []
-
-        # Join UIDs for batch fetch: "1,2,3,4,5"
-        uid_list = ",".join(uid.decode("utf-8") for uid in email_ids)
-
-        try:
-            import re
-
-            # Fetch only the Date header field - much smaller than full headers
-            _, data = await imap.uid("fetch", uid_list, "BODY.PEEK[HEADER.FIELDS (DATE)]")
-
-            results: list[tuple[str, datetime]] = []
-            pending_uid: str | None = None
-            pending_date: datetime | None = None
-
-            for item in data:
-                if isinstance(item, bytearray):
-                    # This is the date header content
-                    date_str = bytes(item).decode("utf-8", errors="replace").strip()
-                    # Remove "Date: " prefix if present
-                    if date_str.lower().startswith("date:"):
-                        date_str = date_str[5:].strip()
-                    pending_date = self._parse_date_from_header(date_str)
-                    # If we already have a UID (from before the data), emit result
-                    if pending_uid is not None:
-                        results.append((pending_uid, pending_date))
-                        pending_uid = None
-                        pending_date = None
-                elif isinstance(item, bytes):
-                    item_str = item.decode("utf-8", errors="replace")
-                    # Look for UID in any bytes item
-                    uid_match = re.search(r"UID\s+(\d+)", item_str)
-                    if uid_match:
-                        if pending_date is not None:
-                            # UID came after the data
-                            results.append((uid_match.group(1), pending_date))
-                            pending_date = None
-                        else:
-                            # UID came before the data - save it
-                            pending_uid = uid_match.group(1)
-
-            return results
-        except Exception as e:
-            logger.error(f"Error in batch fetch dates: {e}")
-            return []
-
-    async def _batch_fetch_headers(
-        self,
-        imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
-        email_ids: list[str],
-    ) -> list[dict[str, Any]]:
-        """Batch fetch full headers for a list of email UIDs.
-
-        Returns a list of metadata dictionaries.
-
-        Note: Different IMAP servers return different response formats:
-        - Some include UID in the FETCH line: b'1 FETCH (UID 1 BODY[...]'
-        - Others (like Proton Bridge) return UID separately: b' UID 1)'
-        This method handles both formats.
-        """
-        if not email_ids:
-            return []
-
-        # Join UIDs for batch fetch: "1,2,3,4,5"
-        uid_list = ",".join(email_ids)
-
-        try:
-            import re
-
-            _, data = await imap.uid("fetch", uid_list, "BODY.PEEK[HEADER]")
-
-            results: list[dict[str, Any]] = []
-            pending_uid: str | None = None
-            pending_headers: bytes | None = None
-
-            for item in data:
-                if isinstance(item, bytearray):
-                    # Store headers; emit if we already have a UID
-                    pending_headers = bytes(item)
-                    if pending_uid is not None:
-                        self._append_header_metadata(results, pending_uid, pending_headers)
-                        pending_uid, pending_headers = None, None
-                elif isinstance(item, bytes):
-                    uid_match = re.search(r"UID\s+(\d+)", item.decode("utf-8", errors="replace"))
-                    if not uid_match:
-                        continue
-                    if pending_headers is not None:
-                        # UID came after the data
-                        self._append_header_metadata(results, uid_match.group(1), pending_headers)
-                        pending_headers = None
-                    else:
-                        # UID came before the data - save it
-                        pending_uid = uid_match.group(1)
-
-            return results
-        except Exception as e:
-            logger.error(f"Error in batch fetch headers: {e}")
-            return []
-
-    def _append_header_metadata(self, results: list[dict[str, Any]], uid: str, headers: bytes) -> None:
-        """Parse headers and append to results if successful."""
-        metadata = self._parse_header_to_metadata(uid, headers)
-        if metadata:
-            results.append(metadata)
-
-    def _parse_header_to_metadata(self, email_id: str, raw_headers: bytes) -> dict[str, Any] | None:
-        """Parse raw email headers into a metadata dictionary."""
+    def _parse_headers(self, email_id: str, raw_headers: bytes) -> dict[str, Any] | None:
+        """Parse raw email headers into metadata dictionary."""
         try:
             parser = BytesParser(policy=default)
             email_message = parser.parsebytes(raw_headers)
@@ -377,7 +255,15 @@ class EmailClient:
             if cc_header:
                 to_addresses.extend([addr.strip() for addr in cc_header.split(",")])
 
-            date = self._parse_date_from_header(date_str)
+            try:
+                date_tuple = email.utils.parsedate_tz(date_str)
+                date = (
+                    datetime.fromtimestamp(email.utils.mktime_tz(date_tuple), tz=timezone.utc)
+                    if date_tuple
+                    else datetime.now(timezone.utc)
+                )
+            except Exception:
+                date = datetime.now(timezone.utc)
 
             return {
                 "email_id": email_id,
@@ -388,8 +274,92 @@ class EmailClient:
                 "attachments": [],
             }
         except Exception as e:
-            logger.error(f"Error parsing header metadata: {e}")
+            logger.error(f"Error parsing email headers: {e!s}")
             return None
+
+    async def _fetch_dates_chunk(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        chunk: list[bytes],
+        chunk_num: int,
+        total_chunks: int,
+    ) -> dict[str, datetime]:
+        """Fetch INTERNALDATE for a single chunk of UIDs."""
+        uid_list = ",".join(uid.decode() for uid in chunk)
+        chunk_start = time.perf_counter()
+        _, data = await imap.uid("fetch", uid_list, "(INTERNALDATE)")
+        chunk_elapsed = time.perf_counter() - chunk_start
+
+        chunk_dates: dict[str, datetime] = {}
+        for item in data:
+            if not isinstance(item, bytes) or b"INTERNALDATE" not in item:
+                continue
+            uid_match = re.search(rb"UID (\d+)", item)
+            date_match = re.search(rb'INTERNALDATE "([^"]+)"', item)
+            if uid_match and date_match:
+                uid = uid_match.group(1).decode()
+                date_str = date_match.group(1).decode().strip()
+                chunk_dates[uid] = datetime.strptime(date_str, "%d-%b-%Y %H:%M:%S %z")
+
+        if total_chunks > 1:
+            logger.info(f"Fetched dates chunk {chunk_num}/{total_chunks}: {len(chunk)} UIDs in {chunk_elapsed:.2f}s")
+
+        return chunk_dates
+
+    async def _batch_fetch_dates(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_ids: list[bytes],
+        chunk_size: int = 5000,
+    ) -> dict[str, datetime]:
+        """Batch fetch INTERNALDATE for all UIDs in parallel chunks."""
+        if not email_ids:
+            return {}
+
+        # Split into chunks
+        chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
+        total_chunks = len(chunks)
+
+        # Fetch all chunks in parallel
+        tasks = [
+            self._fetch_dates_chunk(imap, chunk, chunk_num, total_chunks) for chunk_num, chunk in enumerate(chunks, 1)
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # Merge results
+        uid_dates: dict[str, datetime] = {}
+        for chunk_dates in results:
+            uid_dates.update(chunk_dates)
+
+        return uid_dates
+
+    async def _batch_fetch_headers(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_ids: list[bytes] | list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Batch fetch headers for a list of UIDs."""
+        if not email_ids:
+            return {}
+
+        # Normalize to list of strings
+        str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in email_ids]
+        uid_list = ",".join(str_ids)
+        _, data = await imap.uid("fetch", uid_list, "BODY.PEEK[HEADER]")
+
+        results: dict[str, dict[str, Any]] = {}
+        for i, item in enumerate(data):
+            if not isinstance(item, bytes) or b"BODY[HEADER]" not in item:
+                continue
+            uid_match = re.search(rb"UID (\d+)", item)
+            if uid_match and i + 1 < len(data) and isinstance(data[i + 1], bytearray):
+                uid = uid_match.group(1).decode()
+                raw_headers = bytes(data[i + 1])
+                metadata = self._parse_headers(uid, raw_headers)
+                if metadata:
+                    results[uid] = metadata
+
+        return results
 
     async def get_email_count(
         self,
@@ -434,7 +404,7 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
-    async def get_emails_metadata_stream(  # noqa: C901
+    async def get_emails_metadata_stream(
         self,
         page: int = 1,
         page_size: int = 10,
@@ -455,7 +425,7 @@ class EmailClient:
             await imap._client_task
             await imap.wait_hello_from_server()
 
-            # Login and select inbox
+            # Login and select mailbox
             await imap.login(self.email_server.user_name, self.email_server.password)
             await _send_imap_id(imap)
             await imap.select(_quote_mailbox(mailbox))
@@ -472,55 +442,10 @@ class EmailClient:
             )
             logger.info(f"Get metadata: Search criteria: {search_criteria}")
 
-            # Calculate pagination offsets
-            start = (page - 1) * page_size
-            end = start + page_size
-
-            # Check if server supports SORT extension (RFC 5256)
-            if _has_sort_capability(imap):
-                # Use server-side sorting - much more efficient
-                sort_order = "(REVERSE DATE)" if order == "desc" else "(DATE)"
-                logger.info(f"Using IMAP SORT with {sort_order}")
-
-                try:
-                    _, sort_response = await imap.uid("sort", sort_order, "UTF-8", *search_criteria)
-
-                    if not sort_response or not sort_response[0]:
-                        logger.warning("No messages returned from SORT")
-                        return
-
-                    # Parse sorted UIDs
-                    sorted_uids = sort_response[0].split()
-                    logger.info(f"SORT returned {len(sorted_uids)} UIDs")
-
-                    # Paginate the sorted UIDs
-                    page_uids = [uid.decode("utf-8") for uid in sorted_uids[start:end]]
-
-                    if not page_uids:
-                        return
-
-                    # Batch fetch full headers for just the page
-                    metadata_list = await self._batch_fetch_headers(imap, page_uids)
-
-                    # Sort the results to match the SORT order (batch fetch may return unordered)
-                    uid_order = {uid: i for i, uid in enumerate(page_uids)}
-                    metadata_list.sort(key=lambda m: uid_order.get(m["email_id"], 999999))
-
-                    for metadata in metadata_list:
-                        yield metadata
-                    return
-
-                except Exception as e:
-                    logger.warning(f"SORT command failed, falling back to batch fetch: {e}")
-                    # Fall through to batch fetch fallback
-
-            # Fallback: Batch fetch approach (for servers without SORT)
-            # This is still much faster than the old N individual fetches
-            logger.info("Using batch fetch fallback (server doesn't support SORT)")
-
-            # Search for messages
+            # Search for messages - use UID SEARCH for better compatibility
             _, messages = await imap.uid_search(*search_criteria)
 
+            # Handle empty or None responses
             if not messages or not messages[0]:
                 logger.warning("No messages returned from search")
                 return
@@ -528,44 +453,37 @@ class EmailClient:
             email_ids = messages[0].split()
             logger.info(f"Found {len(email_ids)} email IDs")
 
-            if not email_ids:
-                return
+            # Phase 1: Batch fetch INTERNALDATE for sorting (parallel chunks)
+            fetch_dates_start = time.perf_counter()
+            uid_dates = await self._batch_fetch_dates(imap, email_ids)
+            fetch_dates_elapsed = time.perf_counter() - fetch_dates_start
 
-            # Batch fetch just the Date headers for all emails (much smaller than full headers)
-            date_tuples = await self._batch_fetch_dates(imap, email_ids)
-
-            if not date_tuples:
-                # Fallback: if batch date fetch failed, try with full headers
-                logger.warning("Batch date fetch returned no results, using full header fetch")
-                all_uids = [uid.decode("utf-8") for uid in email_ids]
-                all_metadata = await self._batch_fetch_headers(imap, all_uids)
-                all_metadata.sort(key=lambda x: x["date"], reverse=(order == "desc"))
-                for metadata in all_metadata[start:end]:
-                    yield metadata
-                return
-
-            # Sort by date
-            date_tuples.sort(key=lambda x: x[1], reverse=(order == "desc"))
+            # Sort by INTERNALDATE
+            sorted_uids = sorted(uid_dates.items(), key=lambda x: x[1], reverse=(order == "desc"))
 
             # Paginate
-            page_tuples = date_tuples[start:end]
-            page_uids = [uid for uid, _ in page_tuples]
+            start = (page - 1) * page_size
+            page_uids = [uid for uid, _ in sorted_uids[start : start + page_size]]
 
             if not page_uids:
+                logger.info(f"Phase 1 (dates): {len(uid_dates)} UIDs in {fetch_dates_elapsed:.2f}s, page {page} empty")
                 return
 
-            # Batch fetch full headers for just the page
-            metadata_list = await self._batch_fetch_headers(imap, page_uids)
+            # Phase 2: Batch fetch headers for requested page only
+            fetch_headers_start = time.perf_counter()
+            metadata_by_uid = await self._batch_fetch_headers(imap, page_uids)
+            fetch_headers_elapsed = time.perf_counter() - fetch_headers_start
 
-            # Sort results to match the date order
-            uid_order = {uid: i for i, uid in enumerate(page_uids)}
-            metadata_list.sort(key=lambda m: uid_order.get(m["email_id"], 999999))
+            logger.info(
+                f"Fetched page {page}: {fetch_dates_elapsed:.2f}s dates ({len(uid_dates)} UIDs), "
+                f"{fetch_headers_elapsed:.2f}s headers ({len(page_uids)} UIDs)"
+            )
 
-            for metadata in metadata_list:
-                yield metadata
-
+            # Yield in sorted order
+            for uid in page_uids:
+                if uid in metadata_by_uid:
+                    yield metadata_by_uid[uid]
         finally:
-            # Ensure we logout properly
             try:
                 await imap.logout()
             except Exception as e:
@@ -836,6 +754,7 @@ class EmailClient:
             port=self.email_server.port,
             start_tls=self.smtp_start_tls,
             use_tls=self.smtp_use_tls,
+            tls_context=self._get_smtp_ssl_context(),
         ) as smtp:
             await smtp.login(self.email_server.user_name, self.email_server.password)
 
