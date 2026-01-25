@@ -29,6 +29,9 @@ from mcp_email_server.emails.models import (
 )
 from mcp_email_server.log import logger
 
+# Maximum body length before truncation (characters)
+MAX_BODY_LENGTH = 20000
+
 
 def _quote_mailbox(mailbox: str) -> str:
     """Quote mailbox name for IMAP compatibility.
@@ -105,6 +108,29 @@ class EmailClient:
         """Get SSL context for SMTP connections based on verify_ssl setting."""
         return _create_smtp_ssl_context(self.smtp_verify_ssl)
 
+    @staticmethod
+    def _parse_recipients(email_message) -> list[str]:
+        """Extract recipient addresses from To and Cc headers."""
+        recipients = []
+        to_header = email_message.get("To", "")
+        if to_header:
+            recipients = [addr.strip() for addr in to_header.split(",")]
+        cc_header = email_message.get("Cc", "")
+        if cc_header:
+            recipients.extend([addr.strip() for addr in cc_header.split(",")])
+        return recipients
+
+    @staticmethod
+    def _parse_date(date_str: str) -> datetime:
+        """Parse email date string to datetime, with fallback to current time."""
+        try:
+            date_tuple = email.utils.parsedate_tz(date_str)
+            if date_tuple:
+                return datetime.fromtimestamp(email.utils.mktime_tz(date_tuple), tz=timezone.utc)
+            return datetime.now(timezone.utc)
+        except Exception:
+            return datetime.now(timezone.utc)
+
     def _parse_email_data(self, raw_email: bytes, email_id: str | None = None) -> dict[str, Any]:  # noqa: C901
         """Parse raw email data into a structured dictionary."""
         parser = BytesParser(policy=default)
@@ -118,28 +144,9 @@ class EmailClient:
         # Extract Message-ID for reply threading
         message_id = email_message.get("Message-ID")
 
-        # Extract recipients
-        to_addresses = []
-        to_header = email_message.get("To", "")
-        if to_header:
-            # Simple parsing - split by comma and strip whitespace
-            to_addresses = [addr.strip() for addr in to_header.split(",")]
-
-        # Also check CC recipients
-        cc_header = email_message.get("Cc", "")
-        if cc_header:
-            to_addresses.extend([addr.strip() for addr in cc_header.split(",")])
-
-        # Parse date
-        try:
-            date_tuple = email.utils.parsedate_tz(date_str)
-            date = (
-                datetime.fromtimestamp(email.utils.mktime_tz(date_tuple), tz=timezone.utc)
-                if date_tuple
-                else datetime.now(timezone.utc)
-            )
-        except Exception:
-            date = datetime.now(timezone.utc)
+        # Extract recipients and parse date
+        to_addresses = self._parse_recipients(email_message)
+        date = self._parse_date(date_str)
 
         # Get body content
         body = ""
@@ -174,8 +181,8 @@ class EmailClient:
                 except UnicodeDecodeError:
                     body = payload.decode("utf-8", errors="replace")
         # TODO: Allow retrieving full email body
-        if body and len(body) > 20000:
-            body = body[:20000] + "...[TRUNCATED]"
+        if body and len(body) > MAX_BODY_LENGTH:
+            body = body[:MAX_BODY_LENGTH] + "...[TRUNCATED]"
         return {
             "email_id": email_id or "",
             "message_id": message_id,
@@ -199,7 +206,7 @@ class EmailClient:
         seen: bool | None = None,
         flagged: bool | None = None,
         answered: bool | None = None,
-    ):
+    ) -> list[str]:
         search_criteria = []
         if before:
             search_criteria.extend(["BEFORE", before.strftime("%d-%b-%Y").upper()])
@@ -238,24 +245,8 @@ class EmailClient:
             sender = email_message.get("From", "")
             date_str = email_message.get("Date", "")
 
-            to_addresses = []
-            to_header = email_message.get("To", "")
-            if to_header:
-                to_addresses = [addr.strip() for addr in to_header.split(",")]
-
-            cc_header = email_message.get("Cc", "")
-            if cc_header:
-                to_addresses.extend([addr.strip() for addr in cc_header.split(",")])
-
-            try:
-                date_tuple = email.utils.parsedate_tz(date_str)
-                date = (
-                    datetime.fromtimestamp(email.utils.mktime_tz(date_tuple), tz=timezone.utc)
-                    if date_tuple
-                    else datetime.now(timezone.utc)
-                )
-            except Exception:
-                date = datetime.now(timezone.utc)
+            to_addresses = self._parse_recipients(email_message)
+            date = self._parse_date(date_str)
 
             return {
                 "email_id": email_id,

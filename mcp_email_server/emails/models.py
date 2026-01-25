@@ -40,17 +40,10 @@ class EmailMetadataPageResponse(BaseModel):
     total: int
 
 
-class EmailBodyResponse(BaseModel):
-    """Single email body response"""
+class EmailBodyResponse(EmailMetadata):
+    """Single email body response - extends EmailMetadata with body content"""
 
-    email_id: str  # IMAP UID of this email
-    message_id: str | None = None  # RFC 5322 Message-ID header for reply threading
-    subject: str
-    sender: str
-    recipients: list[str]
-    date: datetime
     body: str
-    attachments: list[str]
 
 
 class EmailContentBatchResponse(BaseModel):
