@@ -20,6 +20,7 @@ import aiosmtplib
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails.markdown_utils import markdown_to_email_html
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -712,10 +713,16 @@ class EmailClient:
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         html: bool = False,
+        markdown: bool = False,
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
     ):
+        # Convert markdown to HTML if requested
+        if markdown:
+            body = markdown_to_email_html(body, wrap_in_html=True)
+            html = True  # Markdown output is always HTML
+
         # Create message with or without attachments
         if attachments:
             msg = self._create_message_with_attachments(body, html, attachments)
@@ -1407,12 +1414,13 @@ class ClassicEmailHandler(EmailHandler):
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         html: bool = False,
+        markdown: bool = False,
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
     ) -> None:
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references
+            recipients, subject, body, cc, bcc, html, markdown, attachments, in_reply_to, references
         )
 
         # Save to Sent folder if enabled

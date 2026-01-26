@@ -66,6 +66,7 @@ class EmailHandler(abc.ABC):
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         html: bool = False,
+        markdown: bool = False,
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
@@ -80,6 +81,7 @@ class EmailHandler(abc.ABC):
             cc: List of CC email addresses.
             bcc: List of BCC email addresses.
             html: Whether to send as HTML (True) or plain text (False).
+            markdown: Whether to convert body from Markdown to HTML.
             attachments: List of file paths to attach.
             in_reply_to: Message-ID of the email being replied to (for threading).
             references: Space-separated Message-IDs for the thread chain.

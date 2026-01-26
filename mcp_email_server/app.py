@@ -145,6 +145,13 @@ async def send_email(
         bool,
         Field(default=False, description="Whether to send the email as HTML (True) or plain text (False)."),
     ] = False,
+    markdown: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Whether to convert the body from Markdown to HTML. When True, the body is parsed as Markdown and converted to email-safe HTML with proper formatting. Overrides the html parameter.",
+        ),
+    ] = False,
     attachments: Annotated[
         list[str] | None,
         Field(
@@ -175,6 +182,7 @@ async def send_email(
         cc,
         bcc,
         html,
+        markdown,
         attachments,
         in_reply_to,
         references,
