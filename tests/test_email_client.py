@@ -812,13 +812,17 @@ class TestBatchFetchHeaders:
     async def test_batch_fetch_headers_parses_imap_response(self, email_client):
         """Test that _batch_fetch_headers correctly parses IMAP header responses."""
         mock_imap = AsyncMock()
+        # aioimaplib returns FETCH response in 3 parts:
+        # - BODY[HEADER] line (no UID)
+        # - header content as bytearray
+        # - UID line
         mock_imap.uid = AsyncMock(
             return_value=(
                 None,
                 [
-                    b"1 FETCH (UID 100 BODY[HEADER] {50}",
+                    b"1 FETCH (BODY[HEADER] {50}",
                     bytearray(b"From: a@test.com\r\nSubject: Test\r\n\r\n"),
-                    b")",
+                    b" UID 100)",
                     b"FETCH completed",
                 ],
             )
@@ -842,16 +846,17 @@ class TestBatchFetchHeaders:
     async def test_batch_fetch_headers_preserves_uid_mapping(self, email_client):
         """Test that _batch_fetch_headers returns dict keyed by UID."""
         mock_imap = AsyncMock()
+        # aioimaplib returns each email as 3 items: BODY[HEADER] line, content, UID line
         mock_imap.uid = AsyncMock(
             return_value=(
                 None,
                 [
-                    b"1 FETCH (UID 100 BODY[HEADER] {50}",
+                    b"1 FETCH (BODY[HEADER] {50}",
                     bytearray(b"From: a@test.com\r\nSubject: First\r\n\r\n"),
-                    b")",
-                    b"2 FETCH (UID 200 BODY[HEADER] {50}",
+                    b" UID 100)",
+                    b"2 FETCH (BODY[HEADER] {50}",
                     bytearray(b"From: b@test.com\r\nSubject: Second\r\n\r\n"),
-                    b")",
+                    b" UID 200)",
                     b"FETCH completed",
                 ],
             )

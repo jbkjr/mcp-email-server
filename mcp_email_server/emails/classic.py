@@ -345,8 +345,15 @@ class EmailClient:
         for i, item in enumerate(data):
             if not isinstance(item, bytes) or b"BODY[HEADER]" not in item:
                 continue
-            uid_match = re.search(rb"UID (\d+)", item)
-            if uid_match and i + 1 < len(data) and isinstance(data[i + 1], bytearray):
+            # aioimaplib returns FETCH response in 3 parts:
+            # i:   b'N FETCH (BODY[HEADER] {size}'  - contains BODY[HEADER]
+            # i+1: bytearray(...)                   - raw header content
+            # i+2: b' UID N)'                       - contains UID
+            if i + 2 >= len(data) or not isinstance(data[i + 1], bytearray):
+                continue
+            uid_item = data[i + 2] if isinstance(data[i + 2], bytes) else None
+            uid_match = re.search(rb"UID (\d+)", uid_item) if uid_item else None
+            if uid_match:
                 uid = uid_match.group(1).decode()
                 raw_headers = bytes(data[i + 1])
                 metadata = self._parse_headers(uid, raw_headers)
