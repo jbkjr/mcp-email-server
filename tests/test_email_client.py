@@ -645,3 +645,151 @@ class TestBatchFetchHeaders:
         assert len(result) == 2
         assert result["100"]["subject"] == "First"
         assert result["200"]["subject"] == "Second"
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_skips_non_bytes_items(self, email_client):
+        """Test that _batch_fetch_headers skips non-bytes items in response."""
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(
+            return_value=(
+                None,
+                [
+                    "not bytes",  # Should be skipped
+                    b"1 FETCH (BODY[HEADER] {50}",
+                    bytearray(b"From: a@test.com\r\nSubject: Test\r\n\r\n"),
+                    b" UID 100)",
+                ],
+            )
+        )
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["100"])
+
+        assert "100" in result
+        assert result["100"]["subject"] == "Test"
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_skips_items_without_body_header(self, email_client):
+        """Test that _batch_fetch_headers skips bytes without BODY[HEADER]."""
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(
+            return_value=(
+                None,
+                [
+                    b"some other data",  # No BODY[HEADER], should be skipped
+                    b"1 FETCH (BODY[HEADER] {50}",
+                    bytearray(b"From: a@test.com\r\nSubject: Test\r\n\r\n"),
+                    b" UID 100)",
+                ],
+            )
+        )
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["100"])
+
+        assert "100" in result
+        assert result["100"]["subject"] == "Test"
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_skips_truncated_response(self, email_client):
+        """Test that _batch_fetch_headers skips when i+2 >= len(data)."""
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(
+            return_value=(
+                None,
+                [
+                    b"1 FETCH (BODY[HEADER] {50}",
+                    bytearray(b"From: a@test.com\r\nSubject: Test\r\n\r\n"),
+                    # Missing UID line (i+2 doesn't exist)
+                ],
+            )
+        )
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["100"])
+
+        # Should return empty dict since response is truncated
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_skips_non_bytearray_content(self, email_client):
+        """Test that _batch_fetch_headers skips when data[i+1] is not bytearray."""
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(
+            return_value=(
+                None,
+                [
+                    b"1 FETCH (BODY[HEADER] {50}",
+                    b"not a bytearray",  # Should be bytearray, not bytes
+                    b" UID 100)",
+                ],
+            )
+        )
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["100"])
+
+        # Should return empty dict since content is not bytearray
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_skips_non_bytes_uid_item(self, email_client):
+        """Test that _batch_fetch_headers skips when data[i+2] is not bytes."""
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(
+            return_value=(
+                None,
+                [
+                    b"1 FETCH (BODY[HEADER] {50}",
+                    bytearray(b"From: a@test.com\r\nSubject: Test\r\n\r\n"),
+                    12345,  # Not bytes, should result in uid_item = None
+                ],
+            )
+        )
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["100"])
+
+        # Should return empty dict since UID item is not bytes
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_skips_missing_uid_in_response(self, email_client):
+        """Test that _batch_fetch_headers skips when UID regex doesn't match."""
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(
+            return_value=(
+                None,
+                [
+                    b"1 FETCH (BODY[HEADER] {50}",
+                    bytearray(b"From: a@test.com\r\nSubject: Test\r\n\r\n"),
+                    b" NO_UID_HERE)",  # No UID in this line
+                ],
+            )
+        )
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["100"])
+
+        # Should return empty dict since UID regex doesn't match
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_headers_handles_mixed_valid_invalid(self, email_client):
+        """Test that _batch_fetch_headers processes valid items and skips invalid ones."""
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(
+            return_value=(
+                None,
+                [
+                    # Invalid: truncated (no UID line)
+                    b"1 FETCH (BODY[HEADER] {50}",
+                    bytearray(b"From: bad@test.com\r\nSubject: Bad\r\n\r\n"),
+                    # Valid email
+                    b"2 FETCH (BODY[HEADER] {50}",
+                    bytearray(b"From: good@test.com\r\nSubject: Good\r\n\r\n"),
+                    b" UID 200)",
+                ],
+            )
+        )
+
+        result = await email_client._batch_fetch_headers(mock_imap, ["100", "200"])
+
+        # Only the valid email should be in results
+        assert len(result) == 1
+        assert "200" in result
+        assert result["200"]["subject"] == "Good"
