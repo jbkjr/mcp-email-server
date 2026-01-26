@@ -197,9 +197,7 @@ async def delete_emails(
     return result
 
 
-@mcp.tool(
-    description="Mark one or more emails as read or unread. Use list_emails_metadata first to get the email_id."
-)
+@mcp.tool(description="Mark one or more emails as read or unread. Use list_emails_metadata first to get the email_id.")
 async def mark_emails(
     account_name: Annotated[str, Field(description="The name of the email account.")],
     email_ids: Annotated[
