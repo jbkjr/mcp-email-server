@@ -70,3 +70,13 @@ class AttachmentDownloadResponse(BaseModel):
     mime_type: str
     size: int
     saved_path: str
+
+
+class EmailMarkResponse(BaseModel):
+    """Response for mark_emails operation"""
+
+    success: bool
+    marked_ids: list[str]
+    failed_ids: list[str]
+    mailbox: str
+    marked_as: str
