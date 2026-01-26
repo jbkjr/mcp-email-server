@@ -457,13 +457,16 @@ Subject: No Date Email
     async def test_batch_fetch_headers_parses_response(self, email_client):
         """Test _batch_fetch_headers correctly parses IMAP BODY[HEADER] response."""
         mock_imap = AsyncMock()
-        # Simulate IMAP response format for BODY[HEADER]
+        # aioimaplib returns FETCH response in 3 parts:
+        # - BODY[HEADER] line (no UID)
+        # - header content as bytearray
+        # - UID line
         mock_imap.uid.return_value = (
             "OK",
             [
-                b"1 FETCH (UID 100 BODY[HEADER] {100}",
+                b"1 FETCH (BODY[HEADER] {100}",
                 bytearray(b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\n\r\n"),
-                b")",
+                b" UID 100)",
             ],
         )
 
