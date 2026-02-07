@@ -23,7 +23,10 @@ from mcp_email_server.emails.models import (
     LabelListResponse,
 )
 
-mcp = FastMCP("email")
+mcp = FastMCP(
+    "email",
+    instructions="When sending emails, always use markdown=True unless the user explicitly requests plain text. This ensures emails render with proper formatting and proportional fonts in email clients.",
+)
 
 
 @mcp.resource("email://{account_name}")
@@ -148,10 +151,10 @@ async def send_email(
     markdown: Annotated[
         bool,
         Field(
-            default=False,
+            default=True,
             description="Whether to convert the body from Markdown to HTML. When True, the body is parsed as Markdown and converted to email-safe HTML with proper formatting. Overrides the html parameter.",
         ),
-    ] = False,
+    ] = True,
     attachments: Annotated[
         list[str] | None,
         Field(
