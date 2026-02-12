@@ -88,6 +88,32 @@ class EmailHandler(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def forward_email(
+        self,
+        email_id: str,
+        mailbox: str,
+        recipients: list[str],
+        body: str | None = None,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+    ) -> None:
+        """
+        Forward an email to new recipients.
+
+        Args:
+            email_id: The UID of the email to forward.
+            mailbox: The mailbox containing the email.
+            recipients: List of recipient email addresses.
+            body: Optional message to prepend above the forwarded content (Markdown).
+            cc: List of CC email addresses.
+            bcc: List of BCC email addresses.
+            html: If True, body is pre-formatted HTML (skip Markdown conversion).
+            attachments: List of additional file paths to attach.
+        """
+
+    @abc.abstractmethod
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """
         Delete emails by their IDs. Returns (deleted_ids, failed_ids)

@@ -170,6 +170,62 @@ def _format_quoted_reply_html(original_email: dict[str, Any]) -> str:
     )
 
 
+def _format_forwarded_email_html(original_email: dict[str, Any]) -> str:
+    """Format an original email as an HTML forwarded message block.
+
+    Uses Gmail-style forwarded message format with inline headers.
+
+    Args:
+        original_email: Parsed email dict with keys: from, date, subject, to, body, html_body.
+
+    Returns:
+        HTML string containing a forwarded message header and body.
+    """
+    from html import escape as html_escape
+
+    sender = original_email.get("from", "Unknown")
+    date = original_email.get("date")
+    subject = original_email.get("subject", "")
+    to_addresses = original_email.get("to", [])
+    raw_html_body = original_email.get("html_body", "")
+    text_body = original_email.get("body", "")
+
+    # Format date
+    if isinstance(date, datetime):
+        date_str = date.strftime("%a, %b %d, %Y at %I:%M %p")
+    else:
+        date_str = str(date) if date else "Unknown date"
+
+    # Format To field
+    if isinstance(to_addresses, list):
+        to_str = html_escape(", ".join(to_addresses))
+    else:
+        to_str = html_escape(str(to_addresses)) if to_addresses else ""
+
+    # Build forwarded content
+    if raw_html_body:
+        forwarded_content = _strip_html_wrappers(raw_html_body)
+    elif text_body:
+        if len(text_body) > MAX_QUOTED_BODY_LENGTH:
+            text_body = text_body[:MAX_QUOTED_BODY_LENGTH] + "\n[...forwarded text truncated]"
+        forwarded_content = "<br>\n".join(html_escape(line) for line in text_body.splitlines())
+    else:
+        forwarded_content = ""
+
+    return (
+        f'<div style="margin-top: 1em;">'
+        f'<p style="color: #666;">---------- Forwarded message ---------</p>'
+        f'<p style="color: #666;">'
+        f"From: {html_escape(sender)}<br>"
+        f"Date: {html_escape(date_str)}<br>"
+        f"Subject: {html_escape(subject)}<br>"
+        f"To: {to_str}"
+        f"</p>"
+        f"<div>{forwarded_content}</div>"
+        f"</div>"
+    )
+
+
 class EmailClient:
     def __init__(self, email_server: EmailServer, sender: str | None = None):
         self.email_server = email_server
@@ -738,6 +794,60 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
+    async def extract_attachments(
+        self,
+        email_id: str,
+        mailbox: str = "INBOX",
+    ) -> list[tuple[str, str, bytes]]:
+        """Extract all attachments from an email as in-memory data.
+
+        Args:
+            email_id: The UID of the email.
+            mailbox: The mailbox to search in (default: "INBOX").
+
+        Returns:
+            A list of (filename, mime_type, data_bytes) tuples.
+        """
+        imap = self.imap_class(self.email_server.host, self.email_server.port)
+        try:
+            await imap._client_task
+            await imap.wait_hello_from_server()
+
+            await imap.login(self.email_server.user_name, self.email_server.password)
+            await _send_imap_id(imap)
+            await imap.select(_quote_mailbox(mailbox))
+
+            data = await self._fetch_email_with_formats(imap, email_id)
+            if not data:
+                return []
+
+            raw_email = self._extract_raw_email(data)
+            if not raw_email:
+                return []
+
+            parser = BytesParser(policy=default)
+            email_message = parser.parsebytes(raw_email)
+
+            attachments = []
+            if email_message.is_multipart():
+                for part in email_message.walk():
+                    content_disposition = str(part.get("Content-Disposition", ""))
+                    if "attachment" in content_disposition:
+                        filename = part.get_filename()
+                        if filename:
+                            attachment_data = part.get_payload(decode=True)
+                            if attachment_data:
+                                mime_type = part.get_content_type() or "application/octet-stream"
+                                attachments.append((filename, mime_type, attachment_data))
+
+            return attachments
+
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
     def _validate_attachment(self, file_path: str) -> Path:
         """Validate attachment file path."""
         path = Path(file_path)
@@ -800,6 +910,7 @@ class EmailClient:
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        extra_parts: list[MIMEApplication] | None = None,
     ):
         # Convert body to HTML unless it's already raw HTML
         if not html:
@@ -807,8 +918,11 @@ class EmailClient:
             html = True
 
         # Create message with or without attachments
-        if attachments:
-            msg = self._create_message_with_attachments(body, html, attachments)
+        if attachments or extra_parts:
+            msg = self._create_message_with_attachments(body, html, attachments or [])
+            if extra_parts:
+                for part in extra_parts:
+                    msg.attach(part)
         else:
             content_type = "html" if html else "plain"
             msg = MIMEText(body, content_type, "utf-8")
@@ -1529,6 +1643,75 @@ class ClassicEmailHandler(EmailHandler):
                 )
             except Exception as e:
                 logger.error(f"Failed to save email to Sent folder: {e}", exc_info=True)
+
+    async def forward_email(
+        self,
+        email_id: str,
+        mailbox: str,
+        recipients: list[str],
+        body: str | None = None,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+    ) -> None:
+        # Fetch original email
+        original = await self.incoming_client.get_email_body_by_id(email_id, mailbox)
+        if not original:
+            msg = f"Email with ID {email_id} not found in {mailbox}"
+            raise ValueError(msg)
+
+        # Build subject with Fwd: prefix
+        original_subject = original.get("subject", "")
+        if original_subject.startswith("Fwd:") or original_subject.startswith("FWD:"):
+            subject = original_subject
+        else:
+            subject = f"Fwd: {original_subject}"
+
+        # Build forwarded content
+        forwarded_html = _format_forwarded_email_html(original)
+
+        # Build combined body
+        if body:
+            if html:
+                user_html = body
+            else:
+                user_html = markdown_to_email_html(body, wrap_in_html=False)
+            combined_html = wrap_html_document(user_html + forwarded_html)
+        else:
+            combined_html = wrap_html_document(forwarded_html)
+
+        # Extract original attachments
+        original_attachments = await self.incoming_client.extract_attachments(email_id, mailbox)
+        extra_parts = []
+        for filename, mime_type, data in original_attachments:
+            subtype = mime_type.split("/")[1] if "/" in mime_type else "octet-stream"
+            part = MIMEApplication(data, _subtype=subtype)
+            part.add_header("Content-Disposition", "attachment", filename=filename)
+            extra_parts.append(part)
+
+        # Send the forwarded email (no threading headers)
+        sent_msg = await self.outgoing_client.send_email(
+            recipients,
+            subject,
+            combined_html,
+            cc,
+            bcc,
+            html=True,
+            attachments=attachments,
+            extra_parts=extra_parts or None,
+        )
+
+        # Save to Sent folder if enabled
+        if self.save_to_sent and sent_msg:
+            try:
+                await self.outgoing_client.append_to_sent(
+                    sent_msg,
+                    self.email_settings.incoming,
+                    self.sent_folder_name,
+                )
+            except Exception as e:
+                logger.error(f"Failed to save forwarded email to Sent folder: {e}", exc_info=True)
 
     async def _fetch_original_for_quote(self, message_id: str) -> dict[str, Any] | None:
         """Fetch the original email by Message-ID for reply quoting.

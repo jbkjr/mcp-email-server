@@ -7,6 +7,7 @@ from mcp_email_server.app import (
     add_email_account,
     delete_emails,
     download_attachment,
+    forward_email,
     get_emails_content,
     list_available_accounts,
     list_emails_metadata,
@@ -643,3 +644,43 @@ class TestMcpTools:
             )
 
             assert result.emails[0].message_id == "<test@example.com>"
+
+    @pytest.mark.asyncio
+    async def test_forward_email(self):
+        """Test forward_email MCP tool."""
+        mock_handler = AsyncMock()
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await forward_email(
+                account_name="test_account",
+                email_id="12345",
+                recipients=["bob@example.com"],
+                mailbox="INBOX",
+                body="FYI",
+            )
+
+            assert result == "Email forwarded successfully to bob@example.com"
+            mock_handler.forward_email.assert_called_once_with(
+                "12345",
+                "INBOX",
+                ["bob@example.com"],
+                "FYI",
+                None,  # cc
+                None,  # bcc
+                False,  # html
+                None,  # attachments
+            )
+
+    @pytest.mark.asyncio
+    async def test_forward_email_multiple_recipients(self):
+        """Test forward_email MCP tool with multiple recipients."""
+        mock_handler = AsyncMock()
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            result = await forward_email(
+                account_name="test_account",
+                email_id="12345",
+                recipients=["alice@example.com", "bob@example.com"],
+            )
+
+            assert result == "Email forwarded successfully to alice@example.com, bob@example.com"

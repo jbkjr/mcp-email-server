@@ -196,6 +196,55 @@ async def send_email(
 
 
 @mcp.tool(
+    description="Forward an email to new recipients. The original message is included below any optional message you add, with original attachments forwarded automatically.",
+)
+async def forward_email(
+    account_name: Annotated[str, Field(description="The name of the email account to send from.")],
+    email_id: Annotated[str, Field(description="The email_id of the email to forward (obtained from list_emails_metadata).")],
+    recipients: Annotated[list[str], Field(description="A list of recipient email addresses to forward to.")],
+    mailbox: Annotated[
+        str, Field(default="INBOX", description="IMAP folder path containing the email to forward.")
+    ] = "INBOX",
+    body: Annotated[
+        str | None,
+        Field(default=None, description="Optional message to prepend above the forwarded content. Supports Markdown formatting."),
+    ] = None,
+    cc: Annotated[
+        list[str] | None,
+        Field(default=None, description="A list of CC email addresses."),
+    ] = None,
+    bcc: Annotated[
+        list[str] | None,
+        Field(default=None, description="A list of BCC email addresses."),
+    ] = None,
+    html: Annotated[
+        bool,
+        Field(default=False, description="Set to True only if the body contains pre-formatted raw HTML. When False (default), the body is automatically converted from Markdown/plain text to email-safe HTML."),
+    ] = False,
+    attachments: Annotated[
+        list[str] | None,
+        Field(
+            default=None,
+            description="A list of additional absolute file paths to attach to the forwarded email.",
+        ),
+    ] = None,
+) -> str:
+    handler = dispatch_handler(account_name)
+    await handler.forward_email(
+        email_id,
+        mailbox,
+        recipients,
+        body,
+        cc,
+        bcc,
+        html,
+        attachments,
+    )
+    recipient_str = ", ".join(recipients)
+    return f"Email forwarded successfully to {recipient_str}"
+
+
+@mcp.tool(
     description="Delete one or more emails by their email_id. Use list_emails_metadata first to get the email_id."
 )
 async def delete_emails(

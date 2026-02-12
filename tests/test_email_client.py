@@ -12,6 +12,7 @@ from mcp_email_server.emails.classic import (
     ClassicEmailHandler,
     EmailClient,
     _create_smtp_ssl_context,
+    _format_forwarded_email_html,
     _format_quoted_reply_html,
 )
 
@@ -1572,3 +1573,512 @@ class TestAutoQuoteReply:
             assert "Original HTML" in sent_body
             # Still sent as html=True
             assert mock_send.call_args[0][5] is True  # html
+
+
+class TestFormatForwardedEmailHtml:
+    """Tests for _format_forwarded_email_html helper."""
+
+    def test_basic_formatting_with_all_fields(self):
+        """Test forwarded message with all fields present."""
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "subject": "Original Subject",
+            "to": ["bob@example.com"],
+            "body": "Hello Bob",
+            "html_body": "",
+        }
+        result = _format_forwarded_email_html(original)
+
+        assert "---------- Forwarded message ---------" in result
+        assert "From: Alice &lt;alice@example.com&gt;" in result
+        assert "Subject: Original Subject" in result
+        assert "To: bob@example.com" in result
+        assert "Hello Bob" in result
+
+    def test_html_body_preferred_over_text(self):
+        """Test that HTML body is used when available."""
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "subject": "Test",
+            "to": ["recipient@example.com"],
+            "body": "Plain text version",
+            "html_body": "<p>Rich <strong>HTML</strong> content</p>",
+        }
+        result = _format_forwarded_email_html(original)
+
+        assert "<p>Rich <strong>HTML</strong> content</p>" in result
+        assert "Plain text version" not in result
+
+    def test_text_fallback_with_escaping(self):
+        """Test text fallback with HTML escaping."""
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "subject": "Test",
+            "to": [],
+            "body": "Line with <html> & special chars\nSecond line",
+            "html_body": "",
+        }
+        result = _format_forwarded_email_html(original)
+
+        assert "&lt;html&gt;" in result
+        assert "&amp; special chars" in result
+        assert "<br>" in result
+
+    def test_missing_fields(self):
+        """Test graceful handling of missing fields."""
+        result = _format_forwarded_email_html({})
+
+        assert "---------- Forwarded message ---------" in result
+        assert "From: Unknown" in result
+        assert "Unknown date" in result
+
+    def test_long_body_truncation(self):
+        """Test that long text bodies are truncated."""
+        long_body = "x" * 6000
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "subject": "Test",
+            "to": [],
+            "body": long_body,
+            "html_body": "",
+        }
+        result = _format_forwarded_email_html(original)
+
+        assert "[...forwarded text truncated]" in result
+
+    def test_multiple_recipients(self):
+        """Test To field with multiple recipients."""
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "subject": "Test",
+            "to": ["alice@example.com", "bob@example.com"],
+            "body": "test",
+            "html_body": "",
+        }
+        result = _format_forwarded_email_html(original)
+
+        assert "To: alice@example.com, bob@example.com" in result
+
+    def test_strips_html_wrappers(self):
+        """Test that HTML document wrappers are stripped from forwarded body."""
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "subject": "Test",
+            "to": [],
+            "body": "",
+            "html_body": '<!DOCTYPE html><html><head><style>h1{color:red}</style></head><body><p>Content</p></body></html>',
+        }
+        result = _format_forwarded_email_html(original)
+
+        assert "<!DOCTYPE" not in result
+        assert "<html>" not in result
+        assert "<p>Content</p>" in result
+
+    def test_escapes_sender_xss(self):
+        """Test that sender is HTML-escaped to prevent XSS."""
+        original = {
+            "from": "Evil <script>alert('xss')</script>",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "subject": "Test",
+            "to": [],
+            "body": "test",
+            "html_body": "",
+        }
+        result = _format_forwarded_email_html(original)
+
+        assert "<script>" not in result
+        assert "&lt;script&gt;" in result
+
+
+class TestExtractAttachments:
+    """Tests for EmailClient.extract_attachments method."""
+
+    @pytest.mark.asyncio
+    async def test_extracts_multiple_attachments(self, email_client):
+        """Test extracting multiple attachments from an email."""
+        from email.mime.application import MIMEApplication
+        from email.mime.multipart import MIMEMultipart
+
+        # Build a multipart email with attachments
+        msg = MIMEMultipart()
+        msg["Subject"] = "Test"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "recipient@example.com"
+        msg.attach(MIMEText("Body text", "plain"))
+
+        pdf_data = b"%PDF-1.4 fake pdf data"
+        pdf_part = MIMEApplication(pdf_data, _subtype="pdf")
+        pdf_part.add_header("Content-Disposition", "attachment", filename="document.pdf")
+        msg.attach(pdf_part)
+
+        img_data = b"\x89PNG fake image data"
+        img_part = MIMEApplication(img_data, _subtype="png")
+        img_part.add_header("Content-Disposition", "attachment", filename="image.png")
+        msg.attach(img_part)
+
+        raw_email = msg.as_bytes()
+
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        with (
+            patch.object(email_client, "imap_class", return_value=mock_imap),
+            patch.object(
+                email_client,
+                "_fetch_email_with_formats",
+                return_value=[b"1 FETCH", bytearray(raw_email), b"UID 123)"],
+            ),
+            patch.object(email_client, "_extract_raw_email", return_value=raw_email),
+        ):
+            result = await email_client.extract_attachments("123", "INBOX")
+
+            assert len(result) == 2
+            assert result[0][0] == "document.pdf"
+            assert "pdf" in result[0][1]
+            assert result[0][2] == pdf_data
+            assert result[1][0] == "image.png"
+            assert "png" in result[1][1]
+            assert result[1][2] == img_data
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_for_no_attachments(self, email_client):
+        """Test that emails without attachments return empty list."""
+        msg = MIMEText("Just text, no attachments", "plain")
+        msg["Subject"] = "Test"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "recipient@example.com"
+        raw_email = msg.as_bytes()
+
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        with (
+            patch.object(email_client, "imap_class", return_value=mock_imap),
+            patch.object(
+                email_client,
+                "_fetch_email_with_formats",
+                return_value=[b"1 FETCH", bytearray(raw_email), b"UID 123)"],
+            ),
+            patch.object(email_client, "_extract_raw_email", return_value=raw_email),
+        ):
+            result = await email_client.extract_attachments("123", "INBOX")
+
+            assert result == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_email_not_found(self, email_client):
+        """Test that extract_attachments returns empty list when email not found."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock()
+        mock_imap.select = AsyncMock()
+        mock_imap.logout = AsyncMock()
+
+        with (
+            patch.object(email_client, "imap_class", return_value=mock_imap),
+            patch.object(email_client, "_fetch_email_with_formats", return_value=None),
+        ):
+            result = await email_client.extract_attachments("999", "INBOX")
+
+            assert result == []
+
+
+class TestForwardEmail:
+    """Tests for ClassicEmailHandler.forward_email."""
+
+    @pytest.mark.asyncio
+    async def test_forward_with_user_body(self, email_settings):
+        """Test forwarding with a user message prepended."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "message_id": "<original@example.com>",
+            "subject": "Original Subject",
+            "from": "Alice <alice@example.com>",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Original message body",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(
+                handler.incoming_client, "get_email_body_by_id", return_value=original_email
+            ),
+            patch.object(
+                handler.incoming_client, "extract_attachments", return_value=[]
+            ),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.forward_email(
+                email_id="42",
+                mailbox="INBOX",
+                recipients=["bob@example.com"],
+                body="FYI, see below.",
+            )
+
+            mock_send.assert_called_once()
+            sent_body = mock_send.call_args[0][2]  # body is 3rd positional arg
+            assert "FYI, see below." in sent_body
+            assert "---------- Forwarded message ---------" in sent_body
+            assert "Original message body" in sent_body
+            assert mock_send.call_args.kwargs.get("html") is True or mock_send.call_args[0][5] is True
+
+    @pytest.mark.asyncio
+    async def test_forward_without_user_body(self, email_settings):
+        """Test forwarding without a user message."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "message_id": "<original@example.com>",
+            "subject": "Original Subject",
+            "from": "Alice <alice@example.com>",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Original message body",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(
+                handler.incoming_client, "get_email_body_by_id", return_value=original_email
+            ),
+            patch.object(
+                handler.incoming_client, "extract_attachments", return_value=[]
+            ),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.forward_email(
+                email_id="42",
+                mailbox="INBOX",
+                recipients=["bob@example.com"],
+            )
+
+            mock_send.assert_called_once()
+            sent_body = mock_send.call_args[0][2]
+            assert "---------- Forwarded message ---------" in sent_body
+            assert "Original message body" in sent_body
+
+    @pytest.mark.asyncio
+    async def test_forward_adds_fwd_prefix(self, email_settings):
+        """Test that subject gets Fwd: prefix."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "subject": "Important News",
+            "from": "alice@example.com",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "content",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(handler.incoming_client, "get_email_body_by_id", return_value=original_email),
+            patch.object(handler.incoming_client, "extract_attachments", return_value=[]),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.forward_email(
+                email_id="42", mailbox="INBOX", recipients=["bob@example.com"]
+            )
+
+            sent_subject = mock_send.call_args[0][1]
+            assert sent_subject == "Fwd: Important News"
+
+    @pytest.mark.asyncio
+    async def test_forward_no_double_fwd_prefix(self, email_settings):
+        """Test that subject already starting with Fwd: is not double-prefixed."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "subject": "Fwd: Already Forwarded",
+            "from": "alice@example.com",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "content",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(handler.incoming_client, "get_email_body_by_id", return_value=original_email),
+            patch.object(handler.incoming_client, "extract_attachments", return_value=[]),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.forward_email(
+                email_id="42", mailbox="INBOX", recipients=["bob@example.com"]
+            )
+
+            sent_subject = mock_send.call_args[0][1]
+            assert sent_subject == "Fwd: Already Forwarded"
+
+    @pytest.mark.asyncio
+    async def test_forward_original_not_found_raises(self, email_settings):
+        """Test that forwarding a nonexistent email raises ValueError."""
+        handler = ClassicEmailHandler(email_settings)
+
+        with patch.object(handler.incoming_client, "get_email_body_by_id", return_value=None):
+            with pytest.raises(ValueError, match="not found"):
+                await handler.forward_email(
+                    email_id="999", mailbox="INBOX", recipients=["bob@example.com"]
+                )
+
+    @pytest.mark.asyncio
+    async def test_forward_html_body_passthrough(self, email_settings):
+        """Test that html=True body is passed through without markdown conversion."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "subject": "Test",
+            "from": "alice@example.com",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "content",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(handler.incoming_client, "get_email_body_by_id", return_value=original_email),
+            patch.object(handler.incoming_client, "extract_attachments", return_value=[]),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.forward_email(
+                email_id="42",
+                mailbox="INBOX",
+                recipients=["bob@example.com"],
+                body="<p>My HTML message</p>",
+                html=True,
+            )
+
+            sent_body = mock_send.call_args[0][2]
+            assert "<p>My HTML message</p>" in sent_body
+            assert "---------- Forwarded message ---------" in sent_body
+
+    @pytest.mark.asyncio
+    async def test_forward_includes_original_attachments(self, email_settings):
+        """Test that original email attachments are forwarded."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "subject": "With Attachment",
+            "from": "alice@example.com",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "See attachment",
+            "html_body": "",
+            "attachments": ["report.pdf"],
+        }
+
+        original_attachments = [
+            ("report.pdf", "application/pdf", b"%PDF-1.4 fake pdf"),
+        ]
+
+        with (
+            patch.object(handler.incoming_client, "get_email_body_by_id", return_value=original_email),
+            patch.object(handler.incoming_client, "extract_attachments", return_value=original_attachments),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.forward_email(
+                email_id="42", mailbox="INBOX", recipients=["bob@example.com"]
+            )
+
+            # Check extra_parts was passed with the attachment
+            call_kwargs = mock_send.call_args.kwargs
+            extra_parts = call_kwargs.get("extra_parts")
+            assert extra_parts is not None
+            assert len(extra_parts) == 1
+            assert extra_parts[0].get_filename() == "report.pdf"
+
+    @pytest.mark.asyncio
+    async def test_forward_saves_to_sent(self, email_settings):
+        """Test that forwarded email is saved to Sent folder when enabled."""
+        email_settings.save_to_sent = True
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "subject": "Test",
+            "from": "alice@example.com",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "content",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        mock_msg = MagicMock()
+
+        with (
+            patch.object(handler.incoming_client, "get_email_body_by_id", return_value=original_email),
+            patch.object(handler.incoming_client, "extract_attachments", return_value=[]),
+            patch.object(handler.outgoing_client, "send_email", return_value=mock_msg),
+            patch.object(handler.outgoing_client, "append_to_sent", return_value=True) as mock_append,
+        ):
+            await handler.forward_email(
+                email_id="42", mailbox="INBOX", recipients=["bob@example.com"]
+            )
+
+            mock_append.assert_called_once_with(
+                mock_msg,
+                email_settings.incoming,
+                email_settings.sent_folder_name,
+            )
+
+    @pytest.mark.asyncio
+    async def test_forward_no_threading_headers(self, email_settings):
+        """Test that forwarded emails do not include threading headers."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "subject": "Test",
+            "from": "alice@example.com",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "content",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(handler.incoming_client, "get_email_body_by_id", return_value=original_email),
+            patch.object(handler.incoming_client, "extract_attachments", return_value=[]),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.forward_email(
+                email_id="42", mailbox="INBOX", recipients=["bob@example.com"]
+            )
+
+            # Verify no in_reply_to or references were passed
+            call_args = mock_send.call_args
+            # in_reply_to and references should not be set (default None)
+            assert call_args.kwargs.get("in_reply_to") is None
+            assert call_args.kwargs.get("references") is None
