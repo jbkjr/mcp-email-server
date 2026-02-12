@@ -13,6 +13,7 @@ from mcp_email_server.emails.classic import (
     EmailClient,
     _create_smtp_ssl_context,
     _format_quoted_reply,
+    _format_quoted_reply_html,
 )
 
 
@@ -1094,6 +1095,70 @@ class TestParseEmailDataHtmlFallback:
 
         assert result["body"] == "Just plain text, no HTML."
 
+    def test_html_only_multipart_preserves_html_body(self, email_client):
+        """HTML-only multipart email should preserve html_body in result."""
+        from email.mime.multipart import MIMEMultipart
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "HTML Newsletter"
+        msg["From"] = "newsletter@example.com"
+        msg["To"] = "user@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        html_part = MIMEText("<p>Hello from the newsletter!</p>", "html")
+        msg.attach(html_part)
+
+        result = email_client._parse_email_data(msg.as_bytes())
+
+        assert "<p>Hello from the newsletter!</p>" in result["html_body"]
+
+    def test_non_multipart_html_preserves_html_body(self, email_client):
+        """Non-multipart HTML email should preserve html_body."""
+        msg = MIMEText("<h1>Title</h1><p>Content</p>", "html")
+        msg["Subject"] = "HTML Only"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "user@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        result = email_client._parse_email_data(msg.as_bytes())
+
+        assert "<h1>Title</h1>" in result["html_body"]
+        assert "<p>Content</p>" in result["html_body"]
+
+    def test_plain_text_has_empty_html_body(self, email_client):
+        """Plain text email should have empty html_body."""
+        msg = MIMEText("Just plain text", "plain")
+        msg["Subject"] = "Plain"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "user@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        result = email_client._parse_email_data(msg.as_bytes())
+
+        assert result["html_body"] == ""
+
+    def test_multipart_with_both_preserves_html_body(self, email_client):
+        """Multipart with both text/plain and text/html should preserve html_body."""
+        from email.mime.multipart import MIMEMultipart
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Both Formats"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "user@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        plain_part = MIMEText("Plain text version", "plain")
+        html_part = MIMEText("<p>HTML version</p>", "html")
+        msg.attach(plain_part)
+        msg.attach(html_part)
+
+        result = email_client._parse_email_data(msg.as_bytes())
+
+        # Body should be plain text (preferred)
+        assert result["body"] == "Plain text version"
+        # html_body should still have the HTML part
+        assert "<p>HTML version</p>" in result["html_body"]
+
 
 class TestFormatQuotedReply:
     """Tests for _format_quoted_reply helper."""
@@ -1167,6 +1232,104 @@ class TestFormatQuotedReply:
 
         assert "Mon, 1 Jan 2024 12:00:00 +0000" in result
         assert "> Test body" in result
+
+
+class TestFormatQuotedReplyHtml:
+    """Tests for _format_quoted_reply_html helper."""
+
+    def test_html_body_preserved_in_blockquote(self):
+        """Test that original HTML body is preserved inside blockquote."""
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Plain text version",
+            "html_body": "<p>Rich <strong>HTML</strong> content</p>",
+        }
+        result = _format_quoted_reply_html(original)
+
+        assert '<blockquote type="cite"' in result
+        assert "<p>Rich <strong>HTML</strong> content</p>" in result
+        assert "Alice" in result
+        assert "wrote:" in result
+
+    def test_plain_text_fallback(self):
+        """Test that plain text is used when html_body is empty."""
+        original = {
+            "from": "Bob <bob@example.com>",
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Just plain text\nWith multiple lines",
+            "html_body": "",
+        }
+        result = _format_quoted_reply_html(original)
+
+        assert "<blockquote" in result
+        assert "Just plain text" in result
+        assert "With multiple lines" in result
+        # Plain text should be HTML-escaped and use <br> for newlines
+        assert "<br>" in result
+
+    def test_strips_html_wrappers(self):
+        """Test that DOCTYPE, html, head, body wrappers are stripped."""
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "",
+            "html_body": '<!DOCTYPE html><html><head><style>h1{color:red}</style></head><body><p>Content</p></body></html>',
+        }
+        result = _format_quoted_reply_html(original)
+
+        assert "<!DOCTYPE" not in result
+        assert "<html>" not in result
+        assert "<head>" not in result
+        assert "<body>" not in result
+        assert "<p>Content</p>" in result
+
+    def test_escapes_sender_in_attribution(self):
+        """Test that sender name is HTML-escaped in attribution line."""
+        original = {
+            "from": "Evil <script>alert('xss')</script>",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "test",
+            "html_body": "",
+        }
+        result = _format_quoted_reply_html(original)
+
+        assert "<script>" not in result
+        assert "&lt;script&gt;" in result
+
+    def test_long_text_body_truncation(self):
+        """Test that long plain text bodies are truncated in HTML quote."""
+        long_body = "x" * 6000
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": long_body,
+            "html_body": "",
+        }
+        result = _format_quoted_reply_html(original)
+
+        assert "[...quoted text truncated]" in result
+
+    def test_missing_fields(self):
+        """Test graceful handling of missing fields."""
+        result = _format_quoted_reply_html({})
+
+        assert "<blockquote" in result
+        assert "Unknown" in result
+        assert "Unknown date" in result
+
+    def test_empty_body_and_html_body(self):
+        """Test with both body and html_body empty."""
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "",
+            "html_body": "",
+        }
+        result = _format_quoted_reply_html(original)
+
+        assert "<blockquote" in result
+        assert "</blockquote>" in result
 
 
 @pytest.fixture
@@ -1345,3 +1508,138 @@ class TestAutoQuoteReply:
 
             sent_body = mock_send.call_args[0][2]
             assert "> I sent this originally" in sent_body
+
+    @pytest.mark.asyncio
+    async def test_html_blockquote_when_markdown_true_with_html_original(self, email_settings):
+        """When markdown=True, reply uses HTML blockquote with original HTML preserved."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "message_id": "<original@example.com>",
+            "subject": "Original Subject",
+            "from": "Alice <alice@example.com>",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Plain text fallback",
+            "html_body": "<p>Original <strong>HTML</strong> content</p>",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(
+                handler.incoming_client, "search_by_message_id", return_value="42"
+            ),
+            patch.object(
+                handler.incoming_client, "get_email_body_by_id", return_value=original_email
+            ),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.send_email(
+                recipients=["alice@example.com"],
+                subject="Re: Original Subject",
+                body="My reply text",
+                in_reply_to="<original@example.com>",
+                markdown=True,
+                quote_reply=True,
+            )
+
+            sent_body = mock_send.call_args[0][2]
+            # Full HTML document
+            assert "<!DOCTYPE html>" in sent_body
+            # User's reply converted from markdown
+            assert "My reply text" in sent_body
+            # Original HTML preserved in blockquote
+            assert "<blockquote" in sent_body
+            assert "Original <strong>HTML</strong> content" in sent_body
+            # Attribution line
+            assert "Alice" in sent_body
+            assert "wrote:" in sent_body
+            # Should be sent as html=True, markdown=False
+            assert mock_send.call_args[0][5] is True   # html
+            assert mock_send.call_args[0][6] is False  # markdown
+
+    @pytest.mark.asyncio
+    async def test_html_blockquote_when_markdown_true_plain_text_original(self, email_settings):
+        """When markdown=True but original has no HTML, blockquote uses escaped text."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "message_id": "<original@example.com>",
+            "subject": "Original Subject",
+            "from": "Bob <bob@example.com>",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Plain text original\nSecond line",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(
+                handler.incoming_client, "search_by_message_id", return_value="42"
+            ),
+            patch.object(
+                handler.incoming_client, "get_email_body_by_id", return_value=original_email
+            ),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.send_email(
+                recipients=["bob@example.com"],
+                subject="Re: Original Subject",
+                body="My reply",
+                in_reply_to="<original@example.com>",
+                markdown=True,
+                quote_reply=True,
+            )
+
+            sent_body = mock_send.call_args[0][2]
+            assert "<blockquote" in sent_body
+            assert "Plain text original" in sent_body
+            assert "Second line" in sent_body
+            assert mock_send.call_args[0][5] is True   # html
+            assert mock_send.call_args[0][6] is False  # markdown
+
+    @pytest.mark.asyncio
+    async def test_text_quoting_when_markdown_false(self, email_settings):
+        """When markdown=False, reply uses text `> ` quoting (existing behavior)."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "message_id": "<original@example.com>",
+            "subject": "Original Subject",
+            "from": "Alice <alice@example.com>",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Original message body",
+            "html_body": "<p>Original HTML</p>",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(
+                handler.incoming_client, "search_by_message_id", return_value="42"
+            ),
+            patch.object(
+                handler.incoming_client, "get_email_body_by_id", return_value=original_email
+            ),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.send_email(
+                recipients=["alice@example.com"],
+                subject="Re: Original Subject",
+                body="My reply text",
+                in_reply_to="<original@example.com>",
+                markdown=False,
+                quote_reply=True,
+            )
+
+            sent_body = mock_send.call_args[0][2]
+            # Text quoting, not HTML blockquote
+            assert "> Original message body" in sent_body
+            assert "<blockquote" not in sent_body
+            # markdown and html should remain False
+            assert mock_send.call_args[0][5] is False  # html
+            assert mock_send.call_args[0][6] is False  # markdown

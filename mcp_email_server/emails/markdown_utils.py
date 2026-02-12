@@ -14,6 +14,24 @@ EMAIL_BODY_STYLE = (
 )
 
 
+def wrap_html_document(html_content: str) -> str:
+    """Wrap HTML content in a minimal email-safe HTML document.
+
+    Args:
+        html_content: HTML fragment to wrap
+
+    Returns:
+        Complete HTML document string with inline body styles
+    """
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="{EMAIL_BODY_STYLE}">
+{html_content}
+</body>
+</html>"""
+
+
 def markdown_to_email_html(text: str, wrap_in_html: bool = True) -> str:
     """Convert markdown text to email-safe HTML.
 
@@ -33,12 +51,6 @@ def markdown_to_email_html(text: str, wrap_in_html: bool = True) -> str:
     )
 
     if wrap_in_html:
-        return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="{EMAIL_BODY_STYLE}">
-{html_content}
-</body>
-</html>"""
+        return wrap_html_document(html_content)
 
     return html_content

@@ -21,7 +21,7 @@ import aiosmtplib
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.html_utils import html_to_text
-from mcp_email_server.emails.markdown_utils import markdown_to_email_html
+from mcp_email_server.emails.markdown_utils import markdown_to_email_html, wrap_html_document
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -140,6 +140,67 @@ def _format_quoted_reply(original_email: dict[str, Any]) -> str:
     return f"\n\nOn {date_str}, {sender} wrote:\n\n{quoted_body}"
 
 
+def _strip_html_wrappers(html_content: str) -> str:
+    """Strip HTML document wrappers (DOCTYPE, html, head, body tags), keeping body content."""
+    content = re.sub(r"<!DOCTYPE[^>]*>", "", html_content, flags=re.IGNORECASE)
+    content = re.sub(r"<html[^>]*>", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"</html\s*>", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"<head[^>]*>.*?</head\s*>", "", content, flags=re.IGNORECASE | re.DOTALL)
+    content = re.sub(r"<body[^>]*>", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"</body\s*>", "", content, flags=re.IGNORECASE)
+    return content.strip()
+
+
+def _format_quoted_reply_html(original_email: dict[str, Any]) -> str:
+    """Format an original email as an HTML blockquote for reply quoting.
+
+    Uses the original HTML body when available, falling back to escaped plain text.
+
+    Args:
+        original_email: Parsed email dict with keys: from, date, body, html_body.
+
+    Returns:
+        HTML string containing an attribution line and styled blockquote.
+    """
+    from html import escape as html_escape
+
+    sender = original_email.get("from", "Unknown")
+    date = original_email.get("date")
+    raw_html_body = original_email.get("html_body", "")
+    text_body = original_email.get("body", "")
+
+    # Format date
+    if isinstance(date, datetime):
+        date_str = date.strftime("%a, %b %d, %Y at %I:%M %p")
+    else:
+        date_str = str(date) if date else "Unknown date"
+
+    # Build quoted content
+    if raw_html_body:
+        quoted_content = _strip_html_wrappers(raw_html_body)
+    elif text_body:
+        if len(text_body) > MAX_QUOTED_BODY_LENGTH:
+            text_body = text_body[:MAX_QUOTED_BODY_LENGTH] + "\n[...quoted text truncated]"
+        quoted_content = "<br>\n".join(html_escape(line) for line in text_body.splitlines())
+    else:
+        quoted_content = ""
+
+    attribution = f"On {date_str}, {html_escape(sender)} wrote:"
+
+    return (
+        f'<div style="margin-top: 1em;">'
+        f'<p style="color: #666;">{attribution}</p>'
+        f'<blockquote type="cite" style="'
+        f"margin: 0 0 0 0.5em; "
+        f"padding: 0.5em 1em; "
+        f"border-left: 3px solid #ccc; "
+        f'color: #555;">'
+        f"{quoted_content}"
+        f"</blockquote>"
+        f"</div>"
+    )
+
+
 class EmailClient:
     def __init__(self, email_server: EmailServer, sender: str | None = None):
         self.email_server = email_server
@@ -197,6 +258,7 @@ class EmailClient:
 
         # Get body content
         body = ""
+        html_body = ""
         attachments = []
 
         if email_message.is_multipart():
@@ -240,6 +302,7 @@ class EmailClient:
                 except UnicodeDecodeError:
                     raw_body = payload.decode("utf-8", errors="replace")
                 if content_type == "text/html":
+                    html_body = raw_body
                     body = html_to_text(raw_body)
                 else:
                     body = raw_body
@@ -253,6 +316,7 @@ class EmailClient:
             "from": sender,
             "to": to_addresses,
             "body": body,
+            "html_body": html_body,
             "date": date,
             "attachments": attachments,
         }
@@ -1473,9 +1537,17 @@ class ClassicEmailHandler(EmailHandler):
     ) -> None:
         # Auto-quote the original message when replying
         if in_reply_to and quote_reply:
-            quoted_text = await self._fetch_and_format_quote(in_reply_to)
-            if quoted_text:
-                body += quoted_text
+            original = await self._fetch_original_for_quote(in_reply_to)
+            if original and markdown:
+                # Convert user's body to HTML, append HTML blockquote, send as raw HTML
+                user_html = markdown_to_email_html(body, wrap_in_html=False)
+                quote_html = _format_quoted_reply_html(original)
+                body = wrap_html_document(user_html + quote_html)
+                html = True
+                markdown = False  # Already converted
+            elif original:
+                # Non-markdown: fall back to text quoting
+                body += _format_quoted_reply(original)
 
         msg = await self.outgoing_client.send_email(
             recipients, subject, body, cc, bcc, html, markdown, attachments, in_reply_to, references
@@ -1492,10 +1564,11 @@ class ClassicEmailHandler(EmailHandler):
             except Exception as e:
                 logger.error(f"Failed to save email to Sent folder: {e}", exc_info=True)
 
-    async def _fetch_and_format_quote(self, message_id: str) -> str | None:
-        """Fetch the original email by Message-ID and format it as a quoted reply.
+    async def _fetch_original_for_quote(self, message_id: str) -> dict[str, Any] | None:
+        """Fetch the original email by Message-ID for reply quoting.
 
-        Searches INBOX first, then the Sent folder. Returns None if not found.
+        Searches INBOX first, then the Sent folder. Returns the parsed email
+        dict or None if not found.
         """
         # Try INBOX first (most common - replying to received email)
         uid = await self.incoming_client.search_by_message_id(message_id, "INBOX")
@@ -1517,7 +1590,7 @@ class ClassicEmailHandler(EmailHandler):
             logger.debug(f"Could not fetch original email body for quoting: {message_id}")
             return None
 
-        return _format_quoted_reply(original)
+        return original
 
     async def _find_sent_folder(self) -> str | None:
         """Find the Sent folder name for the account."""
