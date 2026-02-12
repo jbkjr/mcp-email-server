@@ -197,8 +197,8 @@ class TestEmailClient:
         assert "Important" in criteria
 
     @pytest.mark.asyncio
-    async def test_get_emails_stream(self, email_client):
-        """Test getting emails stream returns sorted, paginated results."""
+    async def test_get_emails_metadata_page(self, email_client):
+        """Test getting emails page returns sorted, paginated results with total count."""
         mock_imap = AsyncMock()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
@@ -246,12 +246,11 @@ class TestEmailClient:
                 with patch.object(
                     email_client, "_batch_fetch_headers", return_value=mock_metadata
                 ) as mock_fetch_headers:
-                    emails = []
-                    async for email_data in email_client.get_emails_metadata_stream(page=1, page_size=10):
-                        emails.append(email_data)
+                    emails, total = await email_client.get_emails_metadata_page(page=1, page_size=10)
 
                     # Behavior: returns emails sorted by date desc (newest first)
                     assert len(emails) == 3
+                    assert total == 3
                     assert emails[0]["subject"] == "Subject 3"
                     assert emails[1]["subject"] == "Subject 2"
                     assert emails[2]["subject"] == "Subject 1"
