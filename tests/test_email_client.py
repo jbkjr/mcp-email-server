@@ -12,7 +12,6 @@ from mcp_email_server.emails.classic import (
     ClassicEmailHandler,
     EmailClient,
     _create_smtp_ssl_context,
-    _format_quoted_reply,
     _format_quoted_reply_html,
 )
 
@@ -1158,80 +1157,6 @@ class TestParseEmailDataHtmlFallback:
         assert result["body"] == "Plain text version"
         # html_body should still have the HTML part
         assert "<p>HTML version</p>" in result["html_body"]
-
-
-class TestFormatQuotedReply:
-    """Tests for _format_quoted_reply helper."""
-
-    def test_basic_formatting(self):
-        """Test basic quoted reply formatting with all fields."""
-        original = {
-            "from": "Alice <alice@example.com>",
-            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
-            "body": "Hello, this is the original message.\nSecond line here.",
-        }
-        result = _format_quoted_reply(original)
-
-        assert "On Fri, Mar 15, 2024 at 02:30 PM, Alice <alice@example.com> wrote:" in result
-        assert "> Hello, this is the original message." in result
-        assert "> Second line here." in result
-
-    def test_empty_body(self):
-        """Test with empty body."""
-        original = {
-            "from": "sender@example.com",
-            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
-            "body": "",
-        }
-        result = _format_quoted_reply(original)
-
-        assert "sender@example.com wrote:" in result
-        # Empty body produces no quoted lines
-        assert result.endswith("wrote:\n\n")
-
-    def test_multiline_body(self):
-        """Test body with multiple lines."""
-        original = {
-            "from": "sender@example.com",
-            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
-            "body": "Line 1\nLine 2\nLine 3\n\nLine 5 after blank",
-        }
-        result = _format_quoted_reply(original)
-
-        assert "> Line 1\n> Line 2\n> Line 3\n> \n> Line 5 after blank" in result
-
-    def test_long_body_truncation(self):
-        """Test that long bodies are truncated."""
-        long_body = "x" * 6000
-        original = {
-            "from": "sender@example.com",
-            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
-            "body": long_body,
-        }
-        result = _format_quoted_reply(original)
-
-        assert "[...quoted text truncated]" in result
-        # The quoted body should be significantly shorter than the original
-        assert len(result) < len(long_body)
-
-    def test_missing_fields(self):
-        """Test graceful handling of missing fields."""
-        result = _format_quoted_reply({})
-
-        assert "Unknown" in result
-        assert "Unknown date" in result
-
-    def test_non_datetime_date(self):
-        """Test with non-datetime date value."""
-        original = {
-            "from": "sender@example.com",
-            "date": "Mon, 1 Jan 2024 12:00:00 +0000",
-            "body": "Test body",
-        }
-        result = _format_quoted_reply(original)
-
-        assert "Mon, 1 Jan 2024 12:00:00 +0000" in result
-        assert "> Test body" in result
 
 
 class TestFormatQuotedReplyHtml:

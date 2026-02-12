@@ -109,37 +109,6 @@ def _create_smtp_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
     return ctx
 
 
-def _format_quoted_reply(original_email: dict[str, Any]) -> str:
-    """Format an original email as a quoted reply block.
-
-    Args:
-        original_email: Parsed email dict from get_email_body_by_id with
-            keys: from, date, body.
-
-    Returns:
-        Formatted quoted reply string with attribution line and `> ` prefixed body.
-    """
-    sender = original_email.get("from", "Unknown")
-    date = original_email.get("date")
-    body = original_email.get("body", "")
-
-    # Format date as "Day, Mon DD, YYYY at HH:MM AM/PM"
-    if isinstance(date, datetime):
-        date_str = date.strftime("%a, %b %d, %Y at %I:%M %p")
-    else:
-        date_str = str(date) if date else "Unknown date"
-
-    # Truncate body if too long
-    if len(body) > MAX_QUOTED_BODY_LENGTH:
-        body = body[:MAX_QUOTED_BODY_LENGTH] + "\n[...quoted text truncated]"
-
-    # Prefix each line with "> "
-    quoted_lines = [f"> {line}" for line in body.splitlines()]
-    quoted_body = "\n".join(quoted_lines)
-
-    return f"\n\nOn {date_str}, {sender} wrote:\n\n{quoted_body}"
-
-
 def _strip_html_wrappers(html_content: str) -> str:
     """Strip HTML document wrappers (DOCTYPE, html, head, body tags), keeping body content."""
     content = re.sub(r"<!DOCTYPE[^>]*>", "", html_content, flags=re.IGNORECASE)
