@@ -41,6 +41,9 @@ from mcp_email_server.log import logger
 # Maximum body length before truncation (characters)
 MAX_BODY_LENGTH = 20000
 
+# Maximum quoted body length before truncation (characters)
+MAX_QUOTED_BODY_LENGTH = 5000
+
 # ProtonMail Bridge labels prefix
 LABELS_PREFIX = "Labels/"
 
@@ -103,6 +106,37 @@ def _create_smtp_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def _format_quoted_reply(original_email: dict[str, Any]) -> str:
+    """Format an original email as a quoted reply block.
+
+    Args:
+        original_email: Parsed email dict from get_email_body_by_id with
+            keys: from, date, body.
+
+    Returns:
+        Formatted quoted reply string with attribution line and `> ` prefixed body.
+    """
+    sender = original_email.get("from", "Unknown")
+    date = original_email.get("date")
+    body = original_email.get("body", "")
+
+    # Format date as "Day, Mon DD, YYYY at HH:MM AM/PM"
+    if isinstance(date, datetime):
+        date_str = date.strftime("%a, %b %d, %Y at %I:%M %p")
+    else:
+        date_str = str(date) if date else "Unknown date"
+
+    # Truncate body if too long
+    if len(body) > MAX_QUOTED_BODY_LENGTH:
+        body = body[:MAX_QUOTED_BODY_LENGTH] + "\n[...quoted text truncated]"
+
+    # Prefix each line with "> "
+    quoted_lines = [f"> {line}" for line in body.splitlines()]
+    quoted_body = "\n".join(quoted_lines)
+
+    return f"\n\nOn {date_str}, {sender} wrote:\n\n{quoted_body}"
 
 
 class EmailClient:
@@ -1418,7 +1452,14 @@ class ClassicEmailHandler(EmailHandler):
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        quote_reply: bool = True,
     ) -> None:
+        # Auto-quote the original message when replying
+        if in_reply_to and quote_reply:
+            quoted_text = await self._fetch_and_format_quote(in_reply_to)
+            if quoted_text:
+                body += quoted_text
+
         msg = await self.outgoing_client.send_email(
             recipients, subject, body, cc, bcc, html, markdown, attachments, in_reply_to, references
         )
@@ -1433,6 +1474,49 @@ class ClassicEmailHandler(EmailHandler):
                 )
             except Exception as e:
                 logger.error(f"Failed to save email to Sent folder: {e}", exc_info=True)
+
+    async def _fetch_and_format_quote(self, message_id: str) -> str | None:
+        """Fetch the original email by Message-ID and format it as a quoted reply.
+
+        Searches INBOX first, then the Sent folder. Returns None if not found.
+        """
+        # Try INBOX first (most common - replying to received email)
+        uid = await self.incoming_client.search_by_message_id(message_id, "INBOX")
+        mailbox = "INBOX"
+
+        # Try Sent folder if not found in INBOX
+        if not uid:
+            sent_folder = await self._find_sent_folder()
+            if sent_folder:
+                uid = await self.incoming_client.search_by_message_id(message_id, sent_folder)
+                mailbox = sent_folder
+
+        if not uid:
+            logger.debug(f"Original email not found for quoting: {message_id}")
+            return None
+
+        original = await self.incoming_client.get_email_body_by_id(uid, mailbox)
+        if not original:
+            logger.debug(f"Could not fetch original email body for quoting: {message_id}")
+            return None
+
+        return _format_quoted_reply(original)
+
+    async def _find_sent_folder(self) -> str | None:
+        """Find the Sent folder name for the account."""
+        try:
+            folders = await self.incoming_client.list_folders()
+            # Check for common Sent folder names
+            sent_names = {"Sent", "INBOX.Sent", "Sent Items", "Sent Mail", "[Gmail]/Sent Mail", "INBOX/Sent"}
+            for folder in folders:
+                if folder.name in sent_names:
+                    return folder.name
+                # Also check for \Sent flag
+                if any("\\Sent" in flag for flag in folder.flags):
+                    return folder.name
+        except Exception as e:
+            logger.debug(f"Error finding Sent folder: {e}")
+        return None
 
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
         """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""

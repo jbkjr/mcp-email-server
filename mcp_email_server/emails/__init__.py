@@ -70,6 +70,7 @@ class EmailHandler(abc.ABC):
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        quote_reply: bool = True,
     ) -> None:
         """
         Send email
@@ -85,6 +86,7 @@ class EmailHandler(abc.ABC):
             attachments: List of file paths to attach.
             in_reply_to: Message-ID of the email being replied to (for threading).
             references: Space-separated Message-IDs for the thread chain.
+            quote_reply: When replying, auto-fetch and append the quoted original message.
         """
 
     @abc.abstractmethod

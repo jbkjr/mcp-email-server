@@ -7,8 +7,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_email_server.config import EmailServer
-from mcp_email_server.emails.classic import EmailClient, _create_smtp_ssl_context
+from mcp_email_server.config import EmailServer, EmailSettings
+from mcp_email_server.emails.classic import (
+    ClassicEmailHandler,
+    EmailClient,
+    _create_smtp_ssl_context,
+    _format_quoted_reply,
+)
 
 
 @pytest.fixture
@@ -1015,3 +1020,255 @@ class TestBatchFetchHeaders:
         assert len(result) == 1
         assert "200" in result
         assert result["200"]["subject"] == "Good"
+
+
+class TestFormatQuotedReply:
+    """Tests for _format_quoted_reply helper."""
+
+    def test_basic_formatting(self):
+        """Test basic quoted reply formatting with all fields."""
+        original = {
+            "from": "Alice <alice@example.com>",
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Hello, this is the original message.\nSecond line here.",
+        }
+        result = _format_quoted_reply(original)
+
+        assert "On Fri, Mar 15, 2024 at 02:30 PM, Alice <alice@example.com> wrote:" in result
+        assert "> Hello, this is the original message." in result
+        assert "> Second line here." in result
+
+    def test_empty_body(self):
+        """Test with empty body."""
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "",
+        }
+        result = _format_quoted_reply(original)
+
+        assert "sender@example.com wrote:" in result
+        # Empty body produces no quoted lines
+        assert result.endswith("wrote:\n\n")
+
+    def test_multiline_body(self):
+        """Test body with multiple lines."""
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "Line 1\nLine 2\nLine 3\n\nLine 5 after blank",
+        }
+        result = _format_quoted_reply(original)
+
+        assert "> Line 1\n> Line 2\n> Line 3\n> \n> Line 5 after blank" in result
+
+    def test_long_body_truncation(self):
+        """Test that long bodies are truncated."""
+        long_body = "x" * 6000
+        original = {
+            "from": "sender@example.com",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": long_body,
+        }
+        result = _format_quoted_reply(original)
+
+        assert "[...quoted text truncated]" in result
+        # The quoted body should be significantly shorter than the original
+        assert len(result) < len(long_body)
+
+    def test_missing_fields(self):
+        """Test graceful handling of missing fields."""
+        result = _format_quoted_reply({})
+
+        assert "Unknown" in result
+        assert "Unknown date" in result
+
+    def test_non_datetime_date(self):
+        """Test with non-datetime date value."""
+        original = {
+            "from": "sender@example.com",
+            "date": "Mon, 1 Jan 2024 12:00:00 +0000",
+            "body": "Test body",
+        }
+        result = _format_quoted_reply(original)
+
+        assert "Mon, 1 Jan 2024 12:00:00 +0000" in result
+        assert "> Test body" in result
+
+
+@pytest.fixture
+def email_settings():
+    """Create test EmailSettings for ClassicEmailHandler tests."""
+    return EmailSettings(
+        account_name="test_account",
+        full_name="Test User",
+        email_address="test@example.com",
+        incoming=EmailServer(
+            user_name="test_user",
+            password="test_password",
+            host="imap.example.com",
+            port=993,
+            use_ssl=True,
+        ),
+        outgoing=EmailServer(
+            user_name="test_user",
+            password="test_password",
+            host="smtp.example.com",
+            port=465,
+            use_ssl=True,
+        ),
+    )
+
+
+class TestAutoQuoteReply:
+    """Tests for auto-quoting in ClassicEmailHandler.send_email."""
+
+    @pytest.mark.asyncio
+    async def test_quote_reply_appends_quoted_text(self, email_settings):
+        """Test that quote_reply=True fetches and appends quoted original."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "42",
+            "message_id": "<original@example.com>",
+            "subject": "Original Subject",
+            "from": "Alice <alice@example.com>",
+            "to": ["test@example.com"],
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Original message body",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(
+                handler.incoming_client, "search_by_message_id", return_value="42"
+            ) as mock_search,
+            patch.object(
+                handler.incoming_client, "get_email_body_by_id", return_value=original_email
+            ) as mock_fetch,
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.send_email(
+                recipients=["alice@example.com"],
+                subject="Re: Original Subject",
+                body="My reply text",
+                in_reply_to="<original@example.com>",
+                quote_reply=True,
+            )
+
+            mock_search.assert_called_once_with("<original@example.com>", "INBOX")
+            mock_fetch.assert_called_once_with("42", "INBOX")
+
+            # Verify the body passed to outgoing contains both reply and quote
+            sent_body = mock_send.call_args[0][2]  # body is 3rd positional arg
+            assert "My reply text" in sent_body
+            assert "> Original message body" in sent_body
+            assert "Alice <alice@example.com> wrote:" in sent_body
+
+    @pytest.mark.asyncio
+    async def test_quote_reply_false_skips_fetching(self, email_settings):
+        """Test that quote_reply=False does not fetch the original."""
+        handler = ClassicEmailHandler(email_settings)
+
+        with (
+            patch.object(handler.incoming_client, "search_by_message_id") as mock_search,
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()),
+        ):
+            await handler.send_email(
+                recipients=["alice@example.com"],
+                subject="Re: Test",
+                body="My reply",
+                in_reply_to="<original@example.com>",
+                quote_reply=False,
+            )
+
+            mock_search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_quote_reply_no_in_reply_to_skips(self, email_settings):
+        """Test that without in_reply_to, no quoting happens."""
+        handler = ClassicEmailHandler(email_settings)
+
+        with (
+            patch.object(handler.incoming_client, "search_by_message_id") as mock_search,
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()),
+        ):
+            await handler.send_email(
+                recipients=["alice@example.com"],
+                subject="New email",
+                body="Hello",
+                quote_reply=True,
+            )
+
+            mock_search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_quote_reply_original_not_found_sends_without_quote(self, email_settings):
+        """Test that if original email is not found, send proceeds without quote."""
+        handler = ClassicEmailHandler(email_settings)
+
+        with (
+            patch.object(handler.incoming_client, "search_by_message_id", return_value=None),
+            patch.object(handler.incoming_client, "list_folders", return_value=[]),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.send_email(
+                recipients=["alice@example.com"],
+                subject="Re: Test",
+                body="My reply",
+                in_reply_to="<nonexistent@example.com>",
+                quote_reply=True,
+            )
+
+            # Body should be unchanged (no quote appended)
+            sent_body = mock_send.call_args[0][2]
+            assert sent_body == "My reply"
+
+    @pytest.mark.asyncio
+    async def test_quote_reply_searches_sent_folder_as_fallback(self, email_settings):
+        """Test that Sent folder is searched when original not found in INBOX."""
+        handler = ClassicEmailHandler(email_settings)
+
+        original_email = {
+            "email_id": "99",
+            "message_id": "<sent@example.com>",
+            "subject": "Sent Subject",
+            "from": "Test User <test@example.com>",
+            "to": ["alice@example.com"],
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "I sent this originally",
+            "attachments": [],
+        }
+
+        from mcp_email_server.emails.models import Folder
+
+        sent_folder = Folder(name="Sent", delimiter="/", flags=["\\Sent", "\\HasNoChildren"])
+
+        # First search (INBOX) returns None, second search (Sent) returns UID
+        search_side_effects = [None, "99"]
+
+        with (
+            patch.object(
+                handler.incoming_client, "search_by_message_id", side_effect=search_side_effects
+            ),
+            patch.object(
+                handler.incoming_client, "list_folders", return_value=[sent_folder]
+            ),
+            patch.object(
+                handler.incoming_client, "get_email_body_by_id", return_value=original_email
+            ) as mock_fetch,
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.send_email(
+                recipients=["alice@example.com"],
+                subject="Re: Sent Subject",
+                body="Replying to my own email",
+                in_reply_to="<sent@example.com>",
+                quote_reply=True,
+            )
+
+            # Should have fetched from Sent folder
+            mock_fetch.assert_called_once_with("99", "Sent")
+
+            sent_body = mock_send.call_args[0][2]
+            assert "> I sent this originally" in sent_body

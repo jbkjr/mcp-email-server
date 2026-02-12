@@ -176,6 +176,13 @@ async def send_email(
             description="Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors.",
         ),
     ] = None,
+    quote_reply: Annotated[
+        bool,
+        Field(
+            default=True,
+            description="When replying (in_reply_to is set), automatically fetch and append the quoted original message. Set to False if you've already included quoted text in the body.",
+        ),
+    ] = True,
 ) -> str:
     handler = dispatch_handler(account_name)
     await handler.send_email(
@@ -189,6 +196,7 @@ async def send_email(
         attachments,
         in_reply_to,
         references,
+        quote_reply,
     )
     recipient_str = ", ".join(recipients)
     attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
