@@ -25,7 +25,7 @@ from mcp_email_server.emails.models import (
 
 mcp = FastMCP(
     "email",
-    instructions="When sending emails, always use markdown=True unless the user explicitly requests plain text. This ensures emails render with proper formatting and proportional fonts in email clients.",
+    instructions="When sending emails, the body supports Markdown formatting (bold, lists, headers, links, etc.) which is automatically converted to email-safe HTML. Use Markdown freely for well-formatted emails. Set html=True only if providing pre-formatted raw HTML.",
 )
 
 
@@ -135,7 +135,7 @@ async def send_email(
     account_name: Annotated[str, Field(description="The name of the email account to send from.")],
     recipients: Annotated[list[str], Field(description="A list of recipient email addresses.")],
     subject: Annotated[str, Field(description="The subject of the email.")],
-    body: Annotated[str, Field(description="The body of the email.")],
+    body: Annotated[str, Field(description="The email body. Supports Markdown formatting (bold, lists, headers, links, etc.) which is automatically converted to email-safe HTML.")],
     cc: Annotated[
         list[str] | None,
         Field(default=None, description="A list of CC email addresses."),
@@ -146,15 +146,8 @@ async def send_email(
     ] = None,
     html: Annotated[
         bool,
-        Field(default=False, description="Whether to send the email as HTML (True) or plain text (False)."),
+        Field(default=False, description="Set to True only if the body contains pre-formatted raw HTML. When False (default), the body is automatically converted from Markdown/plain text to email-safe HTML."),
     ] = False,
-    markdown: Annotated[
-        bool,
-        Field(
-            default=True,
-            description="Whether to convert the body from Markdown to HTML. When True, the body is parsed as Markdown and converted to email-safe HTML with proper formatting. Overrides the html parameter.",
-        ),
-    ] = True,
     attachments: Annotated[
         list[str] | None,
         Field(
@@ -192,7 +185,6 @@ async def send_email(
         cc,
         bcc,
         html,
-        markdown,
         attachments,
         in_reply_to,
         references,

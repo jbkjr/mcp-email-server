@@ -119,11 +119,11 @@ def email_client(email_server):
 
 
 class TestSendEmailWithMarkdown:
-    """Integration tests for sending emails with markdown."""
+    """Integration tests for automatic markdown-to-HTML conversion."""
 
     @pytest.mark.asyncio
-    async def test_send_email_with_markdown(self, email_client):
-        """Test sending email with markdown=True converts body to HTML."""
+    async def test_send_email_converts_markdown_to_html(self, email_client):
+        """Test that body is automatically converted from markdown to HTML."""
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
         mock_smtp.__aexit__ = AsyncMock()
@@ -133,7 +133,6 @@ class TestSendEmailWithMarkdown:
                 recipients=["recipient@example.com"],
                 subject="Test markdown email",
                 body="This is **bold** and this is *italic*.",
-                markdown=True,
             )
 
             mock_smtp.send_message.assert_called_once()
@@ -142,7 +141,7 @@ class TestSendEmailWithMarkdown:
             # Should not be multipart (no attachments)
             assert not message.is_multipart()
 
-            # Check content type is HTML
+            # Check content type is HTML (auto-converted)
             assert message.get_content_type() == "text/html"
 
             # Check body contains converted HTML
@@ -165,7 +164,6 @@ class TestSendEmailWithMarkdown:
                 recipients=["recipient@example.com"],
                 subject="Markdown with attachment",
                 body="# Report\n\nPlease see the **attached** document.",
-                markdown=True,
                 attachments=[str(test_file)],
             )
 
@@ -194,8 +192,8 @@ class TestSendEmailWithMarkdown:
             assert "document.pdf" in message_str
 
     @pytest.mark.asyncio
-    async def test_send_email_markdown_false_unchanged(self, email_client):
-        """Test that markdown=False leaves body as plain text (backward compat)."""
+    async def test_send_email_html_true_skips_conversion(self, email_client):
+        """Test that html=True sends body as-is without markdown conversion."""
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
         mock_smtp.__aexit__ = AsyncMock()
@@ -203,25 +201,24 @@ class TestSendEmailWithMarkdown:
         with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
             await email_client.send_email(
                 recipients=["recipient@example.com"],
-                subject="Plain text email",
-                body="This is **not** converted to HTML.",
-                markdown=False,
+                subject="Raw HTML email",
+                body="<p>This is <strong>raw</strong> HTML.</p>",
+                html=True,
             )
 
             mock_smtp.send_message.assert_called_once()
             message = mock_smtp.send_message.call_args[0][0]
 
-            # Check content type is plain text
-            assert message.get_content_type() == "text/plain"
+            # Check content type is HTML
+            assert message.get_content_type() == "text/html"
 
-            # Check body is unchanged
+            # Check body is passed through without markdown wrapping
             payload = message.get_payload(decode=True).decode("utf-8")
-            assert "**not**" in payload
-            assert "<strong>" not in payload
+            assert "<p>This is <strong>raw</strong> HTML.</p>" == payload
 
     @pytest.mark.asyncio
-    async def test_send_email_markdown_with_unicode(self, email_client):
-        """Test markdown email preserves unicode characters."""
+    async def test_send_email_preserves_unicode(self, email_client):
+        """Test that unicode characters are preserved in converted HTML."""
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
         mock_smtp.__aexit__ = AsyncMock()
@@ -231,7 +228,6 @@ class TestSendEmailWithMarkdown:
                 recipients=["recipient@example.com"],
                 subject="Unicode test",
                 body="Em-dash: — and accents: café résumé naïve",
-                markdown=True,
             )
 
             mock_smtp.send_message.assert_called_once()
@@ -244,31 +240,28 @@ class TestSendEmailWithMarkdown:
             assert "naïve" in payload
 
     @pytest.mark.asyncio
-    async def test_send_email_markdown_overrides_html(self, email_client):
-        """Test that markdown=True correctly sets html=True internally."""
+    async def test_send_email_plain_text_converted_to_html(self, email_client):
+        """Test that even plain text (no markdown syntax) is converted to HTML."""
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
         mock_smtp.__aexit__ = AsyncMock()
 
         with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
-            # Even with html=False explicitly, markdown=True should produce HTML
             await email_client.send_email(
                 recipients=["recipient@example.com"],
                 subject="Test",
-                body="**Bold text**",
-                html=False,
-                markdown=True,
+                body="Just plain text, no formatting.",
             )
 
             mock_smtp.send_message.assert_called_once()
             message = mock_smtp.send_message.call_args[0][0]
 
-            # Content type should be HTML because markdown=True
+            # Content type should be HTML (always converted)
             assert message.get_content_type() == "text/html"
 
     @pytest.mark.asyncio
-    async def test_send_email_empty_body_with_markdown(self, email_client):
-        """Test markdown email with empty body."""
+    async def test_send_email_empty_body(self, email_client):
+        """Test email with empty body still produces valid HTML."""
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
         mock_smtp.__aexit__ = AsyncMock()
@@ -278,7 +271,6 @@ class TestSendEmailWithMarkdown:
                 recipients=["recipient@example.com"],
                 subject="Empty body test",
                 body="",
-                markdown=True,
             )
 
             mock_smtp.send_message.assert_called_once()

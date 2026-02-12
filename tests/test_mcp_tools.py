@@ -387,7 +387,6 @@ class TestMcpTools:
                 ["cc@example.com"],
                 ["bcc@example.com"],
                 False,
-                True,  # markdown (default is True)
                 None,
                 None,  # in_reply_to
                 None,  # references

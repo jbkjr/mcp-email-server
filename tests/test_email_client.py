@@ -1361,7 +1361,7 @@ class TestAutoQuoteReply:
 
     @pytest.mark.asyncio
     async def test_quote_reply_appends_quoted_text(self, email_settings):
-        """Test that quote_reply=True fetches and appends quoted original."""
+        """Test that quote_reply=True fetches and appends HTML blockquote."""
         handler = ClassicEmailHandler(email_settings)
 
         original_email = {
@@ -1372,6 +1372,7 @@ class TestAutoQuoteReply:
             "to": ["test@example.com"],
             "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
             "body": "Original message body",
+            "html_body": "",
             "attachments": [],
         }
 
@@ -1395,11 +1396,15 @@ class TestAutoQuoteReply:
             mock_search.assert_called_once_with("<original@example.com>", "INBOX")
             mock_fetch.assert_called_once_with("42", "INBOX")
 
-            # Verify the body passed to outgoing contains both reply and quote
+            # Default path uses HTML blockquote
             sent_body = mock_send.call_args[0][2]  # body is 3rd positional arg
             assert "My reply text" in sent_body
-            assert "> Original message body" in sent_body
-            assert "Alice <alice@example.com> wrote:" in sent_body
+            assert "<blockquote" in sent_body
+            assert "Original message body" in sent_body
+            assert "Alice" in sent_body
+            assert "wrote:" in sent_body
+            # Should be sent as html=True (pre-built HTML document)
+            assert mock_send.call_args[0][5] is True  # html
 
     @pytest.mark.asyncio
     async def test_quote_reply_false_skips_fetching(self, email_settings):
@@ -1473,6 +1478,7 @@ class TestAutoQuoteReply:
             "to": ["alice@example.com"],
             "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
             "body": "I sent this originally",
+            "html_body": "",
             "attachments": [],
         }
 
@@ -1507,11 +1513,12 @@ class TestAutoQuoteReply:
             mock_fetch.assert_called_once_with("99", "Sent")
 
             sent_body = mock_send.call_args[0][2]
-            assert "> I sent this originally" in sent_body
+            assert "<blockquote" in sent_body
+            assert "I sent this originally" in sent_body
 
     @pytest.mark.asyncio
-    async def test_html_blockquote_when_markdown_true_with_html_original(self, email_settings):
-        """When markdown=True, reply uses HTML blockquote with original HTML preserved."""
+    async def test_html_blockquote_with_html_original(self, email_settings):
+        """Default reply preserves original HTML in blockquote."""
         handler = ClassicEmailHandler(email_settings)
 
         original_email = {
@@ -1540,7 +1547,6 @@ class TestAutoQuoteReply:
                 subject="Re: Original Subject",
                 body="My reply text",
                 in_reply_to="<original@example.com>",
-                markdown=True,
                 quote_reply=True,
             )
 
@@ -1555,13 +1561,12 @@ class TestAutoQuoteReply:
             # Attribution line
             assert "Alice" in sent_body
             assert "wrote:" in sent_body
-            # Should be sent as html=True, markdown=False
-            assert mock_send.call_args[0][5] is True   # html
-            assert mock_send.call_args[0][6] is False  # markdown
+            # Should be sent as html=True (pre-built document)
+            assert mock_send.call_args[0][5] is True  # html
 
     @pytest.mark.asyncio
-    async def test_html_blockquote_when_markdown_true_plain_text_original(self, email_settings):
-        """When markdown=True but original has no HTML, blockquote uses escaped text."""
+    async def test_html_blockquote_with_plain_text_original(self, email_settings):
+        """Default reply with plain text original uses escaped text in blockquote."""
         handler = ClassicEmailHandler(email_settings)
 
         original_email = {
@@ -1590,7 +1595,6 @@ class TestAutoQuoteReply:
                 subject="Re: Original Subject",
                 body="My reply",
                 in_reply_to="<original@example.com>",
-                markdown=True,
                 quote_reply=True,
             )
 
@@ -1598,12 +1602,11 @@ class TestAutoQuoteReply:
             assert "<blockquote" in sent_body
             assert "Plain text original" in sent_body
             assert "Second line" in sent_body
-            assert mock_send.call_args[0][5] is True   # html
-            assert mock_send.call_args[0][6] is False  # markdown
+            assert mock_send.call_args[0][5] is True  # html
 
     @pytest.mark.asyncio
-    async def test_text_quoting_when_markdown_false(self, email_settings):
-        """When markdown=False, reply uses text `> ` quoting (existing behavior)."""
+    async def test_html_true_reply_appends_blockquote(self, email_settings):
+        """When html=True, blockquote is appended directly to raw HTML body."""
         handler = ClassicEmailHandler(email_settings)
 
         original_email = {
@@ -1630,16 +1633,17 @@ class TestAutoQuoteReply:
             await handler.send_email(
                 recipients=["alice@example.com"],
                 subject="Re: Original Subject",
-                body="My reply text",
+                body="<p>My raw HTML reply</p>",
+                html=True,
                 in_reply_to="<original@example.com>",
-                markdown=False,
                 quote_reply=True,
             )
 
             sent_body = mock_send.call_args[0][2]
-            # Text quoting, not HTML blockquote
-            assert "> Original message body" in sent_body
-            assert "<blockquote" not in sent_body
-            # markdown and html should remain False
-            assert mock_send.call_args[0][5] is False  # html
-            assert mock_send.call_args[0][6] is False  # markdown
+            # Raw HTML body preserved
+            assert "<p>My raw HTML reply</p>" in sent_body
+            # Blockquote appended
+            assert "<blockquote" in sent_body
+            assert "Original HTML" in sent_body
+            # Still sent as html=True
+            assert mock_send.call_args[0][5] is True  # html

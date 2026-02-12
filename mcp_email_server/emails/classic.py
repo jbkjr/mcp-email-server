@@ -828,15 +828,14 @@ class EmailClient:
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         html: bool = False,
-        markdown: bool = False,
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
     ):
-        # Convert markdown to HTML if requested
-        if markdown:
+        # Convert body to HTML unless it's already raw HTML
+        if not html:
             body = markdown_to_email_html(body, wrap_in_html=True)
-            html = True  # Markdown output is always HTML
+            html = True
 
         # Create message with or without attachments
         if attachments:
@@ -1529,7 +1528,6 @@ class ClassicEmailHandler(EmailHandler):
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         html: bool = False,
-        markdown: bool = False,
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
@@ -1538,19 +1536,18 @@ class ClassicEmailHandler(EmailHandler):
         # Auto-quote the original message when replying
         if in_reply_to and quote_reply:
             original = await self._fetch_original_for_quote(in_reply_to)
-            if original and markdown:
+            if original and not html:
                 # Convert user's body to HTML, append HTML blockquote, send as raw HTML
                 user_html = markdown_to_email_html(body, wrap_in_html=False)
                 quote_html = _format_quoted_reply_html(original)
                 body = wrap_html_document(user_html + quote_html)
-                html = True
-                markdown = False  # Already converted
+                html = True  # Already converted, skip conversion in EmailClient
             elif original:
-                # Non-markdown: fall back to text quoting
-                body += _format_quoted_reply(original)
+                # Raw HTML path: append HTML blockquote directly
+                body += _format_quoted_reply_html(original)
 
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, markdown, attachments, in_reply_to, references
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references
         )
 
         # Save to Sent folder if enabled
