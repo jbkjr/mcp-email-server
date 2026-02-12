@@ -20,6 +20,7 @@ import aiosmtplib
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails.html_utils import html_to_text
 from mcp_email_server.emails.markdown_utils import markdown_to_email_html
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
@@ -199,6 +200,7 @@ class EmailClient:
         attachments = []
 
         if email_message.is_multipart():
+            html_body = ""
             for part in email_message.walk():
                 content_type = part.get_content_type()
                 content_disposition = str(part.get("Content-Disposition", ""))
@@ -217,15 +219,30 @@ class EmailClient:
                             body += body_part.decode(charset)
                         except UnicodeDecodeError:
                             body += body_part.decode("utf-8", errors="replace")
+                elif content_type == "text/html":
+                    html_part = part.get_payload(decode=True)
+                    if html_part:
+                        charset = part.get_content_charset("utf-8")
+                        try:
+                            html_body += html_part.decode(charset)
+                        except UnicodeDecodeError:
+                            html_body += html_part.decode("utf-8", errors="replace")
+            # Fall back to converted HTML if no plain text was found
+            if not body and html_body:
+                body = html_to_text(html_body)
         else:
-            # Handle plain text emails
+            content_type = email_message.get_content_type()
             payload = email_message.get_payload(decode=True)
             if payload:
                 charset = email_message.get_content_charset("utf-8")
                 try:
-                    body = payload.decode(charset)
+                    raw_body = payload.decode(charset)
                 except UnicodeDecodeError:
-                    body = payload.decode("utf-8", errors="replace")
+                    raw_body = payload.decode("utf-8", errors="replace")
+                if content_type == "text/html":
+                    body = html_to_text(raw_body)
+                else:
+                    body = raw_body
         # TODO: Allow retrieving full email body
         if body and len(body) > MAX_BODY_LENGTH:
             body = body[:MAX_BODY_LENGTH] + "...[TRUNCATED]"

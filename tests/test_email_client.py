@@ -1022,6 +1022,79 @@ class TestBatchFetchHeaders:
         assert result["200"]["subject"] == "Good"
 
 
+class TestParseEmailDataHtmlFallback:
+    """Tests for HTML-to-text fallback in _parse_email_data."""
+
+    def test_html_only_multipart_extracts_body(self, email_client):
+        """HTML-only multipart email should have body extracted from HTML."""
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "HTML Newsletter"
+        msg["From"] = "newsletter@example.com"
+        msg["To"] = "user@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        html_part = MIMEText("<p>Hello from the newsletter!</p><p>Click <a href='https://example.com'>here</a>.</p>", "html")
+        msg.attach(html_part)
+
+        result = email_client._parse_email_data(msg.as_bytes())
+
+        assert "Hello from the newsletter!" in result["body"]
+        assert "(https://example.com)" in result["body"]
+        assert "<p>" not in result["body"]
+
+    def test_multipart_prefers_plain_text(self, email_client):
+        """When both text/plain and text/html exist, prefer plain text."""
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Both Formats"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "user@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        plain_part = MIMEText("Plain text version", "plain")
+        html_part = MIMEText("<p>HTML version</p>", "html")
+        msg.attach(plain_part)
+        msg.attach(html_part)
+
+        result = email_client._parse_email_data(msg.as_bytes())
+
+        assert result["body"] == "Plain text version"
+
+    def test_non_multipart_html_converts_to_text(self, email_client):
+        """Non-multipart HTML email should be converted to text."""
+        from email.mime.text import MIMEText
+
+        msg = MIMEText("<h1>Title</h1><p>Some content here.</p>", "html")
+        msg["Subject"] = "HTML Only"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "user@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        result = email_client._parse_email_data(msg.as_bytes())
+
+        assert "Title" in result["body"]
+        assert "Some content here." in result["body"]
+        assert "<h1>" not in result["body"]
+        assert "<p>" not in result["body"]
+
+    def test_non_multipart_plain_text_unchanged(self, email_client):
+        """Non-multipart plain text email should be returned as-is (regression test)."""
+        msg = MIMEText("Just plain text, no HTML.", "plain")
+        msg["Subject"] = "Plain"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "user@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        result = email_client._parse_email_data(msg.as_bytes())
+
+        assert result["body"] == "Just plain text, no HTML."
+
+
 class TestFormatQuotedReply:
     """Tests for _format_quoted_reply helper."""
 
