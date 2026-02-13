@@ -68,6 +68,22 @@ SENT_FOLDER_CANDIDATES = [
     "INBOX/Sent",
 ]
 
+# Common Trash folder names for auto-detection
+TRASH_FOLDER_CANDIDATES = [
+    "Trash",
+    "Deleted Items",
+    "Deleted Messages",
+    "[Gmail]/Trash",
+    "INBOX.Trash",
+]
+
+# Common Archive folder names for auto-detection
+ARCHIVE_FOLDER_CANDIDATES = [
+    "Archive",
+    "[Gmail]/All Mail",
+    "INBOX.Archive",
+]
+
 
 def _is_ok(result: Any) -> bool:
     """Check if an IMAP operation result indicates success."""
@@ -652,12 +668,30 @@ class EmailClient:
             uid_dates = await self._batch_fetch_dates(imap, email_ids)
             fetch_dates_elapsed = time.perf_counter() - fetch_dates_start
 
-            # Sort by INTERNALDATE
-            sorted_uids = sorted(uid_dates.items(), key=lambda x: x[1], reverse=(order == "desc"))
+            # Normalize email_ids to strings for comparison
+            str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in email_ids]
+
+            # Log if any UIDs were lost during date fetch
+            if uid_dates and len(uid_dates) < len(str_ids):
+                logger.warning(
+                    f"INTERNALDATE fetch missed {len(str_ids) - len(uid_dates)}/{len(str_ids)} UIDs"
+                )
+
+            if uid_dates:
+                # Normal path: sort by INTERNALDATE
+                sorted_uids = sorted(uid_dates.items(), key=lambda x: x[1], reverse=(order == "desc"))
+                ordered_uids = [uid for uid, _ in sorted_uids]
+            else:
+                # Fallback: UID ordering (higher UID ≈ newer email)
+                logger.warning(
+                    f"INTERNALDATE fetch returned no results for {len(str_ids)} UIDs, "
+                    f"falling back to UID ordering"
+                )
+                ordered_uids = sorted(str_ids, key=int, reverse=(order == "desc"))
 
             # Paginate
             start = (page - 1) * page_size
-            page_uids = [uid for uid, _ in sorted_uids[start : start + page_size]]
+            page_uids = ordered_uids[start : start + page_size]
 
             if not page_uids:
                 logger.info(f"Phase 1 (dates): {len(uid_dates)} UIDs in {fetch_dates_elapsed:.2f}s, page {page} empty")
@@ -675,6 +709,10 @@ class EmailClient:
 
             # Collect in sorted order
             results = [metadata_by_uid[uid] for uid in page_uids if uid in metadata_by_uid]
+            if len(results) < len(page_uids):
+                logger.warning(
+                    f"Header fetch missed {len(page_uids) - len(results)}/{len(page_uids)} UIDs on page {page}"
+                )
             return results, total
 
     def _check_email_content(self, data: list) -> bool:
@@ -1602,30 +1640,82 @@ class ClassicEmailHandler(EmailHandler):
 
         return original
 
-    async def _find_sent_folder(self) -> str | None:
-        """Find the Sent folder name for the account."""
+    async def _find_special_folder(self, flag: str, fallback_names: list[str]) -> str | None:
+        """Find a special folder by RFC 6154 flag, falling back to common names.
+
+        Results are cached on the handler instance to avoid repeated LIST calls.
+        """
+        cache_key = f"_special_folder_{flag}"
+        cached = getattr(self, cache_key, None)
+        if cached is not None:
+            return cached if cached != "" else None
+
         try:
             folders = await self.incoming_client.list_folders()
-            # Check for common Sent folder names
-            sent_names = {"Sent", "INBOX.Sent", "Sent Items", "Sent Mail", "[Gmail]/Sent Mail", "INBOX/Sent"}
+            # Check for RFC 6154 flag first
             for folder in folders:
-                if folder.name in sent_names:
+                if any(flag.lower() in f.lower() for f in folder.flags):
+                    setattr(self, cache_key, folder.name)
                     return folder.name
-                # Also check for \Sent flag
-                if any("\\Sent" in flag for flag in folder.flags):
-                    return folder.name
+            # Fall back to common names
+            folder_names = {f.name for f in folders}
+            for candidate in fallback_names:
+                if candidate in folder_names:
+                    setattr(self, cache_key, candidate)
+                    return candidate
         except Exception as e:
-            logger.debug(f"Error finding Sent folder: {e}")
+            logger.debug(f"Error finding special folder with flag {flag}: {e}")
+
+        setattr(self, cache_key, "")  # cache negative result
         return None
 
+    async def _find_sent_folder(self) -> str | None:
+        """Find the Sent folder name for the account."""
+        return await self._find_special_folder("\\Sent", SENT_FOLDER_CANDIDATES)
+
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> EmailDeleteResponse:
-        """Delete emails by their UIDs."""
+        """Delete emails by moving to Trash (auto-detected), falling back to permanent delete."""
+        # Try to find Trash folder for safe delete
+        trash_folder = await self._find_special_folder("\\Trash", TRASH_FOLDER_CANDIDATES)
+
+        if trash_folder and mailbox != trash_folder:
+            # Move to Trash instead of permanent delete
+            moved_ids, failed_ids = await self.incoming_client.move_emails(email_ids, trash_folder, mailbox)
+            return EmailDeleteResponse(
+                success=len(failed_ids) == 0,
+                deleted_ids=moved_ids,
+                failed_ids=failed_ids,
+                mailbox=mailbox,
+                destination=trash_folder,
+            )
+
+        # No Trash folder found, or already in Trash — permanently delete
+        if not trash_folder and mailbox != "Trash":
+            logger.warning("Trash folder not found, permanently deleting emails")
         deleted_ids, failed_ids = await self.incoming_client.delete_emails(email_ids, mailbox)
         return EmailDeleteResponse(
             success=len(failed_ids) == 0,
             deleted_ids=deleted_ids,
             failed_ids=failed_ids,
             mailbox=mailbox,
+        )
+
+    async def archive_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> EmailMoveResponse:
+        """Archive emails by moving to the Archive folder (auto-detected via RFC 6154 \\Archive flag)."""
+        archive_folder = await self._find_special_folder("\\Archive", ARCHIVE_FOLDER_CANDIDATES)
+        if not archive_folder:
+            raise ValueError(
+                "Archive folder not found. No folder with \\Archive flag or common archive folder names "
+                "(Archive, [Gmail]/All Mail) detected."
+            )
+
+        moved_ids, failed_ids = await self.incoming_client.move_emails(email_ids, archive_folder, mailbox)
+        return EmailMoveResponse(
+            success=len(failed_ids) == 0,
+            moved_ids=moved_ids,
+            failed_ids=failed_ids,
+            source_mailbox=mailbox,
+            destination_folder=archive_folder,
         )
 
     async def download_attachment(

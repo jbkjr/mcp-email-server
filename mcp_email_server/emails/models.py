@@ -138,6 +138,7 @@ class EmailDeleteResponse(BaseModel):
     deleted_ids: list[str]
     failed_ids: list[str]
     mailbox: str
+    destination: str | None = None  # Trash folder name if moved, None if permanently deleted
 
 
 class EmailSendResponse(BaseModel):

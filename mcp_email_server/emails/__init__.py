@@ -138,6 +138,19 @@ class EmailHandler(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def archive_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> "EmailMoveResponse":
+        """
+        Archive emails by moving to the Archive folder (auto-detected via RFC 6154 \\Archive flag).
+
+        Args:
+            email_ids: List of email UIDs to archive.
+            mailbox: The source mailbox (default: "INBOX").
+
+        Returns:
+            EmailMoveResponse with operation results.
+        """
+
+    @abc.abstractmethod
     async def download_attachment(
         self,
         email_id: str,

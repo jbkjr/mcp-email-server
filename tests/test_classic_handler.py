@@ -12,6 +12,8 @@ from mcp_email_server.emails.models import (
     EmailDeleteResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
+    EmailMoveResponse,
+    Folder,
 )
 
 
@@ -552,3 +554,377 @@ Subject: No Date Email
         assert "100" in result
         assert result["100"]["subject"] == "Test"
         assert result["100"]["from"] == "sender@example.com"
+
+
+class TestFindSpecialFolder:
+    """Test _find_special_folder for RFC 6154 flag and fallback detection."""
+
+    @pytest.fixture
+    def classic_handler(self, email_settings):
+        return ClassicEmailHandler(email_settings)
+
+    @pytest.mark.asyncio
+    async def test_finds_folder_by_flag(self, classic_handler):
+        """Test finding a folder by its RFC 6154 flag."""
+        folders = [
+            Folder(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+            Folder(name="Bin", delimiter="/", flags=["\\Trash", "\\HasNoChildren"]),
+        ]
+        mock_list = AsyncMock(return_value=folders)
+
+        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+            result = await classic_handler._find_special_folder("\\Trash", ["Trash", "Deleted Items"])
+
+        assert result == "Bin"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_common_name(self, classic_handler):
+        """Test fallback to common folder names when flag not found."""
+        folders = [
+            Folder(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+            Folder(name="Trash", delimiter="/", flags=["\\HasNoChildren"]),
+        ]
+        mock_list = AsyncMock(return_value=folders)
+
+        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+            result = await classic_handler._find_special_folder("\\Trash", ["Trash", "Deleted Items"])
+
+        assert result == "Trash"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_not_found(self, classic_handler):
+        """Test returns None when no matching folder exists."""
+        folders = [
+            Folder(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+            Folder(name="Sent", delimiter="/", flags=["\\Sent"]),
+        ]
+        mock_list = AsyncMock(return_value=folders)
+
+        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+            result = await classic_handler._find_special_folder("\\Trash", ["Trash", "Deleted Items"])
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_caches_positive_result(self, classic_handler):
+        """Test that positive results are cached."""
+        folders = [Folder(name="Trash", delimiter="/", flags=["\\Trash"])]
+        mock_list = AsyncMock(return_value=folders)
+
+        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+            result1 = await classic_handler._find_special_folder("\\Trash", ["Trash"])
+            result2 = await classic_handler._find_special_folder("\\Trash", ["Trash"])
+
+        assert result1 == "Trash"
+        assert result2 == "Trash"
+        mock_list.assert_called_once()  # Only one LIST call due to caching
+
+    @pytest.mark.asyncio
+    async def test_caches_negative_result(self, classic_handler):
+        """Test that negative results are cached."""
+        folders = [Folder(name="INBOX", delimiter="/", flags=[])]
+        mock_list = AsyncMock(return_value=folders)
+
+        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+            result1 = await classic_handler._find_special_folder("\\Archive", ["Archive"])
+            result2 = await classic_handler._find_special_folder("\\Archive", ["Archive"])
+
+        assert result1 is None
+        assert result2 is None
+        mock_list.assert_called_once()
+
+
+class TestDeleteEmailsSafeDelete:
+    """Test delete_emails moves to Trash when available."""
+
+    @pytest.fixture
+    def classic_handler(self, email_settings):
+        return ClassicEmailHandler(email_settings)
+
+    @pytest.mark.asyncio
+    async def test_moves_to_trash_when_found(self, classic_handler):
+        """Test delete_emails moves to Trash folder when it exists."""
+        folders = [
+            Folder(name="INBOX", delimiter="/", flags=[]),
+            Folder(name="Trash", delimiter="/", flags=["\\Trash"]),
+        ]
+        mock_list = AsyncMock(return_value=folders)
+        mock_move = AsyncMock(return_value=(["123", "456"], []))
+
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "move_emails", mock_move),
+        ):
+            result = await classic_handler.delete_emails(["123", "456"], "INBOX")
+
+        assert isinstance(result, EmailDeleteResponse)
+        assert result.success is True
+        assert result.deleted_ids == ["123", "456"]
+        assert result.failed_ids == []
+        assert result.mailbox == "INBOX"
+        assert result.destination == "Trash"
+        mock_move.assert_called_once_with(["123", "456"], "Trash", "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_permanent_delete_when_no_trash(self, classic_handler):
+        """Test delete_emails permanently deletes when Trash folder not found."""
+        folders = [Folder(name="INBOX", delimiter="/", flags=[])]
+        mock_list = AsyncMock(return_value=folders)
+        mock_delete = AsyncMock(return_value=(["123"], []))
+
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
+        ):
+            result = await classic_handler.delete_emails(["123"], "INBOX")
+
+        assert isinstance(result, EmailDeleteResponse)
+        assert result.success is True
+        assert result.deleted_ids == ["123"]
+        assert result.destination is None
+        mock_delete.assert_called_once_with(["123"], "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_permanent_delete_when_already_in_trash(self, classic_handler):
+        """Test delete_emails permanently deletes when already in Trash."""
+        folders = [Folder(name="Trash", delimiter="/", flags=["\\Trash"])]
+        mock_list = AsyncMock(return_value=folders)
+        mock_delete = AsyncMock(return_value=(["123"], []))
+
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
+        ):
+            result = await classic_handler.delete_emails(["123"], "Trash")
+
+        assert isinstance(result, EmailDeleteResponse)
+        assert result.success is True
+        assert result.destination is None
+        mock_delete.assert_called_once_with(["123"], "Trash")
+
+    @pytest.mark.asyncio
+    async def test_move_to_trash_with_failures(self, classic_handler):
+        """Test delete_emails reports failures when moving to Trash."""
+        folders = [Folder(name="Trash", delimiter="/", flags=["\\Trash"])]
+        mock_list = AsyncMock(return_value=folders)
+        mock_move = AsyncMock(return_value=(["123"], ["456"]))
+
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "move_emails", mock_move),
+        ):
+            result = await classic_handler.delete_emails(["123", "456"], "INBOX")
+
+        assert result.success is False
+        assert result.deleted_ids == ["123"]
+        assert result.failed_ids == ["456"]
+        assert result.destination == "Trash"
+
+
+class TestArchiveEmails:
+    """Test archive_emails moves to Archive folder."""
+
+    @pytest.fixture
+    def classic_handler(self, email_settings):
+        return ClassicEmailHandler(email_settings)
+
+    @pytest.mark.asyncio
+    async def test_archives_when_folder_found(self, classic_handler):
+        """Test archive_emails moves to Archive folder when found."""
+        folders = [
+            Folder(name="INBOX", delimiter="/", flags=[]),
+            Folder(name="Archive", delimiter="/", flags=["\\Archive"]),
+        ]
+        mock_list = AsyncMock(return_value=folders)
+        mock_move = AsyncMock(return_value=(["123", "456"], []))
+
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "move_emails", mock_move),
+        ):
+            result = await classic_handler.archive_emails(["123", "456"], "INBOX")
+
+        assert isinstance(result, EmailMoveResponse)
+        assert result.success is True
+        assert result.moved_ids == ["123", "456"]
+        assert result.source_mailbox == "INBOX"
+        assert result.destination_folder == "Archive"
+        mock_move.assert_called_once_with(["123", "456"], "Archive", "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_archives_with_gmail_all_mail(self, classic_handler):
+        """Test archive_emails finds [Gmail]/All Mail by fallback name."""
+        folders = [
+            Folder(name="INBOX", delimiter="/", flags=[]),
+            Folder(name="[Gmail]/All Mail", delimiter="/", flags=["\\All"]),
+        ]
+        mock_list = AsyncMock(return_value=folders)
+        mock_move = AsyncMock(return_value=(["123"], []))
+
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "move_emails", mock_move),
+        ):
+            result = await classic_handler.archive_emails(["123"], "INBOX")
+
+        assert result.success is True
+        assert result.destination_folder == "[Gmail]/All Mail"
+
+    @pytest.mark.asyncio
+    async def test_raises_when_archive_not_found(self, classic_handler):
+        """Test archive_emails raises ValueError when Archive folder not found."""
+        folders = [Folder(name="INBOX", delimiter="/", flags=[])]
+        mock_list = AsyncMock(return_value=folders)
+
+        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+            with pytest.raises(ValueError, match="Archive folder not found"):
+                await classic_handler.archive_emails(["123"], "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_archive_with_failures(self, classic_handler):
+        """Test archive_emails reports partial failures."""
+        folders = [Folder(name="Archive", delimiter="/", flags=["\\Archive"])]
+        mock_list = AsyncMock(return_value=folders)
+        mock_move = AsyncMock(return_value=(["123"], ["456"]))
+
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "move_emails", mock_move),
+        ):
+            result = await classic_handler.archive_emails(["123", "456"], "INBOX")
+
+        assert result.success is False
+        assert result.moved_ids == ["123"]
+        assert result.failed_ids == ["456"]
+
+
+class TestSearchFallback:
+    """Test UID ordering fallback when INTERNALDATE fetch fails."""
+
+    @pytest.fixture
+    def email_client(self, email_settings):
+        return EmailClient(email_settings.incoming)
+
+    @pytest.mark.asyncio
+    async def test_uid_ordering_fallback_when_dates_empty(self, email_client):
+        """When _batch_fetch_dates returns {}, UIDs should still reach header fetch via UID ordering."""
+        mock_imap = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"100 200 300"]))
+
+        header_data = {
+            "100": {"email_id": "100", "subject": "Email A", "from": "a@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
+            "200": {"email_id": "200", "subject": "Email B", "from": "b@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
+            "300": {"email_id": "300", "subject": "Email C", "from": "c@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
+        }
+
+        with (
+            patch.object(email_client, "_imap_connection") as mock_ctx,
+            patch.object(email_client, "_batch_fetch_dates", return_value={}),
+            patch.object(email_client, "_batch_fetch_headers", return_value=header_data) as mock_headers,
+        ):
+            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_imap)
+            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            results, total = await email_client.get_emails_metadata_page(
+                page=1, page_size=10, order="asc",
+            )
+
+        assert total == 3
+        assert len(results) == 3
+        # ASC order: 100, 200, 300
+        assert results[0]["email_id"] == "100"
+        assert results[2]["email_id"] == "300"
+        mock_headers.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_uid_ordering_fallback_desc(self, email_client):
+        """When dates are empty, desc ordering should use reverse UID sort."""
+        mock_imap = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"100 200 300"]))
+
+        header_data = {
+            "100": {"email_id": "100", "subject": "A", "from": "a@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
+            "200": {"email_id": "200", "subject": "B", "from": "b@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
+            "300": {"email_id": "300", "subject": "C", "from": "c@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
+        }
+
+        with (
+            patch.object(email_client, "_imap_connection") as mock_ctx,
+            patch.object(email_client, "_batch_fetch_dates", return_value={}),
+            patch.object(email_client, "_batch_fetch_headers", return_value=header_data),
+        ):
+            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_imap)
+            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            results, total = await email_client.get_emails_metadata_page(
+                page=1, page_size=10, order="desc",
+            )
+
+        assert total == 3
+        assert len(results) == 3
+        # DESC order: 300, 200, 100
+        assert results[0]["email_id"] == "300"
+        assert results[2]["email_id"] == "100"
+
+    @pytest.mark.asyncio
+    async def test_partial_date_loss_still_returns_results(self, email_client):
+        """When _batch_fetch_dates returns partial results, remaining UIDs (with dates) are returned normally."""
+        mock_imap = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"100 200 300"]))
+
+        # Only 2 out of 3 UIDs have dates
+        partial_dates = {
+            "100": datetime(2025, 1, 20, tzinfo=timezone.utc),
+            "300": datetime(2025, 1, 22, tzinfo=timezone.utc),
+        }
+
+        header_data = {
+            "100": {"email_id": "100", "subject": "A", "from": "a@test.com", "to": ["r@test.com"], "date": datetime(2025, 1, 20, tzinfo=timezone.utc), "attachments": []},
+            "300": {"email_id": "300", "subject": "C", "from": "c@test.com", "to": ["r@test.com"], "date": datetime(2025, 1, 22, tzinfo=timezone.utc), "attachments": []},
+        }
+
+        with (
+            patch.object(email_client, "_imap_connection") as mock_ctx,
+            patch.object(email_client, "_batch_fetch_dates", return_value=partial_dates),
+            patch.object(email_client, "_batch_fetch_headers", return_value=header_data),
+        ):
+            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_imap)
+            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            results, total = await email_client.get_emails_metadata_page(
+                page=1, page_size=10, order="desc",
+            )
+
+        assert total == 3
+        # Only 2 UIDs had dates, so only 2 results (sorted by date desc: 300, 100)
+        assert len(results) == 2
+        assert results[0]["email_id"] == "300"
+        assert results[1]["email_id"] == "100"
+
+    @pytest.mark.asyncio
+    async def test_header_fetch_loss_returns_partial_results(self, email_client):
+        """When _batch_fetch_headers returns fewer results than requested, partial results are still returned."""
+        mock_imap = AsyncMock()
+        mock_imap.uid_search = AsyncMock(return_value=("OK", [b"100 200 300"]))
+
+        with (
+            patch.object(email_client, "_imap_connection") as mock_ctx,
+            patch.object(email_client, "_batch_fetch_dates", return_value={}),
+            patch.object(email_client, "_batch_fetch_headers", return_value={
+                # Only 2 out of 3 UIDs returned from header fetch
+                "100": {"email_id": "100", "subject": "A", "from": "a@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
+                "300": {"email_id": "300", "subject": "C", "from": "c@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
+            }),
+        ):
+            mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_imap)
+            mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            results, total = await email_client.get_emails_metadata_page(
+                page=1, page_size=10, order="asc",
+            )
+
+        assert total == 3
+        # Only 2 results because UID 200 was lost in header fetch
+        assert len(results) == 2
+        assert results[0]["email_id"] == "100"
+        assert results[1]["email_id"] == "300"

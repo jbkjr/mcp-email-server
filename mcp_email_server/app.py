@@ -263,7 +263,7 @@ async def forward_email(
 
 
 @mcp.tool(
-    description="Delete one or more emails by their email_id. Use list_emails_metadata first to get the email_id."
+    description="Delete one or more emails by their email_id. Moves to Trash when available (auto-detected via RFC 6154 flags), falls back to permanent deletion. Use list_emails_metadata first to get the email_id."
 )
 async def delete_emails(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -275,6 +275,21 @@ async def delete_emails(
 ) -> EmailDeleteResponse:
     handler = dispatch_handler(account_name)
     return await handler.delete_emails(email_ids, mailbox)
+
+
+@mcp.tool(
+    description="Archive one or more emails by moving them to the Archive folder (auto-detected via RFC 6154 flags or common folder names)."
+)
+async def archive_emails(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_ids: Annotated[
+        list[str],
+        Field(description="List of email_id to archive (obtained from list_emails_metadata)."),
+    ],
+    mailbox: Annotated[str, Field(default="INBOX", description="IMAP folder path containing the emails to archive.")] = "INBOX",
+) -> EmailMoveResponse:
+    handler = dispatch_handler(account_name)
+    return await handler.archive_emails(email_ids, mailbox)
 
 
 @mcp.tool(
