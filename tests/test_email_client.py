@@ -12,6 +12,7 @@ from mcp_email_server.emails.classic import (
     ClassicEmailHandler,
     EmailClient,
     _create_smtp_ssl_context,
+    _detect_email_service,
     _format_forwarded_email_html,
     _format_quoted_reply_html,
 )
@@ -2081,3 +2082,243 @@ class TestForwardEmail:
             # in_reply_to and references should not be set (default None)
             assert call_args.kwargs.get("in_reply_to") is None
             assert call_args.kwargs.get("references") is None
+
+
+class TestDetectEmailService:
+    """Tests for _detect_email_service helper."""
+
+    @staticmethod
+    def _make_settings(
+        imap_host: str = "imap.example.com",
+        imap_port: int = 993,
+        verify_ssl: bool = True,
+        email_service: str | None = None,
+    ) -> EmailSettings:
+        """Create EmailSettings with only the fields relevant to service detection."""
+        return EmailSettings(
+            account_name="test",
+            full_name="Test",
+            email_address="test@example.com",
+            incoming=EmailServer(
+                user_name="test", password="test", host=imap_host, port=imap_port, verify_ssl=verify_ssl
+            ),
+            outgoing=EmailServer(
+                user_name="test", password="test", host="smtp.example.com", port=465
+            ),
+            email_service=email_service,
+        )
+
+    def test_explicit_override(self):
+        """Test that email_service config field takes priority."""
+        settings = self._make_settings(imap_host="imap.gmail.com", email_service="protonmail")
+        assert _detect_email_service(settings) == "protonmail"
+
+    def test_gmail_host(self):
+        """Test Gmail detection via IMAP host."""
+        settings = self._make_settings(imap_host="imap.gmail.com")
+        assert _detect_email_service(settings) == "gmail"
+
+    def test_gmail_host_case_insensitive(self):
+        """Test Gmail detection is case-insensitive."""
+        settings = self._make_settings(imap_host="IMAP.GMAIL.COM")
+        assert _detect_email_service(settings) == "gmail"
+
+    def test_protonmail_localhost(self):
+        """Test ProtonMail Bridge detection via localhost + verify_ssl=False."""
+        settings = self._make_settings(imap_host="127.0.0.1", imap_port=1143, verify_ssl=False)
+        assert _detect_email_service(settings) == "protonmail"
+
+    def test_protonmail_localhost_name(self):
+        """Test ProtonMail Bridge detection via 'localhost' hostname."""
+        settings = self._make_settings(imap_host="localhost", imap_port=1143, verify_ssl=False)
+        assert _detect_email_service(settings) == "protonmail"
+
+    def test_localhost_with_verify_ssl_true_is_generic(self):
+        """Test that localhost with verify_ssl=True does not trigger ProtonMail detection."""
+        settings = self._make_settings(imap_host="localhost", verify_ssl=True)
+        assert _detect_email_service(settings) == "generic"
+
+    def test_generic_fallback(self):
+        """Test generic fallback for unknown hosts."""
+        settings = self._make_settings(imap_host="imap.example.com")
+        assert _detect_email_service(settings) == "generic"
+
+    def test_explicit_override_beats_gmail(self):
+        """Test that explicit override wins over Gmail host detection."""
+        settings = self._make_settings(imap_host="imap.gmail.com", email_service="generic")
+        assert _detect_email_service(settings) == "generic"
+
+
+class TestServiceAwareQuoteFormat:
+    """Tests for service-specific quote formatting in _format_quoted_reply_html."""
+
+    def _make_original(self):
+        return {
+            "from": "Alice <alice@example.com>",
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Original message body",
+            "html_body": "<p>Original <strong>HTML</strong> content</p>",
+        }
+
+    def test_protonmail_format(self):
+        """Test ProtonMail-specific quote structure."""
+        result = _format_quoted_reply_html(self._make_original(), service="protonmail")
+
+        assert 'class="protonmail_quote"' in result
+        assert '<div class="protonmail_quote">' in result
+        assert '<blockquote class="protonmail_quote" type="cite">' in result
+        assert "Alice" in result
+        assert "wrote:" in result
+        assert "Original <strong>HTML</strong> content" in result
+
+    def test_gmail_format(self):
+        """Test Gmail-specific quote structure."""
+        result = _format_quoted_reply_html(self._make_original(), service="gmail")
+
+        assert 'class="gmail_quote"' in result
+        assert '<div class="gmail_quote">' in result
+        assert '<div class="gmail_attr"' in result
+        assert '<blockquote class="gmail_quote"' in result
+        assert "border-inline-start:1px solid rgb(204,204,204)" in result
+        assert "Alice" in result
+        assert "wrote:" in result
+        assert "Original <strong>HTML</strong> content" in result
+
+    def test_generic_format(self):
+        """Test generic quote structure (default)."""
+        result = _format_quoted_reply_html(self._make_original(), service="generic")
+
+        assert 'class="protonmail_quote"' not in result
+        assert 'class="gmail_quote"' not in result
+        assert '<blockquote type="cite"' in result
+        assert "Alice" in result
+        assert "wrote:" in result
+        assert "Original <strong>HTML</strong> content" in result
+
+    def test_default_service_is_generic(self):
+        """Test that omitting service parameter gives generic format."""
+        result = _format_quoted_reply_html(self._make_original())
+
+        assert 'class="protonmail_quote"' not in result
+        assert 'class="gmail_quote"' not in result
+        assert '<blockquote type="cite"' in result
+
+    def test_generic_attribution_inside_blockquote(self):
+        """Test that generic format puts attribution inside blockquote."""
+        result = _format_quoted_reply_html(self._make_original(), service="generic")
+
+        # Attribution should be inside blockquote for generic format
+        bq_start = result.index("<blockquote")
+        bq_end = result.index("</blockquote>")
+        attribution_pos = result.index("wrote:")
+        assert bq_start < attribution_pos < bq_end
+
+    def test_protonmail_attribution_outside_blockquote(self):
+        """Test that ProtonMail format puts attribution outside blockquote."""
+        result = _format_quoted_reply_html(self._make_original(), service="protonmail")
+
+        bq_start = result.index('<blockquote class="protonmail_quote"')
+        attribution_pos = result.index("wrote:")
+        assert attribution_pos < bq_start
+
+    def test_gmail_attribution_outside_blockquote(self):
+        """Test that Gmail format puts attribution outside blockquote."""
+        result = _format_quoted_reply_html(self._make_original(), service="gmail")
+
+        bq_start = result.index('<blockquote class="gmail_quote"')
+        attribution_pos = result.index("wrote:")
+        assert attribution_pos < bq_start
+
+    def test_plain_text_fallback_all_services(self):
+        """Test that all service formats handle plain text fallback correctly."""
+        original = {
+            "from": "Bob <bob@example.com>",
+            "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "body": "Plain text body\nSecond line",
+            "html_body": "",
+        }
+        for service in ("protonmail", "gmail", "generic"):
+            result = _format_quoted_reply_html(original, service=service)
+            assert "Plain text body" in result
+            assert "Second line" in result
+            assert "<br>" in result
+
+
+class TestClassicEmailHandlerServiceDetection:
+    """Tests for ClassicEmailHandler using detected email_service."""
+
+    @staticmethod
+    def _make_handler(
+        imap_host: str,
+        smtp_host: str,
+        imap_port: int = 993,
+        smtp_port: int = 465,
+        verify_ssl: bool = True,
+        email_address: str = "test@example.com",
+    ) -> ClassicEmailHandler:
+        """Create a ClassicEmailHandler with minimal boilerplate."""
+        settings = EmailSettings(
+            account_name="test",
+            full_name="Test",
+            email_address=email_address,
+            incoming=EmailServer(
+                user_name="test", password="test", host=imap_host, port=imap_port, verify_ssl=verify_ssl
+            ),
+            outgoing=EmailServer(
+                user_name="test", password="test", host=smtp_host, port=smtp_port, verify_ssl=verify_ssl
+            ),
+        )
+        return ClassicEmailHandler(settings)
+
+    def test_handler_stores_detected_service(self):
+        """Test that ClassicEmailHandler stores the detected service."""
+        handler = self._make_handler(
+            imap_host="127.0.0.1", smtp_host="127.0.0.1",
+            imap_port=1143, smtp_port=1025, verify_ssl=False,
+        )
+        assert handler.email_service == "protonmail"
+
+    def test_handler_gmail_service(self):
+        """Test that ClassicEmailHandler detects Gmail."""
+        handler = self._make_handler(imap_host="imap.gmail.com", smtp_host="smtp.gmail.com")
+        assert handler.email_service == "gmail"
+
+    @pytest.mark.asyncio
+    async def test_send_reply_uses_service_format(self):
+        """Test that send_email passes detected service to quote formatter."""
+        handler = self._make_handler(
+            imap_host="127.0.0.1", smtp_host="127.0.0.1",
+            imap_port=1143, smtp_port=1025, verify_ssl=False,
+        )
+
+        original_email = {
+            "email_id": "42",
+            "message_id": "<original@example.com>",
+            "subject": "Test",
+            "from": "Alice <alice@example.com>",
+            "to": ["test@proton.me"],
+            "date": datetime(2024, 3, 15, 14, 30, tzinfo=timezone.utc),
+            "body": "Original body",
+            "html_body": "",
+            "attachments": [],
+        }
+
+        with (
+            patch.object(
+                handler.incoming_client, "search_by_message_id", return_value="42"
+            ),
+            patch.object(
+                handler.incoming_client, "get_email_body_by_id", return_value=original_email
+            ),
+            patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
+        ):
+            await handler.send_email(
+                recipients=["alice@example.com"],
+                subject="Re: Test",
+                body="My reply",
+                in_reply_to="<original@example.com>",
+                quote_reply=True,
+            )
+
+            sent_body = mock_send.call_args[0][2]
+            assert 'class="protonmail_quote"' in sent_body

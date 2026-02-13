@@ -85,6 +85,7 @@ class EmailSettings(AccountAttributes):
     outgoing: EmailServer
     save_to_sent: bool = True  # Save sent emails to IMAP Sent folder
     sent_folder_name: str | None = None  # Override Sent folder name (auto-detect if None)
+    email_service: str | None = None  # Override auto-detection: 'protonmail', 'gmail', etc.
 
     @classmethod
     def init(
@@ -109,6 +110,7 @@ class EmailSettings(AccountAttributes):
         smtp_password: str | None = None,
         save_to_sent: bool = True,
         sent_folder_name: str | None = None,
+        email_service: str | None = None,
     ) -> EmailSettings:
         return cls(
             account_name=account_name,
@@ -132,6 +134,7 @@ class EmailSettings(AccountAttributes):
             ),
             save_to_sent=save_to_sent,
             sent_folder_name=sent_folder_name,
+            email_service=email_service,
         )
 
     @classmethod
@@ -154,6 +157,7 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_SMTP_VERIFY_SSL (default: true)
         - MCP_EMAIL_SERVER_SAVE_TO_SENT (default: true)
         - MCP_EMAIL_SERVER_SENT_FOLDER_NAME (default: auto-detect)
+        - MCP_EMAIL_SERVER_EMAIL_SERVICE (default: auto-detect from IMAP host)
         """
         # Check if minimum required environment variables are set
         email_address = os.getenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS")
@@ -195,6 +199,7 @@ class EmailSettings(AccountAttributes):
                 imap_password=os.getenv("MCP_EMAIL_SERVER_IMAP_PASSWORD", password),
                 save_to_sent=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SAVE_TO_SENT"), True),
                 sent_folder_name=os.getenv("MCP_EMAIL_SERVER_SENT_FOLDER_NAME"),
+                email_service=os.getenv("MCP_EMAIL_SERVER_EMAIL_SERVICE"),
             )
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to create email settings from environment variables: {e}")

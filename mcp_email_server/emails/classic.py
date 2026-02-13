@@ -85,6 +85,32 @@ ARCHIVE_FOLDER_CANDIDATES = [
 ]
 
 
+def _detect_email_service(email_settings: EmailSettings) -> str:
+    """Detect the email service from IMAP config for service-aware reply quoting.
+
+    Detection order:
+    1. Explicit override via email_service config field
+    2. imap.gmail.com host → 'gmail' (includes Google Workspace custom domains)
+    3. localhost/127.0.0.1 + verify_ssl=False → 'protonmail' (ProtonMail Bridge)
+    4. Everything else → 'generic'
+
+    Note: The localhost heuristic could mislabel other local IMAP servers with
+    self-signed certs as ProtonMail. Use email_service config override for those cases.
+    """
+    if email_settings.email_service:
+        return email_settings.email_service
+
+    host = email_settings.incoming.host.lower()
+
+    if host == "imap.gmail.com":
+        return "gmail"
+
+    if host in ("localhost", "127.0.0.1") and not email_settings.incoming.verify_ssl:
+        return "protonmail"
+
+    return "generic"
+
+
 def _is_ok(result: Any) -> bool:
     """Check if an IMAP operation result indicates success."""
     status = result[0] if isinstance(result, tuple) else result
@@ -162,13 +188,15 @@ def _strip_html_wrappers(html_content: str) -> str:
     return content.strip()
 
 
-def _format_quoted_reply_html(original_email: dict[str, Any]) -> str:
+def _format_quoted_reply_html(original_email: dict[str, Any], service: str = "generic") -> str:
     """Format an original email as an HTML blockquote for reply quoting.
 
-    Uses the original HTML body when available, falling back to escaped plain text.
+    Uses service-specific HTML structure so email clients can properly collapse
+    the quoted content (including the attribution line).
 
     Args:
         original_email: Parsed email dict with keys: from, date, body, html_body.
+        service: Email service name ('protonmail', 'gmail', 'generic').
 
     Returns:
         HTML string containing an attribution line and styled blockquote.
@@ -198,14 +226,38 @@ def _format_quoted_reply_html(original_email: dict[str, Any]) -> str:
 
     attribution = f"On {date_str}, {html_escape(sender)} wrote:"
 
+    if service == "protonmail":
+        return (
+            f'<div class="protonmail_quote">'
+            f"{attribution}<br>"
+            f'<blockquote class="protonmail_quote" type="cite">'
+            f"{quoted_content}"
+            f"</blockquote><br>"
+            f"</div>"
+        )
+
+    if service == "gmail":
+        return (
+            f'<div class="gmail_quote">'
+            f'<div class="gmail_attr" dir="ltr">{attribution}<br></div>'
+            f'<blockquote class="gmail_quote" style="'
+            f"margin:0 0 0 .8ex;"
+            f"border-inline-start:1px solid rgb(204,204,204);"
+            f'padding-inline-start:1ex">'
+            f"{quoted_content}"
+            f"</blockquote>"
+            f"</div>"
+        )
+
+    # generic: attribution inside blockquote for maximum compatibility
     return (
         f'<div style="margin-top: 1em;">'
-        f'<p style="color: #666;">{attribution}</p>'
         f'<blockquote type="cite" style="'
         f"margin: 0 0 0 0.5em; "
         f"padding: 0.5em 1em; "
         f"border-left: 3px solid #ccc; "
         f'color: #555;">'
+        f'<p style="color: #666;">{attribution}</p>'
         f"{quoted_content}"
         f"</blockquote>"
         f"</div>"
@@ -1397,6 +1449,7 @@ class ClassicEmailHandler(EmailHandler):
         )
         self.save_to_sent = email_settings.save_to_sent
         self.sent_folder_name = email_settings.sent_folder_name
+        self.email_service = _detect_email_service(email_settings)
 
     async def get_emails_metadata(
         self,
@@ -1502,12 +1555,12 @@ class ClassicEmailHandler(EmailHandler):
             if original and not html:
                 # Convert user's body to HTML, append HTML blockquote, send as raw HTML
                 user_html = markdown_to_email_html(body, wrap_in_html=False)
-                quote_html = _format_quoted_reply_html(original)
+                quote_html = _format_quoted_reply_html(original, service=self.email_service)
                 body = wrap_html_document(user_html + quote_html)
                 html = True  # Already converted, skip conversion in EmailClient
             elif original:
                 # Raw HTML path: append HTML blockquote directly
-                body += _format_quoted_reply_html(original)
+                body += _format_quoted_reply_html(original, service=self.email_service)
 
         msg = await self.outgoing_client.send_email(
             recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references
