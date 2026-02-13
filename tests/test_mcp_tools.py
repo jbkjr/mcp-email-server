@@ -19,9 +19,11 @@ from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
     EmailContentBatchResponse,
+    EmailDeleteResponse,
     EmailMarkResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
+    EmailSendResponse,
 )
 
 
@@ -175,6 +177,9 @@ class TestMcpTools:
                 seen=None,
                 flagged=None,
                 answered=None,
+                body=None,
+                text=None,
+                has_attachment=None,
             )
 
     @pytest.mark.asyncio
@@ -223,6 +228,9 @@ class TestMcpTools:
                 seen=None,
                 flagged=None,
                 answered=None,
+                body=None,
+                text=None,
+                has_attachment=None,
             )
 
     @pytest.mark.asyncio
@@ -268,7 +276,7 @@ class TestMcpTools:
             assert result.emails[0].subject == "Test Subject"
 
             # Verify dispatch_handler and get_emails_content were called correctly
-            mock_handler.get_emails_content.assert_called_once_with(["12345"], "INBOX")
+            mock_handler.get_emails_content.assert_called_once_with(["12345"], "INBOX", 20000)
 
     @pytest.mark.asyncio
     async def test_get_emails_content_batch(self):
@@ -324,7 +332,7 @@ class TestMcpTools:
             assert result.emails[1].email_id == "12346"
 
             # Verify dispatch_handler and get_emails_content were called correctly
-            mock_handler.get_emails_content.assert_called_once_with(["12345", "12346", "12347"], "INBOX")
+            mock_handler.get_emails_content.assert_called_once_with(["12345", "12346", "12347"], "INBOX", 20000)
 
     @pytest.mark.asyncio
     async def test_get_emails_content_with_mailbox(self):
@@ -358,16 +366,21 @@ class TestMcpTools:
             )
 
             assert result == batch_response
-            mock_handler.get_emails_content.assert_called_once_with(["12345"], "Sent")
+            mock_handler.get_emails_content.assert_called_once_with(["12345"], "Sent", 20000)
 
     @pytest.mark.asyncio
     async def test_send_email(self):
-        """Test send_email MCP tool."""
-        # Mock the dispatch_handler function
+        """Test send_email MCP tool returns EmailSendResponse."""
+        mock_response = EmailSendResponse(
+            success=True,
+            recipients=["recipient@example.com", "cc@example.com"],
+            subject="Test Subject",
+            message="Email sent successfully to recipient@example.com",
+        )
         mock_handler = AsyncMock()
+        mock_handler.send_email.return_value = mock_response
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
-            # Call the function
             result = await send_email(
                 account_name="test_account",
                 recipients=["recipient@example.com"],
@@ -377,10 +390,10 @@ class TestMcpTools:
                 bcc=["bcc@example.com"],
             )
 
-            # Verify the return value
-            assert result == "Email sent successfully to recipient@example.com"
+            assert isinstance(result, EmailSendResponse)
+            assert result.success is True
+            assert "recipient@example.com" in result.recipients
 
-            # Verify send_email was called correctly
             mock_handler.send_email.assert_called_once_with(
                 ["recipient@example.com"],
                 "Test Subject",
@@ -396,9 +409,12 @@ class TestMcpTools:
 
     @pytest.mark.asyncio
     async def test_delete_emails(self):
-        """Test delete_emails MCP tool."""
+        """Test delete_emails MCP tool returns EmailDeleteResponse."""
+        mock_response = EmailDeleteResponse(
+            success=True, deleted_ids=["12345", "12346"], failed_ids=[], mailbox="INBOX"
+        )
         mock_handler = AsyncMock()
-        mock_handler.delete_emails.return_value = (["12345", "12346"], [])
+        mock_handler.delete_emails.return_value = mock_response
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await delete_emails(
@@ -406,14 +422,19 @@ class TestMcpTools:
                 email_ids=["12345", "12346"],
             )
 
-            assert result == "Successfully deleted 2 email(s)"
+            assert isinstance(result, EmailDeleteResponse)
+            assert result.success is True
+            assert result.deleted_ids == ["12345", "12346"]
             mock_handler.delete_emails.assert_called_once_with(["12345", "12346"], "INBOX")
 
     @pytest.mark.asyncio
     async def test_delete_emails_with_failures(self):
         """Test delete_emails MCP tool with some failures."""
+        mock_response = EmailDeleteResponse(
+            success=False, deleted_ids=["12345"], failed_ids=["12346", "12347"], mailbox="INBOX"
+        )
         mock_handler = AsyncMock()
-        mock_handler.delete_emails.return_value = (["12345"], ["12346", "12347"])
+        mock_handler.delete_emails.return_value = mock_response
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await delete_emails(
@@ -421,14 +442,19 @@ class TestMcpTools:
                 email_ids=["12345", "12346", "12347"],
             )
 
-            assert result == "Successfully deleted 1 email(s), failed to delete 2 email(s): 12346, 12347"
+            assert isinstance(result, EmailDeleteResponse)
+            assert result.success is False
+            assert result.failed_ids == ["12346", "12347"]
             mock_handler.delete_emails.assert_called_once_with(["12345", "12346", "12347"], "INBOX")
 
     @pytest.mark.asyncio
     async def test_delete_emails_with_mailbox(self):
         """Test delete_emails MCP tool with custom mailbox."""
+        mock_response = EmailDeleteResponse(
+            success=True, deleted_ids=["12345"], failed_ids=[], mailbox="Trash"
+        )
         mock_handler = AsyncMock()
-        mock_handler.delete_emails.return_value = (["12345"], [])
+        mock_handler.delete_emails.return_value = mock_response
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await delete_emails(
@@ -437,7 +463,8 @@ class TestMcpTools:
                 mailbox="Trash",
             )
 
-            assert result == "Successfully deleted 1 email(s)"
+            assert isinstance(result, EmailDeleteResponse)
+            assert result.mailbox == "Trash"
             mock_handler.delete_emails.assert_called_once_with(["12345"], "Trash")
 
     @pytest.mark.asyncio
@@ -592,8 +619,14 @@ class TestMcpTools:
     @pytest.mark.asyncio
     async def test_send_email_with_reply_headers(self):
         """Test send_email MCP tool with reply headers."""
+        mock_response = EmailSendResponse(
+            success=True,
+            recipients=["recipient@example.com"],
+            subject="Re: Test",
+            message="Email sent successfully to recipient@example.com",
+        )
         mock_handler = AsyncMock()
-        mock_handler.send_email = AsyncMock()
+        mock_handler.send_email.return_value = mock_response
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await send_email(
@@ -607,9 +640,9 @@ class TestMcpTools:
 
             mock_handler.send_email.assert_called_once()
             call_args = mock_handler.send_email.call_args
-            # Verify in_reply_to and references were passed (positions 7 and 8 after cc, bcc, html, attachments)
             assert "<original@example.com>" in str(call_args)
-            assert "recipient@example.com" in result
+            assert isinstance(result, EmailSendResponse)
+            assert "recipient@example.com" in result.recipients
 
     @pytest.mark.asyncio
     async def test_get_emails_content_includes_message_id(self):
@@ -647,8 +680,15 @@ class TestMcpTools:
 
     @pytest.mark.asyncio
     async def test_forward_email(self):
-        """Test forward_email MCP tool."""
+        """Test forward_email MCP tool returns EmailSendResponse."""
+        mock_response = EmailSendResponse(
+            success=True,
+            recipients=["bob@example.com"],
+            subject="Fwd: Original",
+            message="Email forwarded successfully to bob@example.com",
+        )
         mock_handler = AsyncMock()
+        mock_handler.forward_email.return_value = mock_response
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await forward_email(
@@ -659,7 +699,9 @@ class TestMcpTools:
                 body="FYI",
             )
 
-            assert result == "Email forwarded successfully to bob@example.com"
+            assert isinstance(result, EmailSendResponse)
+            assert result.success is True
+            assert result.recipients == ["bob@example.com"]
             mock_handler.forward_email.assert_called_once_with(
                 "12345",
                 "INBOX",
@@ -674,7 +716,14 @@ class TestMcpTools:
     @pytest.mark.asyncio
     async def test_forward_email_multiple_recipients(self):
         """Test forward_email MCP tool with multiple recipients."""
+        mock_response = EmailSendResponse(
+            success=True,
+            recipients=["alice@example.com", "bob@example.com"],
+            subject="Fwd: Original",
+            message="Email forwarded successfully to alice@example.com, bob@example.com",
+        )
         mock_handler = AsyncMock()
+        mock_handler.forward_email.return_value = mock_response
 
         with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
             result = await forward_email(
@@ -683,4 +732,5 @@ class TestMcpTools:
                 recipients=["alice@example.com", "bob@example.com"],
             )
 
-            assert result == "Email forwarded successfully to alice@example.com, bob@example.com"
+            assert isinstance(result, EmailSendResponse)
+            assert result.recipients == ["alice@example.com", "bob@example.com"]

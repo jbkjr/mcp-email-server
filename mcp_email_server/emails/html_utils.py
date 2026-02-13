@@ -37,9 +37,7 @@ class _HTMLToTextParser(HTMLParser):
             self._result.append("\n")
         elif tag == "hr":
             self._result.append("\n---\n")
-        elif tag in self.BLOCK_TAGS:
-            self._result.append("\n\n")
-        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+        elif tag in self.BLOCK_TAGS or tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             self._result.append("\n\n")
         elif tag == "blockquote":
             self._result.append("\n> ")
@@ -81,9 +79,7 @@ class _HTMLToTextParser(HTMLParser):
         if self._skip_depth > 0:
             return
 
-        if tag in self.BLOCK_TAGS:
-            self._result.append("\n\n")
-        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+        if tag in self.BLOCK_TAGS or tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             self._result.append("\n\n")
         elif tag == "blockquote":
             self._result.append("\n")
@@ -114,10 +110,7 @@ class _HTMLToTextParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._skip_depth > 0:
             return
-        if self._in_pre:
-            self._result.append(data)
-        else:
-            self._result.append(data)
+        self._result.append(data)
 
     def handle_entityref(self, name: str) -> None:
         if self._skip_depth > 0:

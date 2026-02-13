@@ -4,7 +4,7 @@ import mimetypes
 import re
 import ssl
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.header import Header
@@ -27,11 +27,13 @@ from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
     EmailContentBatchResponse,
+    EmailDeleteResponse,
     EmailLabelsResponse,
     EmailMarkResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
     EmailMoveResponse,
+    EmailSendResponse,
     Folder,
     FolderListResponse,
     FolderOperationResponse,
@@ -421,6 +423,7 @@ class EmailClient:
         seen: bool | None = None,
         flagged: bool | None = None,
         answered: bool | None = None,
+        has_attachment: bool | None = None,
     ) -> list[str]:
         search_criteria = []
         if before:
@@ -437,6 +440,10 @@ class EmailClient:
             search_criteria.extend(["FROM", from_address])
         if to_address:
             search_criteria.extend(["TO", to_address])
+        if has_attachment is True:
+            search_criteria.extend(["HEADER", "Content-Type", "multipart/mixed"])
+        elif has_attachment is False:
+            search_criteria.extend(["NOT", "HEADER", "Content-Type", "multipart/mixed"])
 
         # Flag-based criteria using mapping to reduce complexity
         flag_criteria = [
@@ -1041,23 +1048,38 @@ class EmailClient:
             logger.error(f"Error saving to Sent folder: {e}")
             return False
 
+    @staticmethod
+    async def _batch_uid_operation(
+        imap: Any,
+        email_ids: list[str],
+        operation_fn: Callable,
+        op_name: str,
+    ) -> tuple[list[str], list[str]]:
+        """Execute an async IMAP operation on each email_id, returning (succeeded, failed).
+
+        operation_fn(imap, email_id) should raise on failure.
+        """
+        succeeded = []
+        failed = []
+        for email_id in email_ids:
+            try:
+                await operation_fn(imap, email_id)
+                succeeded.append(email_id)
+            except Exception as e:
+                logger.error(f"Failed to {op_name} email {email_id}: {e}")
+                failed.append(email_id)
+        return succeeded, failed
+
     async def delete_emails(self, email_ids: list[str], mailbox: str = DEFAULT_MAILBOX) -> tuple[list[str], list[str]]:
         """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""
-        deleted_ids = []
-        failed_ids = []
-
         async with self._imap_connection(mailbox) as imap:
-            for email_id in email_ids:
-                try:
-                    await imap.uid("store", email_id, "+FLAGS", IMAP_FLAG_DELETED)
-                    deleted_ids.append(email_id)
-                except Exception as e:
-                    logger.error(f"Failed to delete email {email_id}: {e}")
-                    failed_ids.append(email_id)
+            async def _op(imap: Any, email_id: str) -> None:
+                await imap.uid("store", email_id, "+FLAGS", IMAP_FLAG_DELETED)
 
+            deleted, failed = await self._batch_uid_operation(imap, email_ids, _op, "delete")
             await imap.expunge()
 
-        return deleted_ids, failed_ids
+        return deleted, failed
 
     def _parse_list_response(self, folder_data: bytes | str) -> Folder | None:
         """Parse a single IMAP LIST response line into a Folder object.
@@ -1117,24 +1139,13 @@ class EmailClient:
         source_mailbox: str = DEFAULT_MAILBOX,
     ) -> tuple[list[str], list[str]]:
         """Copy emails to a destination folder. Returns (copied_ids, failed_ids)."""
-        copied_ids = []
-        failed_ids = []
-
         async with self._imap_connection(source_mailbox) as imap:
-            for email_id in email_ids:
-                try:
-                    result = await imap.uid("copy", email_id, _quote_mailbox(destination_folder))
-                    if _is_ok(result):
-                        copied_ids.append(email_id)
-                        logger.debug(f"Copied email {email_id} to {destination_folder}")
-                    else:
-                        logger.error(f"Failed to copy email {email_id}: {result}")
-                        failed_ids.append(email_id)
-                except Exception as e:
-                    logger.error(f"Failed to copy email {email_id}: {e}")
-                    failed_ids.append(email_id)
+            async def _op(imap: Any, email_id: str) -> None:
+                result = await imap.uid("copy", email_id, _quote_mailbox(destination_folder))
+                if not _is_ok(result):
+                    raise RuntimeError(f"COPY failed: {result}")
 
-        return copied_ids, failed_ids
+            return await self._batch_uid_operation(imap, email_ids, _op, "copy")
 
     async def move_emails(
         self,
@@ -1296,7 +1307,6 @@ class EmailClient:
         self, email_ids: list[str], mark_as: str, mailbox: str = DEFAULT_MAILBOX
     ) -> tuple[list[str], list[str]]:
         """Mark emails as read or unread. Returns (marked_ids, failed_ids)."""
-        # Determine flag operation: +FLAGS for read, -FLAGS for unread
         if mark_as == "read":
             flag_op = "+FLAGS"
         elif mark_as == "unread":
@@ -1304,19 +1314,36 @@ class EmailClient:
         else:
             raise ValueError(f"Invalid mark_as value: {mark_as}. Must be 'read' or 'unread'.")
 
-        marked_ids = []
-        failed_ids = []
-
         async with self._imap_connection(mailbox) as imap:
-            for email_id in email_ids:
-                try:
-                    await imap.uid("store", email_id, flag_op, IMAP_FLAG_SEEN)
-                    marked_ids.append(email_id)
-                except Exception as e:
-                    logger.error(f"Failed to mark email {email_id} as {mark_as}: {e}")
-                    failed_ids.append(email_id)
+            async def _op(imap: Any, email_id: str) -> None:
+                await imap.uid("store", email_id, flag_op, IMAP_FLAG_SEEN)
 
-        return marked_ids, failed_ids
+            return await self._batch_uid_operation(imap, email_ids, _op, f"mark as {mark_as}")
+
+    async def search_message_id_in_folders(
+        self, message_id: str, folders: list[str]
+    ) -> dict[str, str]:
+        """Search for an email by Message-ID across multiple folders in a single IMAP session.
+
+        Returns a dict mapping folder name to UID for folders where the email was found.
+        """
+        results: dict[str, str] = {}
+        try:
+            async with self._imap_connection(mailbox=None) as imap:
+                for folder in folders:
+                    try:
+                        result = await imap.select(_quote_mailbox(folder))
+                        if not _is_ok(result):
+                            logger.debug(f"Failed to select folder {folder}: {result}")
+                            continue
+                        uid = await self._search_message_id_in_mailbox(imap, message_id)
+                        if uid:
+                            results[folder] = uid
+                    except Exception as e:
+                        logger.debug(f"Error searching for Message-ID in {folder}: {e}")
+        except Exception as e:
+            logger.debug(f"Error during multi-folder search: {e}")
+        return results
 
     async def delete_from_folder(self, email_ids: list[str], folder: str) -> tuple[list[str], list[str]]:
         """Delete emails from a specific folder. Returns (deleted_ids, failed_ids)."""
@@ -1380,14 +1407,19 @@ class ClassicEmailHandler(EmailHandler):
             total=total,
         )
 
-    async def get_emails_content(self, email_ids: list[str], mailbox: str = "INBOX") -> EmailContentBatchResponse:
+    async def get_emails_content(
+        self,
+        email_ids: list[str],
+        mailbox: str = "INBOX",
+        max_body_length: int | None = MAX_BODY_LENGTH,
+    ) -> EmailContentBatchResponse:
         """Batch retrieve email body content"""
         emails = []
         failed_ids = []
 
         for email_id in email_ids:
             try:
-                email_data = await self.incoming_client.get_email_body_by_id(email_id, mailbox)
+                email_data = await self.incoming_client.get_email_body_by_id(email_id, mailbox, max_body_length)
                 if email_data:
                     emails.append(
                         EmailBodyResponse(
@@ -1426,7 +1458,7 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         quote_reply: bool = True,
-    ) -> None:
+    ) -> EmailSendResponse:
         # Auto-quote the original message when replying
         if in_reply_to and quote_reply:
             original = await self._fetch_original_for_quote(in_reply_to)
@@ -1455,6 +1487,17 @@ class ClassicEmailHandler(EmailHandler):
             except Exception as e:
                 logger.error(f"Failed to save email to Sent folder: {e}", exc_info=True)
 
+        all_recipients = list(recipients)
+        if cc:
+            all_recipients.extend(cc)
+        attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
+        return EmailSendResponse(
+            success=True,
+            recipients=all_recipients,
+            subject=subject,
+            message=f"Email sent successfully to {', '.join(recipients)}{attachment_info}",
+        )
+
     async def forward_email(
         self,
         email_id: str,
@@ -1465,7 +1508,7 @@ class ClassicEmailHandler(EmailHandler):
         bcc: list[str] | None = None,
         html: bool = False,
         attachments: list[str] | None = None,
-    ) -> None:
+    ) -> EmailSendResponse:
         # Fetch original email
         original = await self.incoming_client.get_email_body_by_id(email_id, mailbox)
         if not original:
@@ -1524,6 +1567,13 @@ class ClassicEmailHandler(EmailHandler):
             except Exception as e:
                 logger.error(f"Failed to save forwarded email to Sent folder: {e}", exc_info=True)
 
+        return EmailSendResponse(
+            success=True,
+            recipients=list(recipients),
+            subject=subject,
+            message=f"Email forwarded successfully to {', '.join(recipients)}",
+        )
+
     async def _fetch_original_for_quote(self, message_id: str) -> dict[str, Any] | None:
         """Fetch the original email by Message-ID for reply quoting.
 
@@ -1568,9 +1618,15 @@ class ClassicEmailHandler(EmailHandler):
             logger.debug(f"Error finding Sent folder: {e}")
         return None
 
-    async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
-        """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""
-        return await self.incoming_client.delete_emails(email_ids, mailbox)
+    async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> EmailDeleteResponse:
+        """Delete emails by their UIDs."""
+        deleted_ids, failed_ids = await self.incoming_client.delete_emails(email_ids, mailbox)
+        return EmailDeleteResponse(
+            success=len(failed_ids) == 0,
+            deleted_ids=deleted_ids,
+            failed_ids=failed_ids,
+            mailbox=mailbox,
+        )
 
     async def download_attachment(
         self,
@@ -1689,6 +1745,7 @@ class ClassicEmailHandler(EmailHandler):
         self,
         email_ids: list[str],
         label_name: str,
+        source_mailbox: str = DEFAULT_MAILBOX,
     ) -> EmailMoveResponse:
         """Remove a label from emails by deleting from the label folder.
 
@@ -1700,11 +1757,7 @@ class ClassicEmailHandler(EmailHandler):
         failed_ids = []
 
         for email_id in email_ids:
-            # Get the Message-ID from the source email
-            # Note: We need to find this email in the label folder
-            # The email_id provided is from the source mailbox, not the label folder
-            # We need to search by Message-ID to find the copy in the label folder
-            message_id = await self.incoming_client.get_email_message_id(email_id, "INBOX")
+            message_id = await self.incoming_client.get_email_message_id(email_id, source_mailbox)
             if not message_id:
                 logger.warning(f"Could not get Message-ID for email {email_id}")
                 failed_ids.append(email_id)
@@ -1743,16 +1796,15 @@ class ClassicEmailHandler(EmailHandler):
         if not message_id:
             return EmailLabelsResponse(email_id=email_id, labels=[])
 
-        # Get all labels
+        # Get all labels and search in a single session
         labels = await self.incoming_client.list_labels()
-        applied_labels = []
+        if not labels:
+            return EmailLabelsResponse(email_id=email_id, labels=[])
 
-        # Search each label folder for this email
-        for label in labels:
-            found_uid = await self.incoming_client.search_by_message_id(message_id, label.full_path)
-            if found_uid:
-                applied_labels.append(label.name)
+        folder_paths = [label.full_path for label in labels]
+        found_folders = await self.incoming_client.search_message_id_in_folders(message_id, folder_paths)
 
+        applied_labels = [label.name for label in labels if label.full_path in found_folders]
         return EmailLabelsResponse(email_id=email_id, labels=applied_labels)
 
     async def create_label(self, label_name: str) -> FolderOperationResponse:

@@ -14,10 +14,12 @@ from mcp_email_server.emails.dispatcher import dispatch_handler
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailContentBatchResponse,
+    EmailDeleteResponse,
     EmailLabelsResponse,
     EmailMarkResponse,
     EmailMetadataPageResponse,
     EmailMoveResponse,
+    EmailSendResponse,
     FolderListResponse,
     FolderOperationResponse,
     LabelListResponse,
@@ -92,6 +94,18 @@ async def list_emails_metadata(
         bool | None,
         Field(default=None, description="Filter by replied status: True=replied, False=not replied, None=all."),
     ] = None,
+    body: Annotated[
+        str | None,
+        Field(default=None, description="Search for text in the email body (IMAP BODY search)."),
+    ] = None,
+    text: Annotated[
+        str | None,
+        Field(default=None, description="Search for text in the entire email including headers and body (IMAP TEXT search)."),
+    ] = None,
+    has_attachment: Annotated[
+        bool | None,
+        Field(default=None, description="Filter by attachment presence: True=has attachments, False=no attachments, None=all."),
+    ] = None,
 ) -> EmailMetadataPageResponse:
     handler = dispatch_handler(account_name)
 
@@ -108,6 +122,9 @@ async def list_emails_metadata(
         seen=seen,
         flagged=flagged,
         answered=answered,
+        body=body,
+        text=text,
+        has_attachment=has_attachment,
     )
 
 
@@ -123,9 +140,15 @@ async def get_emails_content(
         ),
     ],
     mailbox: Annotated[str, Field(default="INBOX", description="IMAP folder path. Standard: INBOX, Sent, Drafts, Trash. Provider-specific: Gmail uses '[Gmail]/...' prefix; ProtonMail Bridge uses 'Folders/<name>' and 'Labels/<name>'.")] = "INBOX",
+    max_body_length: Annotated[
+        int | None,
+        Field(default=20000, description="Maximum body length in characters before truncation. Set to 0 or null for no limit. Default: 20000."),
+    ] = 20000,
 ) -> EmailContentBatchResponse:
     handler = dispatch_handler(account_name)
-    return await handler.get_emails_content(email_ids, mailbox)
+    # Treat 0 as no limit
+    effective_limit = max_body_length if max_body_length else None
+    return await handler.get_emails_content(email_ids, mailbox, effective_limit)
 
 
 @mcp.tool(
@@ -176,9 +199,9 @@ async def send_email(
             description="When replying (in_reply_to is set), automatically fetch and append the quoted original message. Set to False if you've already included quoted text in the body.",
         ),
     ] = True,
-) -> str:
+) -> EmailSendResponse:
     handler = dispatch_handler(account_name)
-    await handler.send_email(
+    return await handler.send_email(
         recipients,
         subject,
         body,
@@ -190,9 +213,6 @@ async def send_email(
         references,
         quote_reply,
     )
-    recipient_str = ", ".join(recipients)
-    attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
-    return f"Email sent successfully to {recipient_str}{attachment_info}"
 
 
 @mcp.tool(
@@ -228,9 +248,9 @@ async def forward_email(
             description="A list of additional absolute file paths to attach to the forwarded email.",
         ),
     ] = None,
-) -> str:
+) -> EmailSendResponse:
     handler = dispatch_handler(account_name)
-    await handler.forward_email(
+    return await handler.forward_email(
         email_id,
         mailbox,
         recipients,
@@ -240,8 +260,6 @@ async def forward_email(
         html,
         attachments,
     )
-    recipient_str = ", ".join(recipients)
-    return f"Email forwarded successfully to {recipient_str}"
 
 
 @mcp.tool(
@@ -254,14 +272,9 @@ async def delete_emails(
         Field(description="List of email_id to delete (obtained from list_emails_metadata)."),
     ],
     mailbox: Annotated[str, Field(default="INBOX", description="IMAP folder path. Standard: INBOX, Sent, Drafts, Trash. Provider-specific: Gmail uses '[Gmail]/...' prefix; ProtonMail Bridge uses 'Folders/<name>' and 'Labels/<name>'.")] = "INBOX",
-) -> str:
+) -> EmailDeleteResponse:
     handler = dispatch_handler(account_name)
-    deleted_ids, failed_ids = await handler.delete_emails(email_ids, mailbox)
-
-    result = f"Successfully deleted {len(deleted_ids)} email(s)"
-    if failed_ids:
-        result += f", failed to delete {len(failed_ids)} email(s): {', '.join(failed_ids)}"
-    return result
+    return await handler.delete_emails(email_ids, mailbox)
 
 
 @mcp.tool(
@@ -441,10 +454,14 @@ async def remove_label(
         Field(description="List of email_id to unlabel (obtained from list_emails_metadata)."),
     ],
     label_name: Annotated[str, Field(description="The label name (without Labels/ prefix).")],
+    source_mailbox: Annotated[
+        str,
+        Field(default="INBOX", description="The mailbox where the original emails reside (for Message-ID lookup)."),
+    ] = "INBOX",
 ) -> EmailMoveResponse:
     _check_folder_management_enabled()
     handler = dispatch_handler(account_name)
-    return await handler.remove_label(email_ids, label_name)
+    return await handler.remove_label(email_ids, label_name, source_mailbox)
 
 
 @mcp.tool(description="Get all labels applied to a specific email. Requires enable_folder_management=true.")

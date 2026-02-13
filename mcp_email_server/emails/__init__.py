@@ -6,10 +6,12 @@ if TYPE_CHECKING:
     from mcp_email_server.emails.models import (
         AttachmentDownloadResponse,
         EmailContentBatchResponse,
+        EmailDeleteResponse,
         EmailLabelsResponse,
         EmailMarkResponse,
         EmailMetadataPageResponse,
         EmailMoveResponse,
+        EmailSendResponse,
         FolderListResponse,
         FolderOperationResponse,
         LabelListResponse,
@@ -32,6 +34,9 @@ class EmailHandler(abc.ABC):
         seen: bool | None = None,
         flagged: bool | None = None,
         answered: bool | None = None,
+        body: str | None = None,
+        text: str | None = None,
+        has_attachment: bool | None = None,
     ) -> "EmailMetadataPageResponse":
         """
         Get email metadata only (without body content) for better performance.
@@ -49,12 +54,25 @@ class EmailHandler(abc.ABC):
             seen: Filter by read status (True=read, False=unread, None=all).
             flagged: Filter by flagged/starred status (True=flagged, False=unflagged, None=all).
             answered: Filter by replied status (True=replied, False=not replied, None=all).
+            body: Search for text in the email body.
+            text: Search for text in the entire email (headers + body).
+            has_attachment: Filter by attachment presence (True/False/None).
         """
 
     @abc.abstractmethod
-    async def get_emails_content(self, email_ids: list[str], mailbox: str = "INBOX") -> "EmailContentBatchResponse":
+    async def get_emails_content(
+        self,
+        email_ids: list[str],
+        mailbox: str = "INBOX",
+        max_body_length: int | None = 20000,
+    ) -> "EmailContentBatchResponse":
         """
-        Get full content (including body) of multiple emails by their email IDs (IMAP UIDs)
+        Get full content (including body) of multiple emails by their email IDs (IMAP UIDs).
+
+        Args:
+            email_ids: List of email UIDs to retrieve.
+            mailbox: Mailbox to search in.
+            max_body_length: Maximum body length before truncation. 0 or None for no limit.
         """
 
     @abc.abstractmethod
@@ -70,7 +88,7 @@ class EmailHandler(abc.ABC):
         in_reply_to: str | None = None,
         references: str | None = None,
         quote_reply: bool = True,
-    ) -> None:
+    ) -> "EmailSendResponse":
         """
         Send email
 
@@ -98,7 +116,7 @@ class EmailHandler(abc.ABC):
         bcc: list[str] | None = None,
         html: bool = False,
         attachments: list[str] | None = None,
-    ) -> None:
+    ) -> "EmailSendResponse":
         """
         Forward an email to new recipients.
 
@@ -114,9 +132,9 @@ class EmailHandler(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
+    async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> "EmailDeleteResponse":
         """
-        Delete emails by their IDs. Returns (deleted_ids, failed_ids)
+        Delete emails by their IDs.
         """
 
     @abc.abstractmethod
@@ -257,6 +275,7 @@ class EmailHandler(abc.ABC):
         self,
         email_ids: list[str],
         label_name: str,
+        source_mailbox: str = "INBOX",
     ) -> "EmailMoveResponse":
         """
         Remove a label from emails by deleting from the label folder.
@@ -264,6 +283,7 @@ class EmailHandler(abc.ABC):
         Args:
             email_ids: List of email UIDs to unlabel.
             label_name: The label name (without Labels/ prefix).
+            source_mailbox: Mailbox where the original emails reside (for Message-ID lookup).
 
         Returns:
             EmailMoveResponse with operation results.

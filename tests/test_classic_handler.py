@@ -9,6 +9,7 @@ from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
     EmailContentBatchResponse,
+    EmailDeleteResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
 )
@@ -70,57 +71,52 @@ class TestClassicEmailHandler:
             "attachments": [],
         }
 
-        # Mock the get_emails_stream method to yield our test data
-        mock_stream = AsyncMock()
-        mock_stream.__aiter__.return_value = [email_data]
+        # Mock get_emails_metadata_page to return (list, total) in a single call
+        mock_page = AsyncMock(return_value=([email_data], 1))
 
-        # Mock the get_email_count method
-        mock_count = AsyncMock(return_value=1)
+        with patch.object(classic_handler.incoming_client, "get_emails_metadata_page", mock_page):
+            result = await classic_handler.get_emails_metadata(
+                page=1,
+                page_size=10,
+                before=now,
+                since=None,
+                subject="Test",
+                from_address="sender@example.com",
+                to_address=None,
+            )
 
-        # Apply the mocks
-        with patch.object(classic_handler.incoming_client, "get_emails_metadata_stream", return_value=mock_stream):
-            with patch.object(classic_handler.incoming_client, "get_email_count", mock_count):
-                # Call the method
-                result = await classic_handler.get_emails_metadata(
-                    page=1,
-                    page_size=10,
-                    before=now,
-                    since=None,
-                    subject="Test",
-                    from_address="sender@example.com",
-                    to_address=None,
-                )
+            # Verify the result
+            assert isinstance(result, EmailMetadataPageResponse)
+            assert result.page == 1
+            assert result.page_size == 10
+            assert result.before == now
+            assert result.since is None
+            assert result.subject == "Test"
+            assert len(result.emails) == 1
+            assert isinstance(result.emails[0], EmailMetadata)
+            assert result.emails[0].subject == "Test Subject"
+            assert result.emails[0].sender == "sender@example.com"
+            assert result.emails[0].date == now
+            assert result.emails[0].attachments == []
+            assert result.total == 1
 
-                # Verify the result
-                assert isinstance(result, EmailMetadataPageResponse)
-                assert result.page == 1
-                assert result.page_size == 10
-                assert result.before == now
-                assert result.since is None
-                assert result.subject == "Test"
-                assert len(result.emails) == 1
-                assert isinstance(result.emails[0], EmailMetadata)
-                assert result.emails[0].subject == "Test Subject"
-                assert result.emails[0].sender == "sender@example.com"
-                assert result.emails[0].date == now
-                assert result.emails[0].attachments == []
-                assert result.total == 1
-
-                # Verify the client methods were called correctly
-                classic_handler.incoming_client.get_emails_metadata_stream.assert_called_once_with(
-                    1, 10, now, None, "Test", "sender@example.com", None, "desc", "INBOX", None, None, None
-                )
-                mock_count.assert_called_once_with(
-                    now,
-                    None,
-                    "Test",
-                    from_address="sender@example.com",
-                    to_address=None,
-                    mailbox="INBOX",
-                    seen=None,
-                    flagged=None,
-                    answered=None,
-                )
+            mock_page.assert_called_once_with(
+                page=1,
+                page_size=10,
+                before=now,
+                since=None,
+                subject="Test",
+                from_address="sender@example.com",
+                to_address=None,
+                order="desc",
+                mailbox="INBOX",
+                seen=None,
+                flagged=None,
+                answered=None,
+                body=None,
+                text=None,
+                has_attachment=None,
+            )
 
     @pytest.mark.asyncio
     async def test_get_emails_with_mailbox(self, classic_handler):
@@ -135,36 +131,35 @@ class TestClassicEmailHandler:
             "attachments": [],
         }
 
-        mock_stream = AsyncMock()
-        mock_stream.__aiter__.return_value = [email_data]
-        mock_count = AsyncMock(return_value=1)
+        mock_page = AsyncMock(return_value=([email_data], 1))
 
-        with patch.object(classic_handler.incoming_client, "get_emails_metadata_stream", return_value=mock_stream):
-            with patch.object(classic_handler.incoming_client, "get_email_count", mock_count):
-                result = await classic_handler.get_emails_metadata(
-                    page=1,
-                    page_size=10,
-                    mailbox="Sent",
-                )
+        with patch.object(classic_handler.incoming_client, "get_emails_metadata_page", mock_page):
+            result = await classic_handler.get_emails_metadata(
+                page=1,
+                page_size=10,
+                mailbox="Sent",
+            )
 
-                assert isinstance(result, EmailMetadataPageResponse)
-                assert len(result.emails) == 1
+            assert isinstance(result, EmailMetadataPageResponse)
+            assert len(result.emails) == 1
 
-                # Verify mailbox parameter was passed correctly
-                classic_handler.incoming_client.get_emails_metadata_stream.assert_called_once_with(
-                    1, 10, None, None, None, None, None, "desc", "Sent", None, None, None
-                )
-                mock_count.assert_called_once_with(
-                    None,
-                    None,
-                    None,
-                    from_address=None,
-                    to_address=None,
-                    mailbox="Sent",
-                    seen=None,
-                    flagged=None,
-                    answered=None,
-                )
+            mock_page.assert_called_once_with(
+                page=1,
+                page_size=10,
+                before=None,
+                since=None,
+                subject=None,
+                from_address=None,
+                to_address=None,
+                order="desc",
+                mailbox="Sent",
+                seen=None,
+                flagged=None,
+                answered=None,
+                body=None,
+                text=None,
+                has_attachment=None,
+            )
 
     @pytest.mark.asyncio
     async def test_send_email(self, classic_handler):
@@ -231,17 +226,20 @@ class TestClassicEmailHandler:
 
     @pytest.mark.asyncio
     async def test_delete_emails(self, classic_handler):
-        """Test delete_emails method."""
+        """Test delete_emails method returns EmailDeleteResponse."""
         mock_delete = AsyncMock(return_value=(["123", "456"], []))
 
         with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
-            deleted_ids, failed_ids = await classic_handler.delete_emails(
+            result = await classic_handler.delete_emails(
                 email_ids=["123", "456"],
                 mailbox="INBOX",
             )
 
-            assert deleted_ids == ["123", "456"]
-            assert failed_ids == []
+            assert isinstance(result, EmailDeleteResponse)
+            assert result.success is True
+            assert result.deleted_ids == ["123", "456"]
+            assert result.failed_ids == []
+            assert result.mailbox == "INBOX"
             mock_delete.assert_called_once_with(["123", "456"], "INBOX")
 
     @pytest.mark.asyncio
@@ -250,13 +248,15 @@ class TestClassicEmailHandler:
         mock_delete = AsyncMock(return_value=(["123"], ["456"]))
 
         with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
-            deleted_ids, failed_ids = await classic_handler.delete_emails(
+            result = await classic_handler.delete_emails(
                 email_ids=["123", "456"],
                 mailbox="Trash",
             )
 
-            assert deleted_ids == ["123"]
-            assert failed_ids == ["456"]
+            assert isinstance(result, EmailDeleteResponse)
+            assert result.success is False
+            assert result.deleted_ids == ["123"]
+            assert result.failed_ids == ["456"]
             mock_delete.assert_called_once_with(["123", "456"], "Trash")
 
     @pytest.mark.asyncio
@@ -265,13 +265,16 @@ class TestClassicEmailHandler:
         mock_delete = AsyncMock(return_value=(["789"], []))
 
         with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
-            deleted_ids, failed_ids = await classic_handler.delete_emails(
+            result = await classic_handler.delete_emails(
                 email_ids=["789"],
                 mailbox="Archive",
             )
 
-            assert deleted_ids == ["789"]
-            assert failed_ids == []
+            assert isinstance(result, EmailDeleteResponse)
+            assert result.success is True
+            assert result.deleted_ids == ["789"]
+            assert result.failed_ids == []
+            assert result.mailbox == "Archive"
             mock_delete.assert_called_once_with(["789"], "Archive")
 
     @pytest.mark.asyncio
@@ -399,7 +402,7 @@ class TestClassicEmailHandler:
             assert result.emails[0].body == "Test email body"
 
             # Verify the client method was called correctly
-            mock_get_body.assert_called_once_with("123", "INBOX")
+            mock_get_body.assert_called_once_with("123", "INBOX", 20000)
 
     @pytest.mark.asyncio
     async def test_get_emails_content_returns_none(self, classic_handler):

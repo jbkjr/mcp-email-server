@@ -129,3 +129,21 @@ class EmailMarkResponse(BaseModel):
     failed_ids: list[str]
     mailbox: str
     marked_as: str  # "read" or "unread"
+
+
+class EmailDeleteResponse(BaseModel):
+    """Response for delete_emails operations"""
+
+    success: bool
+    deleted_ids: list[str]
+    failed_ids: list[str]
+    mailbox: str
+
+
+class EmailSendResponse(BaseModel):
+    """Response for send_email and forward_email operations"""
+
+    success: bool
+    recipients: list[str]
+    subject: str
+    message: str

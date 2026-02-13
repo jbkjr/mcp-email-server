@@ -207,7 +207,7 @@ class TestLabelManagementEnabled:
 
                 assert result == remove_response
                 assert result.success is True
-                mock_handler.remove_label.assert_called_once_with(["123"], "Important")
+                mock_handler.remove_label.assert_called_once_with(["123"], "Important", "INBOX")
 
     @pytest.mark.asyncio
     async def test_get_email_labels_enabled(self):
@@ -383,19 +383,19 @@ class TestClassicEmailHandlerLabels:
 
     @pytest.mark.asyncio
     async def test_get_email_labels(self, classic_handler):
-        """Test get_email_labels handler method."""
+        """Test get_email_labels handler method uses single-session search."""
         mock_labels = [
             Label(name="Important", full_path="Labels/Important", delimiter="/", flags=[]),
             Label(name="Work", full_path="Labels/Work", delimiter="/", flags=[]),
         ]
         mock_get_message_id = AsyncMock(return_value="<msg123@example.com>")
         mock_list_labels = AsyncMock(return_value=mock_labels)
-        # Email found in Important but not Work
-        mock_search = AsyncMock(side_effect=["789", None])
+        # Email found in Important but not Work (single-session search)
+        mock_search_folders = AsyncMock(return_value={"Labels/Important": "789"})
 
         with patch.object(classic_handler.incoming_client, "get_email_message_id", mock_get_message_id):
             with patch.object(classic_handler.incoming_client, "list_labels", mock_list_labels):
-                with patch.object(classic_handler.incoming_client, "search_by_message_id", mock_search):
+                with patch.object(classic_handler.incoming_client, "search_message_id_in_folders", mock_search_folders):
                     result = await classic_handler.get_email_labels(
                         email_id="123",
                         source_mailbox="INBOX",
@@ -404,6 +404,10 @@ class TestClassicEmailHandlerLabels:
                     assert isinstance(result, EmailLabelsResponse)
                     assert result.email_id == "123"
                     assert result.labels == ["Important"]
+                    mock_search_folders.assert_called_once_with(
+                        "<msg123@example.com>",
+                        ["Labels/Important", "Labels/Work"],
+                    )
 
     @pytest.mark.asyncio
     async def test_create_label(self, classic_handler):
