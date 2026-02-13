@@ -659,22 +659,21 @@ class EmailClient:
                 logger.warning("No messages returned from search")
                 return [], 0
 
-            email_ids = messages[0].split()
-            total = len(email_ids)
+            raw_ids = messages[0].split()
+            total = len(raw_ids)
             logger.info(f"Found {total} email IDs")
+
+            # Normalize byte UIDs to strings once for use throughout
+            str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in raw_ids]
 
             # Phase 1: Batch fetch INTERNALDATE for sorting (parallel chunks)
             fetch_dates_start = time.perf_counter()
-            uid_dates = await self._batch_fetch_dates(imap, email_ids)
+            uid_dates = await self._batch_fetch_dates(imap, raw_ids)
             fetch_dates_elapsed = time.perf_counter() - fetch_dates_start
 
-            # Normalize email_ids to strings for comparison
-            str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in email_ids]
-
-            # Log if any UIDs were lost during date fetch
-            if uid_dates and len(uid_dates) < len(str_ids):
+            if uid_dates and len(uid_dates) < total:
                 logger.warning(
-                    f"INTERNALDATE fetch missed {len(str_ids) - len(uid_dates)}/{len(str_ids)} UIDs"
+                    f"INTERNALDATE fetch missed {total - len(uid_dates)}/{total} UIDs"
                 )
 
             if uid_dates:
@@ -682,9 +681,9 @@ class EmailClient:
                 sorted_uids = sorted(uid_dates.items(), key=lambda x: x[1], reverse=(order == "desc"))
                 ordered_uids = [uid for uid, _ in sorted_uids]
             else:
-                # Fallback: UID ordering (higher UID ≈ newer email)
+                # Fallback: UID ordering (higher UID ~ newer email)
                 logger.warning(
-                    f"INTERNALDATE fetch returned no results for {len(str_ids)} UIDs, "
+                    f"INTERNALDATE fetch returned no results for {total} UIDs, "
                     f"falling back to UID ordering"
                 )
                 ordered_uids = sorted(str_ids, key=int, reverse=(order == "desc"))
@@ -1640,6 +1639,9 @@ class ClassicEmailHandler(EmailHandler):
 
         return original
 
+    # Sentinel indicating a cached negative lookup (folder not found)
+    _NOT_FOUND: str = "__not_found__"
+
     async def _find_special_folder(self, flag: str, fallback_names: list[str]) -> str | None:
         """Find a special folder by RFC 6154 flag, falling back to common names.
 
@@ -1648,7 +1650,7 @@ class ClassicEmailHandler(EmailHandler):
         cache_key = f"_special_folder_{flag}"
         cached = getattr(self, cache_key, None)
         if cached is not None:
-            return cached if cached != "" else None
+            return None if cached == self._NOT_FOUND else cached
 
         try:
             folders = await self.incoming_client.list_folders()
@@ -1666,7 +1668,7 @@ class ClassicEmailHandler(EmailHandler):
         except Exception as e:
             logger.debug(f"Error finding special folder with flag {flag}: {e}")
 
-        setattr(self, cache_key, "")  # cache negative result
+        setattr(self, cache_key, self._NOT_FOUND)
         return None
 
     async def _find_sent_folder(self) -> str | None:
@@ -1675,10 +1677,10 @@ class ClassicEmailHandler(EmailHandler):
 
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> EmailDeleteResponse:
         """Delete emails by moving to Trash (auto-detected), falling back to permanent delete."""
-        # Try to find Trash folder for safe delete
         trash_folder = await self._find_special_folder("\\Trash", TRASH_FOLDER_CANDIDATES)
+        already_in_trash = trash_folder and mailbox == trash_folder
 
-        if trash_folder and mailbox != trash_folder:
+        if trash_folder and not already_in_trash:
             # Move to Trash instead of permanent delete
             moved_ids, failed_ids = await self.incoming_client.move_emails(email_ids, trash_folder, mailbox)
             return EmailDeleteResponse(
@@ -1689,9 +1691,9 @@ class ClassicEmailHandler(EmailHandler):
                 destination=trash_folder,
             )
 
-        # No Trash folder found, or already in Trash — permanently delete
-        if not trash_folder and mailbox != "Trash":
-            logger.warning("Trash folder not found, permanently deleting emails")
+        # Already in Trash or no Trash folder detected -- permanently delete
+        if not trash_folder:
+            logger.warning("Trash folder not detected, permanently deleting emails")
         deleted_ids, failed_ids = await self.incoming_client.delete_emails(email_ids, mailbox)
         return EmailDeleteResponse(
             success=len(failed_ids) == 0,

@@ -228,10 +228,14 @@ class TestClassicEmailHandler:
 
     @pytest.mark.asyncio
     async def test_delete_emails(self, classic_handler):
-        """Test delete_emails method returns EmailDeleteResponse."""
+        """Test delete_emails permanently deletes when no Trash folder is detected."""
+        mock_list = AsyncMock(return_value=[Folder(name="INBOX", delimiter="/", flags=[])])
         mock_delete = AsyncMock(return_value=(["123", "456"], []))
 
-        with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
+        ):
             result = await classic_handler.delete_emails(
                 email_ids=["123", "456"],
                 mailbox="INBOX",
@@ -242,14 +246,19 @@ class TestClassicEmailHandler:
             assert result.deleted_ids == ["123", "456"]
             assert result.failed_ids == []
             assert result.mailbox == "INBOX"
+            assert result.destination is None
             mock_delete.assert_called_once_with(["123", "456"], "INBOX")
 
     @pytest.mark.asyncio
     async def test_delete_emails_with_failures(self, classic_handler):
-        """Test delete_emails method with some failures."""
+        """Test delete_emails permanently deletes from Trash with some failures."""
+        mock_list = AsyncMock(return_value=[Folder(name="Trash", delimiter="/", flags=["\\Trash"])])
         mock_delete = AsyncMock(return_value=(["123"], ["456"]))
 
-        with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
+        ):
             result = await classic_handler.delete_emails(
                 email_ids=["123", "456"],
                 mailbox="Trash",
@@ -259,14 +268,19 @@ class TestClassicEmailHandler:
             assert result.success is False
             assert result.deleted_ids == ["123"]
             assert result.failed_ids == ["456"]
+            assert result.destination is None
             mock_delete.assert_called_once_with(["123", "456"], "Trash")
 
     @pytest.mark.asyncio
     async def test_delete_emails_custom_mailbox(self, classic_handler):
-        """Test delete_emails method with custom mailbox."""
+        """Test delete_emails permanently deletes from custom mailbox when no Trash detected."""
+        mock_list = AsyncMock(return_value=[Folder(name="INBOX", delimiter="/", flags=[])])
         mock_delete = AsyncMock(return_value=(["789"], []))
 
-        with patch.object(classic_handler.incoming_client, "delete_emails", mock_delete):
+        with (
+            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
+        ):
             result = await classic_handler.delete_emails(
                 email_ids=["789"],
                 mailbox="Archive",
@@ -277,6 +291,7 @@ class TestClassicEmailHandler:
             assert result.deleted_ids == ["789"]
             assert result.failed_ids == []
             assert result.mailbox == "Archive"
+            assert result.destination is None
             mock_delete.assert_called_once_with(["789"], "Archive")
 
     @pytest.mark.asyncio
@@ -559,10 +574,6 @@ Subject: No Date Email
 class TestFindSpecialFolder:
     """Test _find_special_folder for RFC 6154 flag and fallback detection."""
 
-    @pytest.fixture
-    def classic_handler(self, email_settings):
-        return ClassicEmailHandler(email_settings)
-
     @pytest.mark.asyncio
     async def test_finds_folder_by_flag(self, classic_handler):
         """Test finding a folder by its RFC 6154 flag."""
@@ -636,10 +647,6 @@ class TestFindSpecialFolder:
 
 class TestDeleteEmailsSafeDelete:
     """Test delete_emails moves to Trash when available."""
-
-    @pytest.fixture
-    def classic_handler(self, email_settings):
-        return ClassicEmailHandler(email_settings)
 
     @pytest.mark.asyncio
     async def test_moves_to_trash_when_found(self, classic_handler):
@@ -724,10 +731,6 @@ class TestDeleteEmailsSafeDelete:
 class TestArchiveEmails:
     """Test archive_emails moves to Archive folder."""
 
-    @pytest.fixture
-    def classic_handler(self, email_settings):
-        return ClassicEmailHandler(email_settings)
-
     @pytest.mark.asyncio
     async def test_archives_when_folder_found(self, classic_handler):
         """Test archive_emails moves to Archive folder when found."""
@@ -798,6 +801,18 @@ class TestArchiveEmails:
         assert result.failed_ids == ["456"]
 
 
+def _make_header_entry(uid: str, subject: str = "", date: datetime | None = None) -> dict:
+    """Create a minimal email header dict for testing."""
+    return {
+        "email_id": uid,
+        "subject": subject or f"Email {uid}",
+        "from": f"{uid}@test.com",
+        "to": ["r@test.com"],
+        "date": date or datetime.now(timezone.utc),
+        "attachments": [],
+    }
+
+
 class TestSearchFallback:
     """Test UID ordering fallback when INTERNALDATE fetch fails."""
 
@@ -811,11 +826,7 @@ class TestSearchFallback:
         mock_imap = AsyncMock()
         mock_imap.uid_search = AsyncMock(return_value=("OK", [b"100 200 300"]))
 
-        header_data = {
-            "100": {"email_id": "100", "subject": "Email A", "from": "a@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
-            "200": {"email_id": "200", "subject": "Email B", "from": "b@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
-            "300": {"email_id": "300", "subject": "Email C", "from": "c@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
-        }
+        header_data = {uid: _make_header_entry(uid) for uid in ("100", "200", "300")}
 
         with (
             patch.object(email_client, "_imap_connection") as mock_ctx,
@@ -842,11 +853,7 @@ class TestSearchFallback:
         mock_imap = AsyncMock()
         mock_imap.uid_search = AsyncMock(return_value=("OK", [b"100 200 300"]))
 
-        header_data = {
-            "100": {"email_id": "100", "subject": "A", "from": "a@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
-            "200": {"email_id": "200", "subject": "B", "from": "b@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
-            "300": {"email_id": "300", "subject": "C", "from": "c@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
-        }
+        header_data = {uid: _make_header_entry(uid) for uid in ("100", "200", "300")}
 
         with (
             patch.object(email_client, "_imap_connection") as mock_ctx,
@@ -872,15 +879,15 @@ class TestSearchFallback:
         mock_imap = AsyncMock()
         mock_imap.uid_search = AsyncMock(return_value=("OK", [b"100 200 300"]))
 
+        date_100 = datetime(2025, 1, 20, tzinfo=timezone.utc)
+        date_300 = datetime(2025, 1, 22, tzinfo=timezone.utc)
+
         # Only 2 out of 3 UIDs have dates
-        partial_dates = {
-            "100": datetime(2025, 1, 20, tzinfo=timezone.utc),
-            "300": datetime(2025, 1, 22, tzinfo=timezone.utc),
-        }
+        partial_dates = {"100": date_100, "300": date_300}
 
         header_data = {
-            "100": {"email_id": "100", "subject": "A", "from": "a@test.com", "to": ["r@test.com"], "date": datetime(2025, 1, 20, tzinfo=timezone.utc), "attachments": []},
-            "300": {"email_id": "300", "subject": "C", "from": "c@test.com", "to": ["r@test.com"], "date": datetime(2025, 1, 22, tzinfo=timezone.utc), "attachments": []},
+            "100": _make_header_entry("100", date=date_100),
+            "300": _make_header_entry("300", date=date_300),
         }
 
         with (
@@ -907,14 +914,16 @@ class TestSearchFallback:
         mock_imap = AsyncMock()
         mock_imap.uid_search = AsyncMock(return_value=("OK", [b"100 200 300"]))
 
+        # Only 2 out of 3 UIDs returned from header fetch
+        header_data = {
+            "100": _make_header_entry("100"),
+            "300": _make_header_entry("300"),
+        }
+
         with (
             patch.object(email_client, "_imap_connection") as mock_ctx,
             patch.object(email_client, "_batch_fetch_dates", return_value={}),
-            patch.object(email_client, "_batch_fetch_headers", return_value={
-                # Only 2 out of 3 UIDs returned from header fetch
-                "100": {"email_id": "100", "subject": "A", "from": "a@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
-                "300": {"email_id": "300", "subject": "C", "from": "c@test.com", "to": ["r@test.com"], "date": datetime.now(timezone.utc), "attachments": []},
-            }),
+            patch.object(email_client, "_batch_fetch_headers", return_value=header_data),
         ):
             mock_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_imap)
             mock_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
