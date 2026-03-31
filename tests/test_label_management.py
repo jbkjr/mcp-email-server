@@ -514,7 +514,7 @@ class TestEmailClientLabels:
         )
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             result = await email_client.get_email_message_id("123", "INBOX")
 
             assert result == "<unique123@example.com>"
@@ -534,7 +534,7 @@ class TestEmailClientLabels:
         mock_imap.fetch = AsyncMock(return_value=("OK", [b"1 FETCH (UID 456)"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             result = await email_client.search_by_message_id("<unique123@example.com>", "Labels/Important")
 
             assert result == "456"
@@ -553,7 +553,7 @@ class TestEmailClientLabels:
         mock_imap.search = AsyncMock(return_value=("OK", [b""]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             result = await email_client.search_by_message_id("<notfound@example.com>", "Labels/Work")
 
             assert result is None

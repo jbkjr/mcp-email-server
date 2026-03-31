@@ -463,7 +463,7 @@ class TestEmailClientFolders:
         )
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             result = await email_client.list_folders()
 
             # EmailClient.list_folders returns list[Folder]
@@ -486,7 +486,7 @@ class TestEmailClientFolders:
         mock_imap.uid = AsyncMock(return_value=("OK", [b"[COPYUID 1234 1:2 100:101]"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             copied_ids, failed_ids = await email_client.copy_emails(["123", "456"], "Archive", "INBOX")
 
             # EmailClient.copy_emails returns (copied_ids, failed_ids) tuple
@@ -507,7 +507,7 @@ class TestEmailClientFolders:
         mock_imap.uid = AsyncMock(return_value=("OK", [b"OK"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
 
             # EmailClient.move_emails returns (moved_ids, failed_ids) tuple
@@ -525,7 +525,7 @@ class TestEmailClientFolders:
         mock_imap.create = AsyncMock(return_value=("OK", [b"CREATE completed"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.create_folder("NewFolder")
 
             # EmailClient.create_folder returns (success, message) tuple
@@ -544,7 +544,7 @@ class TestEmailClientFolders:
         mock_imap.delete = AsyncMock(return_value=("OK", [b"DELETE completed"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.delete_folder("OldFolder")
 
             # EmailClient.delete_folder returns (success, message) tuple
@@ -563,7 +563,7 @@ class TestEmailClientFolders:
         mock_imap.rename = AsyncMock(return_value=("OK", [b"RENAME completed"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, _message = await email_client.rename_folder("OldName", "NewName")
 
             # EmailClient.rename_folder returns (success, message) tuple
@@ -587,7 +587,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.uid = AsyncMock(side_effect=[("OK", []), ("NO", [b"Message not found"])])
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             copied_ids, failed_ids = await email_client.copy_emails(["123", "456"], "Archive", "INBOX")
 
             # First email succeeds, second fails with NO status
@@ -605,7 +605,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.create = AsyncMock(return_value=("NO", [b"Folder already exists"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, _message = await email_client.create_folder("ExistingFolder")
 
             # EmailClient.create_folder returns (success, message) tuple
@@ -631,7 +631,7 @@ class TestEmailClientFolderEdgeCases:
         )
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             result = await email_client.list_folders()
 
             # EmailClient.list_folders returns list[Folder]
@@ -660,7 +660,7 @@ class TestEmailClientFolderEdgeCases:
             ]
         )
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
 
             assert moved_ids == ["123"]
@@ -690,7 +690,7 @@ class TestEmailClientFolderEdgeCases:
             ]
         )
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
 
             assert moved_ids == ["123"]
@@ -719,7 +719,7 @@ class TestEmailClientFolderEdgeCases:
             ]
         )
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
 
             assert moved_ids == []
@@ -745,7 +745,7 @@ class TestEmailClientFolderEdgeCases:
             ]
         )
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
 
             assert moved_ids == []
@@ -764,7 +764,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.expunge = AsyncMock()
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
 
             # Should complete despite logout error
@@ -782,7 +782,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.create = AsyncMock(side_effect=Exception("Connection lost"))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.create_folder("NewFolder")
 
             assert success is False
@@ -799,7 +799,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.create = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, _message = await email_client.create_folder("NewFolder")
 
             # Should complete despite logout error
@@ -816,7 +816,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.delete = AsyncMock(return_value=("NO", [b"Folder not empty"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.delete_folder("NonEmptyFolder")
 
             assert success is False
@@ -833,7 +833,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.delete = AsyncMock(side_effect=Exception("Connection lost"))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.delete_folder("SomeFolder")
 
             assert success is False
@@ -850,7 +850,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.delete = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, _message = await email_client.delete_folder("SomeFolder")
 
             # Should complete despite logout error
@@ -867,7 +867,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.rename = AsyncMock(return_value=("NO", [b"Folder does not exist"]))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.rename_folder("OldName", "NewName")
 
             assert success is False
@@ -884,7 +884,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.rename = AsyncMock(side_effect=Exception("Connection lost"))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.rename_folder("OldName", "NewName")
 
             assert success is False
@@ -901,7 +901,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.rename = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, _message = await email_client.rename_folder("OldName", "NewName")
 
             # Should complete despite logout error
@@ -961,7 +961,7 @@ class TestEmailClientFolderEdgeCases:
         )
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             result = await email_client.list_folders()
 
             # Should complete despite logout error
@@ -990,7 +990,7 @@ class TestEmailClientFolderEdgeCases:
         )
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             result = await email_client.list_folders()
 
             # Only valid folders should be returned
@@ -1010,7 +1010,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.uid = AsyncMock(side_effect=Exception("Connection lost"))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             copied_ids, failed_ids = await email_client.copy_emails(["123"], "Archive", "INBOX")
 
             assert copied_ids == []
@@ -1028,7 +1028,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.uid = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             copied_ids, failed_ids = await email_client.copy_emails(["123"], "Archive", "INBOX")
 
             # Should complete despite logout error
@@ -1048,7 +1048,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.uid = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             copied_ids, failed_ids = await email_client.copy_emails(["123"], "Archive", "INBOX")
             assert copied_ids == ["123"]
             assert failed_ids == []
@@ -1067,7 +1067,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.uid = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
             assert moved_ids == ["123"]
             assert failed_ids == []
@@ -1093,7 +1093,7 @@ class TestEmailClientFolderEdgeCases:
             ]
         )
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
             assert moved_ids == ["123"]
             assert failed_ids == []
@@ -1110,7 +1110,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.create = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.create_folder("NewFolder")
             assert success is True
             assert "NewFolder" in message
@@ -1127,7 +1127,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.delete = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, message = await email_client.delete_folder("OldFolder")
             assert success is True
             assert "OldFolder" in message
@@ -1144,7 +1144,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap.rename = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             success, _message = await email_client.rename_folder("OldName", "NewName")
             assert success is True
 

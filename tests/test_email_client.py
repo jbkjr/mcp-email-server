@@ -197,6 +197,26 @@ class TestEmailClient:
         assert "SUBJECT" in criteria
         assert "Important" in criteria
 
+    def test_build_search_criteria_multiword_subject(self):
+        """Multi-word subjects must be quoted for IMAP."""
+        criteria = EmailClient._build_search_criteria(subject="Meeting Notes")
+        assert criteria == ["SUBJECT", '"Meeting Notes"']
+
+    def test_build_search_criteria_multiword_from(self):
+        """Multi-word from_address must be quoted for IMAP."""
+        criteria = EmailClient._build_search_criteria(from_address="Alice Example")
+        assert criteria == ["FROM", '"Alice Example"']
+
+    def test_build_search_criteria_multiword_to(self):
+        """Multi-word to_address must be quoted for IMAP."""
+        criteria = EmailClient._build_search_criteria(to_address="Bob Smith")
+        assert criteria == ["TO", '"Bob Smith"']
+
+    def test_build_search_criteria_subject_with_embedded_quotes(self):
+        """Embedded double quotes must be stripped (invalid in IMAP quoted strings)."""
+        criteria = EmailClient._build_search_criteria(subject='He said "hello"')
+        assert criteria == ["SUBJECT", '"He said hello"']
+
     @pytest.mark.asyncio
     async def test_get_emails_metadata_page(self, email_client):
         """Test getting emails page returns sorted, paginated results with total count."""
@@ -242,7 +262,7 @@ class TestEmailClient:
             },
         }
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             with patch.object(email_client, "_batch_fetch_dates", return_value=mock_dates) as mock_fetch_dates:
                 with patch.object(
                     email_client, "_batch_fetch_headers", return_value=mock_metadata
@@ -279,14 +299,14 @@ class TestEmailClient:
         mock_imap.logout = AsyncMock()
 
         # Mock IMAP class
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             count = await email_client.get_email_count()
 
             assert count == 5
 
             # Verify IMAP methods were called correctly
             mock_imap.login.assert_called_once_with(
-                email_client.email_server.user_name, email_client.email_server.password
+                email_client.email_server.user_name, email_client.email_server.password.get_secret_value()
             )
             mock_imap.select.assert_called_once_with('"INBOX"')
             mock_imap.uid_search.assert_called_once_with("ALL")
@@ -313,7 +333,7 @@ class TestEmailClient:
 
             # Verify SMTP methods were called correctly
             mock_smtp.login.assert_called_once_with(
-                email_client.email_server.user_name, email_client.email_server.password
+                email_client.email_server.user_name, email_client.email_server.password.get_secret_value()
             )
             mock_smtp.send_message.assert_called_once()
 
@@ -332,6 +352,67 @@ class TestEmailClient:
             assert "recipient@example.com" in recipients
             assert "cc@example.com" in recipients
             assert "bcc@example.com" in recipients
+
+
+class TestSendEmailMessageIdAndDate:
+    @pytest.mark.asyncio
+    async def test_send_email_sets_message_id_and_date(self, email_client):
+        """Test that send_email sets Message-Id and Date headers."""
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            msg = await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test Subject",
+                body="Test Body",
+            )
+
+            assert msg["Message-Id"] is not None
+            assert "@example.com>" in msg["Message-Id"]
+            assert msg["Date"] is not None
+
+    @pytest.mark.asyncio
+    async def test_send_email_message_id_uses_sender_domain(self, email_server):
+        """Test that Message-Id domain is extracted from the sender address."""
+        client = EmailClient(email_server, sender="user@getsequel.app")
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            msg = await client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test",
+                body="Body",
+            )
+
+            assert "@getsequel.app>" in msg["Message-Id"]
+
+    @pytest.mark.asyncio
+    async def test_send_email_same_message_on_smtp_and_return(self, email_client):
+        """Test that the same msg object (with Message-Id) is sent and returned."""
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            returned_msg = await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test",
+                body="Body",
+            )
+
+            sent_msg = mock_smtp.send_message.call_args[0][0]
+            assert sent_msg["Message-Id"] == returned_msg["Message-Id"]
+            assert sent_msg["Date"] == returned_msg["Date"]
 
 
 class TestParseEmailData:
@@ -443,7 +524,7 @@ class TestDeleteEmails:
         mock_imap.expunge = AsyncMock()
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             deleted_ids, failed_ids = await email_client.delete_emails(["123", "456"])
             assert deleted_ids == ["123", "456"]
             assert failed_ids == []
@@ -472,7 +553,7 @@ class TestDeleteEmails:
 
         mock_imap.uid = AsyncMock(side_effect=uid_side_effect)
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             deleted_ids, failed_ids = await email_client.delete_emails(["123", "456"])
             assert deleted_ids == ["123"]
             assert failed_ids == ["456"]
@@ -490,7 +571,7 @@ class TestDeleteEmails:
         mock_imap.expunge = AsyncMock()
         mock_imap.logout = AsyncMock(side_effect=OSError("Connection closed"))
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             deleted_ids, failed_ids = await email_client.delete_emails(["123"])
             assert deleted_ids == ["123"]
             assert failed_ids == []
@@ -511,7 +592,7 @@ class TestMarkEmails:
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             marked_ids, failed_ids = await email_client.mark_emails(
                 email_ids=["123", "456"],
                 mark_as="read",
@@ -538,7 +619,7 @@ class TestMarkEmails:
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             marked_ids, failed_ids = await email_client.mark_emails(
                 email_ids=["123", "456"],
                 mark_as="unread",
@@ -566,7 +647,7 @@ class TestMarkEmails:
         mock_imap.uid = AsyncMock(side_effect=[None, Exception("Email not found")])
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             marked_ids, failed_ids = await email_client.mark_emails(
                 email_ids=["123", "456"],
                 mark_as="read",
@@ -587,7 +668,7 @@ class TestMarkEmails:
         mock_imap.select = AsyncMock()
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             with pytest.raises(ValueError) as exc_info:
                 await email_client.mark_emails(
                     email_ids=["123"],
@@ -608,7 +689,7 @@ class TestMarkEmails:
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.logout = AsyncMock()
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             await email_client.mark_emails(
                 email_ids=["123"],
                 mark_as="read",
@@ -630,7 +711,7 @@ class TestMarkEmails:
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.logout = AsyncMock(side_effect=OSError("Connection closed"))
 
-        with patch.object(email_client, "imap_class", return_value=mock_imap):
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             # Should complete successfully despite logout error
             marked_ids, failed_ids = await email_client.mark_emails(
                 email_ids=["123"],
@@ -1733,7 +1814,7 @@ class TestExtractAttachments:
         mock_imap.logout = AsyncMock()
 
         with (
-            patch.object(email_client, "imap_class", return_value=mock_imap),
+            patch.object(email_client, "_imap_connect", return_value=mock_imap),
             patch.object(
                 email_client,
                 "_fetch_email_with_formats",
@@ -1769,7 +1850,7 @@ class TestExtractAttachments:
         mock_imap.logout = AsyncMock()
 
         with (
-            patch.object(email_client, "imap_class", return_value=mock_imap),
+            patch.object(email_client, "_imap_connect", return_value=mock_imap),
             patch.object(
                 email_client,
                 "_fetch_email_with_formats",
@@ -1793,7 +1874,7 @@ class TestExtractAttachments:
         mock_imap.logout = AsyncMock()
 
         with (
-            patch.object(email_client, "imap_class", return_value=mock_imap),
+            patch.object(email_client, "_imap_connect", return_value=mock_imap),
             patch.object(email_client, "_fetch_email_with_formats", return_value=None),
         ):
             result = await email_client.extract_attachments("999", "INBOX")

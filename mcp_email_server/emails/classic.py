@@ -163,8 +163,8 @@ async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
         logger.warning(f"IMAP ID command failed: {e!s}")
 
 
-def _create_smtp_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
-    """Create SSL context for SMTP connections.
+def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
+    """Create SSL context for SMTP/IMAP connections.
 
     Returns None for default verification, or permissive context
     for self-signed certificates when verify_ssl=False.
@@ -320,6 +320,10 @@ def _format_forwarded_email_html(original_email: dict[str, Any]) -> str:
     )
 
 
+# Backwards-compatible alias
+_create_smtp_ssl_context = _create_ssl_context
+
+
 class EmailClient:
     def __init__(self, email_server: EmailServer, sender: str | None = None):
         self.email_server = email_server
@@ -330,6 +334,16 @@ class EmailClient:
         self.smtp_use_tls = self.email_server.use_ssl
         self.smtp_start_tls = self.email_server.start_ssl
         self.smtp_verify_ssl = self.email_server.verify_ssl
+
+    def _imap_connect(self, server: "EmailServer | None" = None) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
+        """Create a new IMAP connection with the configured SSL context."""
+        srv = server or self.email_server
+        if srv.use_ssl:
+            imap_ssl_context = _create_ssl_context(srv.verify_ssl)
+            imap_cls = aioimaplib.IMAP4_SSL if srv.use_ssl else aioimaplib.IMAP4
+            return imap_cls(srv.host, srv.port, ssl_context=imap_ssl_context)
+        imap_cls = aioimaplib.IMAP4_SSL if srv.use_ssl else aioimaplib.IMAP4
+        return imap_cls(srv.host, srv.port)
 
     @asynccontextmanager
     async def _imap_connection(
@@ -347,15 +361,11 @@ class EmailClient:
             server: Override server credentials (used by append_to_sent).
         """
         srv = server or self.email_server
-        if server is not None:
-            imap_cls = aioimaplib.IMAP4_SSL if srv.use_ssl else aioimaplib.IMAP4
-        else:
-            imap_cls = self.imap_class
-        imap = imap_cls(srv.host, srv.port)
+        imap = self._imap_connect(server=srv)
         try:
             await imap._client_task
             await imap.wait_hello_from_server()
-            await imap.login(srv.user_name, srv.password)
+            await imap.login(srv.user_name, srv.password.get_secret_value())
             await _send_imap_id(imap)
             if mailbox is not None:
                 await imap.select(_quote_mailbox(mailbox))
@@ -368,7 +378,7 @@ class EmailClient:
 
     def _get_smtp_ssl_context(self) -> ssl.SSLContext | None:
         """Get SSL context for SMTP connections based on verify_ssl setting."""
-        return _create_smtp_ssl_context(self.smtp_verify_ssl)
+        return _create_ssl_context(self.smtp_verify_ssl)
 
     @staticmethod
     def _parse_recipients(email_message) -> list[str]:
@@ -420,6 +430,25 @@ class EmailClient:
         html_body = ""
         attachments = []
 
+        def _strip_html(html: str) -> str:
+            """Simple HTML to text conversion."""
+            import re
+
+            # Remove script and style elements
+            text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
+            # Convert common block elements to newlines
+            text = re.sub(r"<(br|p|div|tr|li)[^>]*/?>", "\n", text, flags=re.IGNORECASE)
+            # Remove all remaining HTML tags
+            text = re.sub(r"<[^>]+>", "", text)
+            # Decode common HTML entities
+            text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+            text = text.replace("&lt;", "<").replace("&gt;", ">")
+            text = text.replace("&quot;", '"').replace("&#39;", "'")
+            # Collapse multiple newlines and whitespace
+            text = re.sub(r"\n\s*\n", "\n\n", text)
+            text = re.sub(r" +", " ", text)
+            return text.strip()
+
         if email_message.is_multipart():
             html_body = ""
             for part in email_message.walk():
@@ -431,7 +460,7 @@ class EmailClient:
                     filename = part.get_filename()
                     if filename:
                         attachments.append(filename)
-                # Handle text parts
+                # Handle text parts - prefer text/plain
                 elif content_type == "text/plain":
                     body_part = part.get_payload(decode=True)
                     if body_part:
@@ -452,6 +481,7 @@ class EmailClient:
             if not body and html_body:
                 body = html_to_text(html_body)
         else:
+            # Handle single-part emails
             content_type = email_message.get_content_type()
             payload = email_message.get_payload(decode=True)
             if payload:
@@ -480,6 +510,18 @@ class EmailClient:
         }
 
     @staticmethod
+    def _sanitize_imap_value(value: str) -> str:
+        """Sanitize a string value for IMAP search criteria.
+
+        For multi-word values, strips embedded double quotes (invalid per RFC 3501
+        Section 4.3) and wraps in double quotes. Single-word values pass through unchanged.
+        """
+        if " " not in value:
+            return value
+        sanitized = value.replace('"', "")
+        return f'"{sanitized}"'
+
+    @staticmethod
     def _build_search_criteria(
         before: datetime | None = None,
         since: datetime | None = None,
@@ -499,15 +541,15 @@ class EmailClient:
         if since:
             search_criteria.extend(["SINCE", since.strftime("%d-%b-%Y").upper()])
         if subject:
-            search_criteria.extend(["SUBJECT", subject])
+            search_criteria.extend(["SUBJECT", EmailClient._sanitize_imap_value(subject)])
         if body:
-            search_criteria.extend(["BODY", body])
+            search_criteria.extend(["BODY", EmailClient._sanitize_imap_value(body)])
         if text:
-            search_criteria.extend(["TEXT", text])
+            search_criteria.extend(["TEXT", EmailClient._sanitize_imap_value(text)])
         if from_address:
-            search_criteria.extend(["FROM", from_address])
+            search_criteria.extend(["FROM", EmailClient._sanitize_imap_value(from_address)])
         if to_address:
-            search_criteria.extend(["TO", to_address])
+            search_criteria.extend(["TO", EmailClient._sanitize_imap_value(to_address)])
         if has_attachment is True:
             search_criteria.extend(["HEADER", "Content-Type", "multipart/mixed"])
         elif has_attachment is False:
@@ -624,20 +666,24 @@ class EmailClient:
         for i, item in enumerate(data):
             if not isinstance(item, bytes) or b"BODY[HEADER]" not in item:
                 continue
-            # aioimaplib returns FETCH response in 3 parts:
-            # i:   b'N FETCH (BODY[HEADER] {size}'  - contains BODY[HEADER]
-            # i+1: bytearray(...)                   - raw header content
-            # i+2: b' UID N)'                       - contains UID
-            if i + 2 >= len(data) or not isinstance(data[i + 1], bytearray):
-                continue
-            uid_item = data[i + 2] if isinstance(data[i + 2], bytes) else None
-            uid_match = re.search(rb"UID (\d+)", uid_item) if uid_item else None
-            if uid_match:
+            # First try to find UID in the same line (standard format)
+            uid_match = re.search(rb"UID (\d+)", item)
+            if uid_match and i + 1 < len(data) and isinstance(data[i + 1], bytearray):
                 uid = uid_match.group(1).decode()
                 raw_headers = bytes(data[i + 1])
                 metadata = self._parse_headers(uid, raw_headers)
                 if metadata:
                     results[uid] = metadata
+            # Proton Bridge format: UID comes AFTER header data in a separate item
+            # Format: [i]=b'N FETCH (BODY[HEADER] {size}', [i+1]=bytearray(headers), [i+2]=b' UID xxx)'
+            elif i + 2 < len(data) and isinstance(data[i + 1], bytearray):
+                uid_after_match = re.search(rb"UID (\d+)", data[i + 2]) if isinstance(data[i + 2], bytes) else None
+                if uid_after_match:
+                    uid = uid_after_match.group(1).decode()
+                    raw_headers = bytes(data[i + 1])
+                    metadata = self._parse_headers(uid, raw_headers)
+                    if metadata:
+                        results[uid] = metadata
 
         return results
 
@@ -1022,6 +1068,12 @@ class EmailClient:
         if references:
             msg["References"] = references
 
+        # Set Date and Message-Id headers so the same values appear in both
+        # the SMTP-sent copy and the IMAP Sent folder copy
+        msg["Date"] = email.utils.formatdate(localtime=True)
+        sender_domain = self.sender.rsplit("@", 1)[-1].rstrip(">")
+        msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
+
         # Note: BCC recipients are not added to headers (they remain hidden)
         # but will be included in the actual recipients for SMTP delivery
 
@@ -1032,7 +1084,7 @@ class EmailClient:
             use_tls=self.smtp_use_tls,
             tls_context=self._get_smtp_ssl_context(),
         ) as smtp:
-            await smtp.login(self.email_server.user_name, self.email_server.password)
+            await smtp.login(self.email_server.user_name, self.email_server.password.get_secret_value())
 
             # Create a combined list of all recipients for delivery
             all_recipients = recipients.copy()

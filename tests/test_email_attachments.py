@@ -232,7 +232,7 @@ class TestDownloadAttachmentMailboxParam:
 
         # Mock _fetch_email_with_formats to return None (will raise ValueError)
         with patch.object(email_client, "_fetch_email_with_formats", return_value=None):
-            with patch.object(email_client, "imap_class", return_value=mock_imap):
+            with patch.object(email_client, "_imap_connect", return_value=mock_imap):
                 with pytest.raises(ValueError):
                     await email_client.download_attachment(
                         email_id="123",
@@ -259,7 +259,7 @@ class TestDownloadAttachmentMailboxParam:
         mock_imap.logout = AsyncMock()
 
         with patch.object(email_client, "_fetch_email_with_formats", return_value=None):
-            with patch.object(email_client, "imap_class", return_value=mock_imap):
+            with patch.object(email_client, "_imap_connect", return_value=mock_imap):
                 with pytest.raises(ValueError):
                     await email_client.download_attachment(
                         email_id="123",
@@ -287,7 +287,7 @@ class TestDownloadAttachmentMailboxParam:
         mock_imap.logout = AsyncMock()
 
         with patch.object(email_client, "_fetch_email_with_formats", return_value=None):
-            with patch.object(email_client, "imap_class", return_value=mock_imap):
+            with patch.object(email_client, "_imap_connect", return_value=mock_imap):
                 with pytest.raises(ValueError):
                     await email_client.download_attachment(
                         email_id="123",

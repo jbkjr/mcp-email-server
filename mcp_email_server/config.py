@@ -7,7 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import tomli_w
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_serializer, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -31,15 +31,19 @@ CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH
 
 class EmailServer(BaseModel):
     user_name: str
-    password: str
+    password: SecretStr
     host: str
     port: int
     use_ssl: bool = True  # Usually port 465
     start_ssl: bool = False  # Usually port 587
     verify_ssl: bool = True  # Set to False for self-signed certificates (e.g., ProtonMail Bridge)
 
+    @field_serializer("password")
+    def serialize_password(self, v: SecretStr) -> str:
+        return v.get_secret_value()
+
     def masked(self) -> EmailServer:
-        return self.model_copy(update={"password": "********"})
+        return self.model_copy(update={"password": SecretStr("********")})
 
 
 class AccountAttributes(BaseModel):
@@ -102,6 +106,7 @@ class EmailSettings(AccountAttributes):
         imap_password: str | None = None,
         imap_port: int = 993,
         imap_ssl: bool = True,
+        imap_verify_ssl: bool = True,
         smtp_port: int = 465,
         smtp_ssl: bool = True,
         smtp_start_ssl: bool = False,
@@ -122,6 +127,7 @@ class EmailSettings(AccountAttributes):
                 host=imap_host,
                 port=imap_port,
                 use_ssl=imap_ssl,
+                verify_ssl=imap_verify_ssl,
             ),
             outgoing=EmailServer(
                 user_name=smtp_user_name or user_name,
@@ -150,6 +156,7 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_IMAP_HOST
         - MCP_EMAIL_SERVER_IMAP_PORT (default: 993)
         - MCP_EMAIL_SERVER_IMAP_SSL (default: true)
+        - MCP_EMAIL_SERVER_IMAP_VERIFY_SSL (default: true)
         - MCP_EMAIL_SERVER_SMTP_HOST
         - MCP_EMAIL_SERVER_SMTP_PORT (default: 465)
         - MCP_EMAIL_SERVER_SMTP_SSL (default: true)
@@ -188,6 +195,7 @@ class EmailSettings(AccountAttributes):
                 imap_host=imap_host,
                 imap_port=int(os.getenv("MCP_EMAIL_SERVER_IMAP_PORT", "993")),
                 imap_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_IMAP_SSL"), True),
+                imap_verify_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_IMAP_VERIFY_SSL"), True),
                 smtp_host=smtp_host,
                 smtp_port=int(os.getenv("MCP_EMAIL_SERVER_SMTP_PORT", "465")),
                 smtp_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SMTP_SSL"), True),
@@ -216,10 +224,14 @@ class EmailSettings(AccountAttributes):
 
 class ProviderSettings(AccountAttributes):
     provider_name: str
-    api_key: str
+    api_key: SecretStr
+
+    @field_serializer("api_key")
+    def serialize_api_key(self, v: SecretStr) -> str:
+        return v.get_secret_value()
 
     def masked(self) -> AccountAttributes:
-        return self.model_copy(update={"api_key": "********"})
+        return self.model_copy(update={"api_key": SecretStr("********")})
 
 
 class Settings(BaseSettings):
