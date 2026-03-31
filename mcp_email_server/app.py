@@ -144,11 +144,15 @@ async def get_emails_content(
         int | None,
         Field(default=20000, description="Maximum body length in characters before truncation. Set to 0 or null for no limit. Default: 20000."),
     ] = 20000,
+    mark_as_read: Annotated[
+        bool,
+        Field(default=False, description="Mark fetched emails as read. Default: False (emails remain unread)."),
+    ] = False,
 ) -> EmailContentBatchResponse:
     handler = dispatch_handler(account_name)
     # Treat 0 as no limit
     effective_limit = max_body_length if max_body_length else None
-    return await handler.get_emails_content(email_ids, mailbox, effective_limit)
+    return await handler.get_emails_content(email_ids, mailbox, effective_limit, mark_as_read=mark_as_read)
 
 
 @mcp.tool(

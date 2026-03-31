@@ -65,6 +65,7 @@ class EmailHandler(abc.ABC):
         email_ids: list[str],
         mailbox: str = "INBOX",
         max_body_length: int | None = 20000,
+        mark_as_read: bool = False,
     ) -> "EmailContentBatchResponse":
         """
         Get full content (including body) of multiple emails by their email IDs (IMAP UIDs).
@@ -73,6 +74,7 @@ class EmailHandler(abc.ABC):
             email_ids: List of email UIDs to retrieve.
             mailbox: Mailbox to search in.
             max_body_length: Maximum body length before truncation. 0 or None for no limit.
+            mark_as_read: If True, mark successfully fetched emails as read.
         """
 
     @abc.abstractmethod

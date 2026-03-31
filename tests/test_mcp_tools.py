@@ -278,7 +278,7 @@ class TestMcpTools:
             assert result.emails[0].subject == "Test Subject"
 
             # Verify dispatch_handler and get_emails_content were called correctly
-            mock_handler.get_emails_content.assert_called_once_with(["12345"], "INBOX", 20000)
+            mock_handler.get_emails_content.assert_called_once_with(["12345"], "INBOX", 20000, mark_as_read=False)
 
     @pytest.mark.asyncio
     async def test_get_emails_content_batch(self):
@@ -334,7 +334,7 @@ class TestMcpTools:
             assert result.emails[1].email_id == "12346"
 
             # Verify dispatch_handler and get_emails_content were called correctly
-            mock_handler.get_emails_content.assert_called_once_with(["12345", "12346", "12347"], "INBOX", 20000)
+            mock_handler.get_emails_content.assert_called_once_with(["12345", "12346", "12347"], "INBOX", 20000, mark_as_read=False)
 
     @pytest.mark.asyncio
     async def test_get_emails_content_with_mailbox(self):
@@ -368,7 +368,7 @@ class TestMcpTools:
             )
 
             assert result == batch_response
-            mock_handler.get_emails_content.assert_called_once_with(["12345"], "Sent", 20000)
+            mock_handler.get_emails_content.assert_called_once_with(["12345"], "Sent", 20000, mark_as_read=False)
 
     @pytest.mark.asyncio
     async def test_send_email(self):
@@ -679,6 +679,40 @@ class TestMcpTools:
             )
 
             assert result.emails[0].message_id == "<test@example.com>"
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_mark_as_read(self):
+        """Test that mark_as_read parameter is passed through to handler."""
+        from datetime import datetime, timezone
+
+        mock_handler = AsyncMock()
+        mock_handler.get_emails_content = AsyncMock(
+            return_value=EmailContentBatchResponse(
+                emails=[
+                    EmailBodyResponse(
+                        email_id="123",
+                        subject="Test",
+                        sender="sender@example.com",
+                        recipients=["recipient@example.com"],
+                        date=datetime.now(timezone.utc),
+                        body="Test body",
+                        attachments=[],
+                    )
+                ],
+                requested_count=1,
+                retrieved_count=1,
+                failed_ids=[],
+            )
+        )
+
+        with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+            await get_emails_content(
+                account_name="test",
+                email_ids=["123"],
+                mark_as_read=True,
+            )
+
+            mock_handler.get_emails_content.assert_called_once_with(["123"], "INBOX", 20000, mark_as_read=True)
 
     @pytest.mark.asyncio
     async def test_forward_email(self):
