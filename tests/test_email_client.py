@@ -15,6 +15,8 @@ from mcp_email_server.emails.classic import (
     _detect_email_service,
     _format_forwarded_email_html,
     _format_quoted_reply_html,
+    _html_to_text,
+    _imap_login,
 )
 
 
@@ -32,6 +34,40 @@ def email_server():
 @pytest.fixture
 def email_client(email_server):
     return EmailClient(email_server, sender="Test User <test@example.com>")
+
+
+class TestImapLogin:
+    @pytest.mark.asyncio
+    async def test_imap_login_ok_returns_none(self):
+        imap = AsyncMock()
+        imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+
+        await _imap_login(imap, "user@example.com", "secret")
+
+        imap.login.assert_awaited_once_with("user@example.com", "secret")
+
+    @pytest.mark.asyncio
+    async def test_imap_login_no_raises_connection_error_with_detail(self):
+        imap = AsyncMock()
+        imap.login = AsyncMock(return_value=MagicMock(result="NO", lines=[b"Incorrect login credentials"]))
+
+        with pytest.raises(ConnectionError) as exc_info:
+            await _imap_login(imap, "user@example.com", "secret")
+
+        message = str(exc_info.value)
+        assert "user@example.com" in message
+        assert "NO" in message
+        assert "Incorrect login credentials" in message
+
+    @pytest.mark.asyncio
+    async def test_imap_login_decodes_non_utf8_detail_with_replacement(self):
+        imap = AsyncMock()
+        imap.login = AsyncMock(return_value=MagicMock(result="BAD", lines=[b"bad byte: \xff"]))
+
+        with pytest.raises(ConnectionError) as exc_info:
+            await _imap_login(imap, "user@example.com", "secret")
+
+        assert "bad byte:" in str(exc_info.value)
 
 
 class TestEmailClient:
@@ -67,6 +103,66 @@ class TestEmailClient:
         assert result["body"] == "This is a test email body"
         assert isinstance(result["date"], datetime)
         assert result["attachments"] == []
+
+    def test_html_to_text_removes_scripts_and_preserves_readable_text(self):
+        """HTML fallback extraction uses an HTML parser for readable plain text."""
+        html = """
+        <html>
+          <head><style>.hidden { display: none; }</style><script>alert('x')</script></head>
+          <body>
+            <h1>Title &amp; Updates</h1>
+            <p>Hello&nbsp;<strong>there</strong></p>
+            <div>Line<br>Break</div>
+            <ul><li>One</li><li>Two</li></ul>
+          </body>
+        </html>
+        """
+
+        result = _html_to_text(html)
+
+        assert "alert" not in result
+        assert "display" not in result
+        assert "Title & Updates" in result
+        assert "Hello" in result
+        assert "there" in result
+        assert "Line" in result
+        assert "Break" in result
+        assert "One" in result
+        assert "Two" in result
+
+    def test_parse_email_data_html_single_part_falls_back_to_text(self):
+        """Single-part HTML emails are converted to plain text."""
+        msg = MIMEText("<html><body><p>Hello&nbsp;<b>world</b></p><script>x()</script></body></html>", "html", "utf-8")
+        msg["Subject"] = "HTML Subject"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "recipient@example.com"
+        msg["Date"] = email.utils.formatdate()
+
+        client = EmailClient(MagicMock())
+        result = client._parse_email_data(msg.as_bytes())
+
+        assert result["subject"] == "HTML Subject"
+        assert "Hello" in result["body"]
+        assert "world" in result["body"]
+        assert "script" not in result["body"]
+        assert "x()" not in result["body"]
+
+    def test_parse_email_data_html_fallback_when_plain_text_missing(self):
+        """Multipart emails use HTML fallback when text/plain is absent."""
+        from email.mime.multipart import MIMEMultipart
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "HTML Only"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "recipient@example.com"
+        msg["Date"] = email.utils.formatdate()
+        msg.attach(MIMEText("<div>First</div><div>Second &amp; third</div>", "html", "utf-8"))
+
+        client = EmailClient(MagicMock())
+        result = client._parse_email_data(msg.as_bytes())
+
+        assert "First" in result["body"]
+        assert "Second & third" in result["body"]
 
     def test_parse_email_data_with_attachments(self):
         """Test parsing email with attachments."""
@@ -224,8 +320,8 @@ class TestEmailClient:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2 3"]))
         mock_imap.logout = AsyncMock()
 
@@ -269,7 +365,8 @@ class TestEmailClient:
                 ) as mock_fetch_headers:
                     emails, total = await email_client.get_emails_metadata_page(page=1, page_size=10)
 
-                    # Behavior: returns emails sorted by date desc (newest first)
+                    # Behavior: returns total count and emails sorted by date desc (newest first)
+                    assert total == 3
                     assert len(emails) == 3
                     assert total == 3
                     assert emails[0]["subject"] == "Subject 3"
@@ -285,32 +382,99 @@ class TestEmailClient:
                     mock_fetch_headers.assert_called_once_with(mock_imap, ["3", "2", "1"])
 
     @pytest.mark.asyncio
-    async def test_get_email_count(self, email_client):
-        """Test getting email count."""
-        # Mock IMAP client
+    async def test_get_emails_metadata_encodes_unicode_mailbox(self, email_client):
+        """Unicode mailbox names should be encoded before IMAP SELECT."""
         mock_imap = AsyncMock()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        mock_imap.search = AsyncMock(return_value=(None, [b"1 2 3 4 5"]))
-        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2 3 4 5"]))
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b""]))
         mock_imap.logout = AsyncMock()
 
         # Mock IMAP class
         with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            count = await email_client.get_email_count()
+            emails, total = await email_client.get_emails_metadata_page(mailbox="Entwürfe")
 
-            assert count == 5
+        assert total == 0
+        assert emails == []
+        mock_imap.select.assert_called_once_with('"Entw&APw-rfe"')
 
-            # Verify IMAP methods were called correctly
-            mock_imap.login.assert_called_once_with(
-                email_client.email_server.user_name, email_client.email_server.password.get_secret_value()
-            )
-            mock_imap.select.assert_called_once_with('"INBOX"')
-            mock_imap.uid_search.assert_called_once_with("ALL")
-            mock_imap.logout.assert_called_once()
+    @pytest.mark.asyncio
+    async def test_get_emails_metadata_search_omits_charset(self, email_client):
+        """UID SEARCH must not send 'CHARSET utf-8'.
+
+        aioimaplib defaults to charset='utf-8'; Microsoft Exchange rejects that
+        with `NO [BADCHARSET (US-ASCII)]`, breaking all search/list operations.
+        We must pass charset=None so no CHARSET token is sent.
+        """
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b""]))
+        mock_imap.logout = AsyncMock()
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            await email_client.get_emails_metadata_page(mailbox="INBOX")
+
+        mock_imap.uid_search.assert_called_once()
+        assert mock_imap.uid_search.call_args.kwargs.get("charset") is None
+
+    @pytest.mark.asyncio
+    async def test_get_emails_metadata_falls_back_to_uid_order_when_dates_missing(self, email_client):
+        """Metadata listing should still return emails when INTERNALDATE parsing fails."""
+        mock_imap = AsyncMock()
+        mock_imap._client_task = asyncio.Future()
+        mock_imap._client_task.set_result(None)
+        mock_imap.wait_hello_from_server = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
+        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2 3"]))
+        mock_imap.logout = AsyncMock()
+
+        mock_metadata = {
+            "1": {
+                "email_id": "1",
+                "subject": "Subject 1",
+                "from": "a@test.com",
+                "to": [],
+                "date": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                "attachments": [],
+            },
+            "2": {
+                "email_id": "2",
+                "subject": "Subject 2",
+                "from": "b@test.com",
+                "to": [],
+                "date": datetime(2024, 1, 2, tzinfo=timezone.utc),
+                "attachments": [],
+            },
+            "3": {
+                "email_id": "3",
+                "subject": "Subject 3",
+                "from": "c@test.com",
+                "to": [],
+                "date": datetime(2024, 1, 3, tzinfo=timezone.utc),
+                "attachments": [],
+            },
+        }
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            with patch.object(email_client, "_batch_fetch_dates", return_value={}) as mock_fetch_dates:
+                with patch.object(
+                    email_client, "_batch_fetch_headers", return_value=mock_metadata
+                ) as mock_fetch_headers:
+                    emails, total = await email_client.get_emails_metadata_page(page=1, page_size=2)
+
+        assert total == 3
+        assert [email["email_id"] for email in emails] == ["3", "2"]
+        mock_fetch_dates.assert_called_once_with(mock_imap, [b"1", b"2", b"3"])
+        mock_fetch_headers.assert_called_once_with(mock_imap, ["3", "2"])
+        mock_imap.logout.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_send_email(self, email_client):
@@ -892,6 +1056,77 @@ class TestBatchFetchDates:
         result = await email_client._batch_fetch_dates(mock_imap, [b"100"])
 
         assert result["100"] == datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_dates_chunks_large_uid_lists(self, email_client):
+        """Test that _batch_fetch_dates splits large UID lists into sequential chunks.
+
+        Regression test for recursion overflow in aioimaplib when processing
+        responses for thousands of UIDs in a single FETCH command.
+        aioimaplib's _handle_responses uses recursion to parse response lines;
+        with >1000 responses in a single buffer, this exceeds Python's default
+        recursion limit and causes a RecursionError / infinite hang.
+
+        See: https://github.com/ai-zerolab/mcp-email-server/pull/155
+        """
+        # Simulate a mailbox with 1500 UIDs — must result in multiple chunks
+        num_uids = 1500
+        uid_list = [str(i).encode() for i in range(1, num_uids + 1)]
+
+        call_count = 0
+
+        async def mock_uid_fetch(cmd, uid_csv, fields):
+            nonlocal call_count
+            call_count += 1
+            uids = uid_csv.split(",")
+            data = [
+                f'{i} FETCH (UID {uid} INTERNALDATE "01-Jan-2024 12:00:00 +0000")'.encode()
+                for i, uid in enumerate(uids, 1)
+            ]
+            data.append(b"FETCH completed")
+            return (None, data)
+
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(side_effect=mock_uid_fetch)
+
+        result = await email_client._batch_fetch_dates(mock_imap, uid_list, chunk_size=500)
+
+        # Must have chunked into 3 calls (500 + 500 + 500)
+        assert call_count == 3, f"Expected 3 sequential chunks, got {call_count} calls"
+        assert len(result) == num_uids
+
+    @pytest.mark.asyncio
+    async def test_batch_fetch_dates_sequential_not_parallel(self, email_client):
+        """Test that chunks are fetched sequentially, not in parallel.
+
+        IMAP is a sequential protocol — parallel FETCH commands on a single
+        connection cause undefined behaviour. Verify that chunks execute serially.
+        """
+        execution_order = []
+        chunk_counter = 0
+
+        async def mock_uid_fetch(cmd, uid_csv, fields):
+            nonlocal chunk_counter
+            chunk_counter += 1
+            chunk_id = chunk_counter
+            execution_order.append(f"start-{chunk_id}")
+            await asyncio.sleep(0.01)  # Simulate network latency
+            execution_order.append(f"end-{chunk_id}")
+            uids = uid_csv.split(",")
+            data = [
+                f'{i} FETCH (UID {uid} INTERNALDATE "01-Jan-2024 12:00:00 +0000")'.encode()
+                for i, uid in enumerate(uids, 1)
+            ]
+            return (None, data)
+
+        mock_imap = AsyncMock()
+        mock_imap.uid = AsyncMock(side_effect=mock_uid_fetch)
+
+        uid_list = [str(i).encode() for i in range(1, 21)]
+        await email_client._batch_fetch_dates(mock_imap, uid_list, chunk_size=10)
+
+        # Sequential execution: start-1, end-1, start-2, end-2
+        assert execution_order == ["start-1", "end-1", "start-2", "end-2"]
 
 
 class TestBatchFetchHeaders:

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import datetime
 import os
+from collections.abc import Iterable
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import tomli_w
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_serializer, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_serializer, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -25,6 +27,23 @@ def _parse_bool_env(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("true", "1", "yes", "on")
+
+
+
+def normalize_address(raw: str) -> str:
+    """Extract and normalize a bare email address for case-insensitive comparison.
+
+    "Alice <Alice@Example.com>" -> "alice@example.com"; "" -> "". ``parseaddr`` is lenient,
+    so non-address input yields a token that will not equal a real configured address.
+    """
+    _, addr = parseaddr(raw)
+    return addr.strip().lower()
+
+
+def _normalize_address_list(raw: Iterable[str]) -> list[str]:
+    """Normalize each address, drop empties, de-duplicate (order-preserving)."""
+    return list(dict.fromkeys(a for a in (normalize_address(x) for x in raw) if a))
+
 
 CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH)).expanduser().resolve()
 
@@ -47,25 +66,16 @@ class EmailServer(BaseModel):
 
 
 class AccountAttributes(BaseModel):
-    model_config = ConfigDict(json_encoders={datetime.datetime: lambda v: v.isoformat()})
     account_name: str
     description: str = ""
     created_at: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(ZoneInfo("UTC")))
     updated_at: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(ZoneInfo("UTC")))
 
     @model_validator(mode="after")
-    @classmethod
-    def update_updated_at(cls, obj: AccountAttributes) -> AccountAttributes:
+    def update_updated_at(self) -> AccountAttributes:
         """Update updated_at field."""
-        # must disable validation to avoid infinite loop
-        obj.model_config["validate_assignment"] = False
-
-        # update updated_at field
-        obj.updated_at = datetime.datetime.now(ZoneInfo("UTC"))
-
-        # enable validation again
-        obj.model_config["validate_assignment"] = True
-        return obj
+        self.updated_at = datetime.datetime.now(ZoneInfo("UTC"))
+        return self
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, AccountAttributes):
@@ -86,10 +96,15 @@ class EmailSettings(AccountAttributes):
     full_name: str
     email_address: str
     incoming: EmailServer
-    outgoing: EmailServer
+    outgoing: EmailServer | None = None
     save_to_sent: bool = True  # Save sent emails to IMAP Sent folder
     sent_folder_name: str | None = None  # Override Sent folder name (auto-detect if None)
     email_service: str | None = None  # Override auto-detection: 'protonmail', 'gmail', etc.
+
+    @property
+    def can_send(self) -> bool:
+        """Return whether this account has SMTP configuration."""
+        return self.outgoing is not None
 
     @classmethod
     def init(
@@ -101,11 +116,12 @@ class EmailSettings(AccountAttributes):
         user_name: str,
         password: str,
         imap_host: str,
-        smtp_host: str,
+        smtp_host: str | None = None,
         imap_user_name: str | None = None,
         imap_password: str | None = None,
         imap_port: int = 993,
         imap_ssl: bool = True,
+        imap_start_ssl: bool = False,
         imap_verify_ssl: bool = True,
         smtp_port: int = 465,
         smtp_ssl: bool = True,
@@ -127,16 +143,21 @@ class EmailSettings(AccountAttributes):
                 host=imap_host,
                 port=imap_port,
                 use_ssl=imap_ssl,
+                start_ssl=imap_start_ssl,
                 verify_ssl=imap_verify_ssl,
             ),
-            outgoing=EmailServer(
-                user_name=smtp_user_name or user_name,
-                password=smtp_password or password,
-                host=smtp_host,
-                port=smtp_port,
-                use_ssl=smtp_ssl,
-                start_ssl=smtp_start_ssl,
-                verify_ssl=smtp_verify_ssl,
+            outgoing=(
+                EmailServer(
+                    user_name=smtp_user_name or user_name,
+                    password=smtp_password or password,
+                    host=smtp_host,
+                    port=smtp_port,
+                    use_ssl=smtp_ssl,
+                    start_ssl=smtp_start_ssl,
+                    verify_ssl=smtp_verify_ssl,
+                )
+                if smtp_host
+                else None
             ),
             save_to_sent=save_to_sent,
             sent_folder_name=sent_folder_name,
@@ -156,8 +177,9 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_IMAP_HOST
         - MCP_EMAIL_SERVER_IMAP_PORT (default: 993)
         - MCP_EMAIL_SERVER_IMAP_SSL (default: true)
+        - MCP_EMAIL_SERVER_IMAP_START_SSL (default: false)
         - MCP_EMAIL_SERVER_IMAP_VERIFY_SSL (default: true)
-        - MCP_EMAIL_SERVER_SMTP_HOST
+        - MCP_EMAIL_SERVER_SMTP_HOST (optional; enables send_email)
         - MCP_EMAIL_SERVER_SMTP_PORT (default: 465)
         - MCP_EMAIL_SERVER_SMTP_SSL (default: true)
         - MCP_EMAIL_SERVER_SMTP_START_SSL (default: false)
@@ -181,8 +203,8 @@ class EmailSettings(AccountAttributes):
         smtp_host = os.getenv("MCP_EMAIL_SERVER_SMTP_HOST")
 
         # Required fields check
-        if not imap_host or not smtp_host:
-            logger.warning("Missing required email configuration environment variables (IMAP_HOST or SMTP_HOST)")
+        if not imap_host:
+            logger.warning("Missing required email configuration environment variable: IMAP_HOST")
             return None
 
         try:
@@ -195,6 +217,7 @@ class EmailSettings(AccountAttributes):
                 imap_host=imap_host,
                 imap_port=int(os.getenv("MCP_EMAIL_SERVER_IMAP_PORT", "993")),
                 imap_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_IMAP_SSL"), True),
+                imap_start_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_IMAP_START_SSL"), False),
                 imap_verify_ssl=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_IMAP_VERIFY_SSL"), True),
                 smtp_host=smtp_host,
                 smtp_port=int(os.getenv("MCP_EMAIL_SERVER_SMTP_PORT", "465")),
@@ -217,7 +240,7 @@ class EmailSettings(AccountAttributes):
         return self.model_copy(
             update={
                 "incoming": self.incoming.masked(),
-                "outgoing": self.outgoing.masked(),
+                "outgoing": self.outgoing.masked() if self.outgoing else None,
             }
         )
 
@@ -240,6 +263,7 @@ class Settings(BaseSettings):
     db_location: str = CONFIG_PATH.with_name("db.sqlite3").as_posix()
     enable_attachment_download: bool = False
     enable_folder_management: bool = False
+    allowed_recipients: list[str] = []
 
     model_config = SettingsConfigDict(toml_file=CONFIG_PATH, validate_assignment=True, revalidate_instances="always")
 
@@ -258,6 +282,15 @@ class Settings(BaseSettings):
         if env_enable_folder is not None:
             self.enable_folder_management = _parse_bool_env(env_enable_folder, False)
             logger.info(f"Set enable_folder_management={self.enable_folder_management} from environment variable")
+
+        # Normalise allowed_recipients from TOML (bare, lowercased, de-duplicated)
+        if self.allowed_recipients:
+            self.allowed_recipients = _normalize_address_list(self.allowed_recipients)
+
+        # Environment variable overrides TOML (comma-separated); an empty string clears the allowlist.
+        env_allowed = os.getenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS")
+        if env_allowed is not None:
+            self.allowed_recipients = _normalize_address_list(env_allowed.split(","))
 
         # Check for email configuration from environment variables
         env_email = EmailSettings.from_env()
@@ -310,19 +343,18 @@ class Settings(BaseSettings):
         return accounts
 
     @model_validator(mode="after")
-    @classmethod
-    def check_unique_account_names(cls, obj: Settings) -> Settings:
+    def check_unique_account_names(self) -> Settings:
         account_names = set()
-        for email in obj.emails:
+        for email in self.emails:
             if email.account_name in account_names:
                 raise ValueError(f"Duplicate account name {email.account_name}")
             account_names.add(email.account_name)
-        for provider in obj.providers:
+        for provider in self.providers:
             if provider.account_name in account_names:
                 raise ValueError(f"Duplicate account name {provider.account_name}")
             account_names.add(provider.account_name)
 
-        return obj
+        return self
 
     @classmethod
     def settings_customise_sources(

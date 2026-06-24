@@ -43,22 +43,6 @@ class TestFolderManagementDisabled:
             assert "Folder management is disabled" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_move_emails_disabled(self):
-        """Test move_emails raises PermissionError when disabled."""
-        mock_settings = MagicMock()
-        mock_settings.enable_folder_management = False
-
-        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
-            with pytest.raises(PermissionError) as exc_info:
-                await move_emails(
-                    account_name="test_account",
-                    email_ids=["123"],
-                    destination_folder="Archive",
-                )
-
-            assert "Folder management is disabled" in str(exc_info.value)
-
-    @pytest.mark.asyncio
     async def test_copy_emails_disabled(self):
         """Test copy_emails raises PermissionError when disabled."""
         mock_settings = MagicMock()
@@ -144,36 +128,6 @@ class TestFolderManagementEnabled:
                 assert len(result.folders) == 3
                 assert result.folders[0].name == "INBOX"
                 mock_handler.list_folders.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_move_emails_enabled(self):
-        """Test move_emails works when enabled."""
-        mock_settings = MagicMock()
-        mock_settings.enable_folder_management = True
-
-        move_response = EmailMoveResponse(
-            success=True,
-            moved_ids=["123", "456"],
-            failed_ids=[],
-            source_mailbox="INBOX",
-            destination_folder="Archive",
-        )
-
-        mock_handler = AsyncMock()
-        mock_handler.move_emails.return_value = move_response
-
-        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
-            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
-                result = await move_emails(
-                    account_name="test_account",
-                    email_ids=["123", "456"],
-                    destination_folder="Archive",
-                )
-
-                assert result == move_response
-                assert result.success is True
-                assert result.moved_ids == ["123", "456"]
-                mock_handler.move_emails.assert_called_once_with(["123", "456"], "Archive", "INBOX")
 
     @pytest.mark.asyncio
     async def test_copy_emails_enabled(self):
@@ -340,25 +294,6 @@ class TestClassicEmailHandlerFolders:
             mock_list.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_move_emails(self, classic_handler):
-        """Test move_emails handler method."""
-        # EmailClient.move_emails returns (moved_ids, failed_ids) tuple
-        mock_move = AsyncMock(return_value=(["123"], []))
-
-        with patch.object(classic_handler.incoming_client, "move_emails", mock_move):
-            result = await classic_handler.move_emails(
-                email_ids=["123"],
-                destination_folder="Archive",
-                source_mailbox="INBOX",
-            )
-
-            assert isinstance(result, EmailMoveResponse)
-            assert result.success is True
-            assert result.moved_ids == ["123"]
-            assert result.failed_ids == []
-            mock_move.assert_called_once_with(["123"], "Archive", "INBOX")
-
-    @pytest.mark.asyncio
     async def test_copy_emails(self, classic_handler):
         """Test copy_emails handler method."""
         # EmailClient.copy_emails returns (copied_ids, failed_ids) tuple
@@ -495,26 +430,6 @@ class TestEmailClientFolders:
             mock_imap.select.assert_called_once_with('"INBOX"')
 
     @pytest.mark.asyncio
-    async def test_move_emails_with_move_command(self, email_client):
-        """Test move_emails using MOVE command."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        # First call (MOVE) succeeds
-        mock_imap.uid = AsyncMock(return_value=("OK", [b"OK"]))
-        mock_imap.logout = AsyncMock()
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
-
-            # EmailClient.move_emails returns (moved_ids, failed_ids) tuple
-            assert moved_ids == ["123"]
-            assert failed_ids == []
-
-    @pytest.mark.asyncio
     async def test_create_folder(self, email_client):
         """Test create_folder IMAP operation."""
         mock_imap = AsyncMock()
@@ -638,138 +553,6 @@ class TestEmailClientFolderEdgeCases:
             assert len(result) == 3
             assert result[1].name == "Folders/My Folder"
             assert result[2].name == "[Gmail]/Sent Mail"
-
-    @pytest.mark.asyncio
-    async def test_move_emails_move_returns_non_ok(self, email_client):
-        """Test move_emails fallback when MOVE returns non-OK status (covers 927->935)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        mock_imap.expunge = AsyncMock()
-        mock_imap.logout = AsyncMock()
-
-        # MOVE returns non-OK status (not exception), then COPY succeeds
-        mock_imap.uid = AsyncMock(
-            side_effect=[
-                ("NO", [b"MOVE not supported"]),  # MOVE returns NO status
-                ("OK", [b"[COPYUID 1234 1 100]"]),  # COPY succeeds
-                ("OK", []),  # STORE \\Deleted succeeds
-            ]
-        )
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
-
-            assert moved_ids == ["123"]
-            assert failed_ids == []
-            # Should have called uid 3 times: move (NO), copy, store
-            assert mock_imap.uid.call_count == 3
-            mock_imap.expunge.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_move_emails_fallback_to_copy_delete(self, email_client):
-        """Test move_emails falls back to COPY+DELETE when MOVE fails (covers 931-940)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        mock_imap.expunge = AsyncMock()
-        mock_imap.logout = AsyncMock()
-
-        # First call (MOVE) fails with exception, second call (COPY) succeeds
-        mock_imap.uid = AsyncMock(
-            side_effect=[
-                Exception("MOVE not supported"),  # MOVE fails
-                ("OK", [b"[COPYUID 1234 1 100]"]),  # COPY succeeds
-                ("OK", []),  # STORE \\Deleted succeeds
-            ]
-        )
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
-
-            assert moved_ids == ["123"]
-            assert failed_ids == []
-            # Should have called uid 3 times: move, copy, store
-            assert mock_imap.uid.call_count == 3
-            mock_imap.expunge.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_move_emails_copy_failure_after_move_failure(self, email_client):
-        """Test move_emails when both MOVE and COPY fail (covers 941-946)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        mock_imap.expunge = AsyncMock()
-        mock_imap.logout = AsyncMock()
-
-        # MOVE fails, then COPY also fails
-        mock_imap.uid = AsyncMock(
-            side_effect=[
-                Exception("MOVE not supported"),  # MOVE fails
-                ("NO", [b"COPY failed"]),  # COPY fails with NO status
-            ]
-        )
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
-
-            assert moved_ids == []
-            assert failed_ids == ["123"]
-
-    @pytest.mark.asyncio
-    async def test_move_emails_exception_during_operation(self, email_client):
-        """Test move_emails when an exception occurs during processing (covers 944-946)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        mock_imap.expunge = AsyncMock()
-        mock_imap.logout = AsyncMock()
-
-        # MOVE fails, then COPY raises unexpected exception
-        mock_imap.uid = AsyncMock(
-            side_effect=[
-                Exception("MOVE not supported"),  # MOVE fails
-                Exception("Connection lost during COPY"),  # COPY fails with exception
-            ]
-        )
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
-
-            assert moved_ids == []
-            assert failed_ids == ["123"]
-
-    @pytest.mark.asyncio
-    async def test_move_emails_logout_error(self, email_client):
-        """Test move_emails handles logout error gracefully (covers 955-956)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        mock_imap.uid = AsyncMock(return_value=("OK", []))
-        mock_imap.expunge = AsyncMock()
-        mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
-
-            # Should complete despite logout error
-            assert moved_ids == ["123"]
-            assert failed_ids == []
 
     @pytest.mark.asyncio
     async def test_create_folder_exception(self, email_client):
@@ -1051,51 +834,6 @@ class TestEmailClientFolderEdgeCases:
         with patch.object(email_client, "_imap_connect", return_value=mock_imap):
             copied_ids, failed_ids = await email_client.copy_emails(["123"], "Archive", "INBOX")
             assert copied_ids == ["123"]
-            assert failed_ids == []
-
-    @pytest.mark.asyncio
-    async def test_move_emails_non_tuple_move_result(self, email_client):
-        """Test move_emails when MOVE returns non-tuple result (covers ternary else branch)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        mock_imap.expunge = AsyncMock()
-        # Return a string instead of tuple for MOVE
-        mock_imap.uid = AsyncMock(return_value="OK")
-        mock_imap.logout = AsyncMock()
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
-            assert moved_ids == ["123"]
-            assert failed_ids == []
-
-    @pytest.mark.asyncio
-    async def test_move_emails_non_tuple_copy_result(self, email_client):
-        """Test move_emails when COPY fallback returns non-tuple result (covers ternary else branch)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
-        mock_imap.expunge = AsyncMock()
-        mock_imap.logout = AsyncMock()
-
-        # MOVE fails, then COPY returns non-tuple string
-        mock_imap.uid = AsyncMock(
-            side_effect=[
-                Exception("MOVE not supported"),  # MOVE fails
-                "OK",  # COPY returns string instead of tuple
-                "OK",  # STORE returns string
-            ]
-        )
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            moved_ids, failed_ids = await email_client.move_emails(["123"], "Archive", "INBOX")
-            assert moved_ids == ["123"]
             assert failed_ids == []
 
     @pytest.mark.asyncio

@@ -2,7 +2,7 @@
 
 import asyncio
 from email.mime.text import MIMEText
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -269,7 +269,7 @@ class TestEmailClientAppendToSent:
         mock._client_task = asyncio.Future()
         mock._client_task.set_result(None)
         mock.wait_hello_from_server = AsyncMock()
-        mock.login = AsyncMock()
+        mock.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock.select = AsyncMock(return_value=("OK", []))
         mock.append = AsyncMock(return_value=("OK", []))
         mock.logout = AsyncMock()
@@ -507,6 +507,20 @@ class TestFindSentFolderByFlag:
         assert result == "[Gmail]/Gesendet"
 
     @pytest.mark.asyncio
+    async def test_find_sent_folder_by_flag_decodes_modified_utf7(self, email_client):
+        """Sent folder detection should return decoded Unicode folder names."""
+        mock = AsyncMock()
+        mock.list = AsyncMock(
+            return_value=(
+                "OK",
+                [b'(\\Sent \\HasNoChildren) "/" "Gesendete &ANw-bjekte"'],
+            )
+        )
+
+        result = await email_client._find_sent_folder_by_flag(mock)
+        assert result == "Gesendete Übjekte"
+
+    @pytest.mark.asyncio
     async def test_find_sent_folder_by_flag_not_found(self, email_client, mock_imap_without_sent_flag):
         """Test when no folder with \\Sent flag exists."""
         result = await email_client._find_sent_folder_by_flag(mock_imap_without_sent_flag)
@@ -570,7 +584,7 @@ class TestAppendToSentWithFlagDetection:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.list = AsyncMock(
             return_value=(
                 "OK",
@@ -599,7 +613,7 @@ class TestAppendToSentWithFlagDetection:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.list = AsyncMock(
             return_value=(
                 "OK",
@@ -619,6 +633,49 @@ class TestAppendToSentWithFlagDetection:
             assert result is True
             # Should use flag-detected folder (highest priority)
             mock_imap.select.assert_called_with('"Flag Detected"')
+
+
+class TestSendEmailSentCopyBcc:
+    """Tests that send_email includes BCC in the Sent folder copy."""
+
+    @pytest.mark.asyncio
+    async def test_sent_copy_includes_bcc_header(self, email_settings_with_save_to_sent):
+        handler = ClassicEmailHandler(email_settings_with_save_to_sent)
+
+        mock_msg = MIMEText("Test body")
+        mock_send = AsyncMock(return_value=mock_msg)
+        mock_append = AsyncMock(return_value=True)
+
+        with patch.object(handler.outgoing_client, "send_email", mock_send):
+            with patch.object(handler.outgoing_client, "append_to_sent", mock_append):
+                await handler.send_email(
+                    recipients=["r@example.com"],
+                    subject="Test",
+                    body="Test body",
+                    bcc=["secret@example.com"],
+                )
+
+        appended_msg = mock_append.call_args[0][0]
+        assert appended_msg["Bcc"] == "secret@example.com"
+
+    @pytest.mark.asyncio
+    async def test_sent_copy_no_bcc_when_none(self, email_settings_with_save_to_sent):
+        handler = ClassicEmailHandler(email_settings_with_save_to_sent)
+
+        mock_msg = MIMEText("Test body")
+        mock_send = AsyncMock(return_value=mock_msg)
+        mock_append = AsyncMock(return_value=True)
+
+        with patch.object(handler.outgoing_client, "send_email", mock_send):
+            with patch.object(handler.outgoing_client, "append_to_sent", mock_append):
+                await handler.send_email(
+                    recipients=["r@example.com"],
+                    subject="Test",
+                    body="Test body",
+                )
+
+        appended_msg = mock_append.call_args[0][0]
+        assert appended_msg["Bcc"] is None
 
 
 class TestHandlerErrorHandling:

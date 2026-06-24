@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -58,6 +59,26 @@ class TestClassicEmailHandler:
         assert handler.incoming_client.email_server == email_settings.incoming
         assert handler.outgoing_client.email_server == email_settings.outgoing
         assert handler.outgoing_client.sender == f"{email_settings.full_name} <{email_settings.email_address}>"
+
+    def test_init_read_only_account(self):
+        """Read-only accounts initialize without an outgoing SMTP client."""
+        email_settings = EmailSettings(
+            account_name="read_only",
+            full_name="Read Only",
+            email_address="read-only@example.com",
+            incoming=EmailServer(
+                user_name="reader",
+                password="secret",
+                host="imap.example.com",
+                port=993,
+                use_ssl=True,
+            ),
+        )
+
+        handler = ClassicEmailHandler(email_settings)
+
+        assert isinstance(handler.incoming_client, EmailClient)
+        assert handler.outgoing_client is None
 
     @pytest.mark.asyncio
     async def test_get_emails(self, classic_handler):
@@ -191,6 +212,7 @@ class TestClassicEmailHandler:
                 None,
                 None,
                 None,
+                None,
             )
 
     @pytest.mark.asyncio
@@ -224,6 +246,55 @@ class TestClassicEmailHandler:
                 [str(test_file)],
                 None,
                 None,
+                None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_read_only_account_rejects_send_email(self):
+        """Read-only accounts cannot send email."""
+        email_settings = EmailSettings(
+            account_name="read_only",
+            full_name="Read Only",
+            email_address="read-only@example.com",
+            incoming=EmailServer(
+                user_name="reader",
+                password="secret",
+                host="imap.example.com",
+                port=993,
+                use_ssl=True,
+            ),
+        )
+        handler = ClassicEmailHandler(email_settings)
+
+        with pytest.raises(RuntimeError, match="SMTP is not configured"):
+            await handler.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test Subject",
+                body="Test Body",
+            )
+
+    @pytest.mark.asyncio
+    async def test_read_only_account_rejects_save_to_mailbox(self):
+        """Read-only accounts cannot compose and save outbound drafts."""
+        email_settings = EmailSettings(
+            account_name="read_only",
+            full_name="Read Only",
+            email_address="read-only@example.com",
+            incoming=EmailServer(
+                user_name="reader",
+                password="secret",
+                host="imap.example.com",
+                port=993,
+                use_ssl=True,
+            ),
+        )
+        handler = ClassicEmailHandler(email_settings)
+
+        with pytest.raises(RuntimeError, match="SMTP is not configured"):
+            await handler.save_to_mailbox(
+                recipients=["recipient@example.com"],
+                subject="Test Subject",
+                body="Test Body",
             )
 
     @pytest.mark.asyncio
@@ -331,6 +402,51 @@ class TestClassicEmailHandler:
             assert result.marked_as == "unread"
 
     @pytest.mark.asyncio
+    async def test_mark_emails_as_read(self, classic_handler):
+        """Test mark_emails_as_read method."""
+        mock_mark = AsyncMock(return_value=(["123", "456"], []))
+
+        with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
+            marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
+                email_ids=["123", "456"],
+                mailbox="INBOX",
+            )
+
+            assert marked_ids == ["123", "456"]
+            assert failed_ids == []
+            mock_mark.assert_called_once_with(["123", "456"], "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_with_failures(self, classic_handler):
+        """Test mark_emails_as_read method with some failures."""
+        mock_mark = AsyncMock(return_value=(["123"], ["456"]))
+
+        with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
+            marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
+                email_ids=["123", "456"],
+                mailbox="INBOX",
+            )
+
+            assert marked_ids == ["123"]
+            assert failed_ids == ["456"]
+            mock_mark.assert_called_once_with(["123", "456"], "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_custom_mailbox(self, classic_handler):
+        """Test mark_emails_as_read method with custom mailbox."""
+        mock_mark = AsyncMock(return_value=(["789"], []))
+
+        with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
+            marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
+                email_ids=["789"],
+                mailbox="Archive",
+            )
+
+            assert marked_ids == ["789"]
+            assert failed_ids == []
+            mock_mark.assert_called_once_with(["789"], "Archive")
+
+    @pytest.mark.asyncio
     async def test_download_attachment(self, classic_handler, tmp_path):
         """Test download_attachment method."""
         save_path = str(tmp_path / "downloaded_attachment.pdf")
@@ -383,6 +499,27 @@ class TestClassicEmailHandler:
             msg = call_args[0][0]
             assert msg["In-Reply-To"] == "<original@example.com>"
             assert msg["References"] == "<original@example.com>"
+
+    @pytest.mark.asyncio
+    async def test_send_email_with_reply_to(self, classic_handler):
+        """Test sending email with Reply-To header."""
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await classic_handler.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test",
+                body="Body",
+                reply_to="replyhere@example.com",
+            )
+
+            call_args = mock_smtp.send_message.call_args
+            msg = call_args[0][0]
+            assert msg["Reply-To"] == "replyhere@example.com"
 
     @pytest.mark.asyncio
     async def test_get_emails_content_includes_message_id(self, classic_handler):
@@ -519,6 +656,172 @@ class TestClassicEmailHandler:
             assert result.requested_count == 2
             assert result.retrieved_count == 0
             assert result.failed_ids == ["123", "456"]
+
+
+class TestEmailClientGetEmailBodyById:
+    """Test EmailClient.get_email_body_by_id read-state behavior."""
+
+    @pytest.fixture
+    def email_client(self, email_settings):
+        return EmailClient(email_settings.incoming)
+
+    @staticmethod
+    def _raw_email() -> bytes:
+        msg = EmailMessage()
+        msg["Subject"] = "Test Subject"
+        msg["From"] = "sender@example.com"
+        msg["To"] = "recipient@example.com"
+        msg["Date"] = "Tue, 26 May 2026 04:30:00 +0000"
+        msg["Message-ID"] = "<test@example.com>"
+        msg.set_content("Test body")
+        return msg.as_bytes()
+
+    @pytest.mark.asyncio
+    async def test_get_email_body_by_id_uses_peek_fetch_by_default(self, email_client, mock_imap):
+        """Test default retrieval uses non-mutating PEEK fetch and does not STORE \\Seen."""
+        mock_imap.uid = AsyncMock(return_value=("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]))
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            result = await email_client.get_email_body_by_id("123")
+
+        assert result is not None
+        assert result["email_id"] == "123"
+        mock_imap.uid.assert_called_once_with("fetch", "123", "BODY.PEEK[]")
+
+    @pytest.mark.asyncio
+    async def test_get_email_body_by_id_marks_as_read_after_successful_parse(self, email_client, mock_imap):
+        """Test mark_as_read=True stores \\Seen after a successful parse."""
+        mock_imap.uid = AsyncMock(
+            side_effect=[
+                ("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]),
+                ("OK", [b"STORE +FLAGS (\\Seen)"]),
+            ]
+        )
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            result = await email_client.get_email_body_by_id("123", mark_as_read=True)
+
+        assert result is not None
+        assert mock_imap.uid.call_args_list[0].args == ("fetch", "123", "BODY.PEEK[]")
+        assert mock_imap.uid.call_args_list[1].args == ("store", "123", "+FLAGS", r"(\Seen)")
+
+    @pytest.mark.asyncio
+    async def test_get_email_body_by_id_does_not_mark_as_read_when_parse_fails(self, email_client, mock_imap):
+        """Test failed parsing skips the \\Seen STORE side effect."""
+        mock_imap.uid = AsyncMock(return_value=("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]))
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            with patch.object(email_client, "_parse_email_data", side_effect=ValueError("parse failed")):
+                result = await email_client.get_email_body_by_id("123", mark_as_read=True)
+
+        assert result is None
+        mock_imap.uid.assert_called_once_with("fetch", "123", "BODY.PEEK[]")
+
+    @pytest.mark.asyncio
+    async def test_get_email_body_by_id_continues_when_mark_as_read_store_fails(self, email_client, mock_imap):
+        """Test STORE failure is logged while retrieval still succeeds."""
+        mock_imap.uid = AsyncMock(
+            side_effect=[
+                ("OK", [b"FETCH BODY[]", bytearray(self._raw_email())]),
+                ("NO", [b"STORE failed"]),
+            ]
+        )
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            result = await email_client.get_email_body_by_id("123", mark_as_read=True)
+
+        assert result is not None
+        assert result["email_id"] == "123"
+        assert mock_imap.uid.call_count == 2
+
+
+class TestEmailClientMarkAsRead:
+    """Test EmailClient.mark_emails_as_read with mock IMAP."""
+
+    @pytest.fixture
+    def email_client(self, email_settings):
+        return EmailClient(email_settings.incoming)
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_success(self, email_client, mock_imap):
+        """Test marking emails as read sets \\Seen flag via IMAP STORE."""
+        mock_imap.uid = AsyncMock(return_value=("OK", [b"1 STORE +FLAGS (\\Seen)"]))
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            marked_ids, failed_ids = await email_client.mark_emails_as_read(["123", "456"])
+
+        assert marked_ids == ["123", "456"]
+        assert failed_ids == []
+        assert mock_imap.uid.call_count == 2
+        mock_imap.uid.assert_any_call("store", "123", "+FLAGS", r"(\Seen)")
+        mock_imap.uid.assert_any_call("store", "456", "+FLAGS", r"(\Seen)")
+        mock_imap.logout.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_partial_failure(self, email_client, mock_imap):
+        """Test marking emails handles partial failures gracefully."""
+        mock_imap.uid = AsyncMock(side_effect=[("OK", []), Exception("IMAP error")])
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            marked_ids, failed_ids = await email_client.mark_emails_as_read(["123", "456"])
+
+        assert marked_ids == ["123"]
+        assert failed_ids == ["456"]
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_treats_no_response_as_failure(self, email_client, mock_imap):
+        """Test IMAP NO STORE responses are reported as failed ids."""
+        mock_imap.uid = AsyncMock(return_value=("NO", [b"STORE failed"]))
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            marked_ids, failed_ids = await email_client.mark_emails_as_read(["123"])
+
+        assert marked_ids == []
+        assert failed_ids == ["123"]
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_raises_on_select_failure(self, email_client, mock_imap):
+        """Test mailbox selection failures are surfaced."""
+        mock_imap.select = AsyncMock(return_value=("NO", [b"unknown mailbox"]))
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            with pytest.raises(RuntimeError, match="SELECT mailbox Archive failed"):
+                await email_client.mark_emails_as_read(["123"], mailbox="Archive")
+
+        mock_imap.logout.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_custom_mailbox(self, email_client, mock_imap):
+        """Test marking emails in a custom mailbox."""
+        mock_imap.uid = AsyncMock(return_value=("OK", []))
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            await email_client.mark_emails_as_read(["123"], mailbox="Archive")
+
+        mock_imap.select.assert_called_once()
+        # Verify the mailbox was quoted and passed to select
+        select_arg = mock_imap.select.call_args[0][0]
+        assert "Archive" in select_arg
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_logout_on_error(self, email_client, mock_imap):
+        """Test that IMAP logout is called even when errors occur."""
+        mock_imap.login = AsyncMock(side_effect=Exception("auth failed"))
+
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            with pytest.raises(Exception, match="auth failed"):
+                await email_client.mark_emails_as_read(["123"])
+
+        mock_imap.logout.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_empty_list(self, email_client, mock_imap):
+        """Test marking empty list returns empty results."""
+        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
+            marked_ids, failed_ids = await email_client.mark_emails_as_read([])
+
+        assert marked_ids == []
+        assert failed_ids == []
 
 
 class TestEmailClientBatchMethods:
@@ -731,7 +1034,7 @@ class TestDeleteEmailsSafeDelete:
         assert result.failed_ids == []
         assert result.mailbox == "INBOX"
         assert result.destination == "Trash"
-        mock_move.assert_called_once_with(["123", "456"], "Trash", "INBOX")
+        mock_move.assert_called_once_with(["123", "456"], "INBOX", "Trash")
 
     @pytest.mark.asyncio
     async def test_permanent_delete_when_no_trash(self, classic_handler):
@@ -813,7 +1116,7 @@ class TestArchiveEmails:
         assert result.moved_ids == ["123", "456"]
         assert result.source_mailbox == "INBOX"
         assert result.destination_folder == "Archive"
-        mock_move.assert_called_once_with(["123", "456"], "Archive", "INBOX")
+        mock_move.assert_called_once_with(["123", "456"], "INBOX", "Archive")
 
     @pytest.mark.asyncio
     async def test_archives_with_gmail_all_mail(self, classic_handler):

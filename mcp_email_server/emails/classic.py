@@ -1,9 +1,12 @@
 import asyncio
+import base64
+import binascii
 import email.utils
 import mimetypes
 import re
 import ssl
 import time
+import unicodedata
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,6 +21,7 @@ from typing import Any
 
 import aioimaplib
 import aiosmtplib
+from bs4 import BeautifulSoup
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
@@ -39,6 +43,7 @@ from mcp_email_server.emails.models import (
     FolderOperationResponse,
     Label,
     LabelListResponse,
+    MailboxInfo,
 )
 from mcp_email_server.log import logger
 
@@ -117,6 +122,171 @@ def _is_ok(result: Any) -> bool:
     return str(status).upper() == "OK"
 
 
+# RFC 3501 system flags (except \Recent which is read-only) + custom keyword atoms
+_VALID_IMAP_FLAG = re.compile(r"^\\[A-Za-z]+$|^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def _validate_flags(flags: list[str]) -> str:
+    """Validate and format IMAP flags into a parenthesised string.
+
+    Accepts system flags (e.g. ``\\Draft``, ``\\Seen``) and custom keyword
+    atoms.  Raises ``ValueError`` on anything that could inject IMAP protocol
+    characters.
+    """
+    for flag in flags:
+        if not _VALID_IMAP_FLAG.match(flag):
+            msg = f"Invalid IMAP flag: {flag!r}"
+            raise ValueError(msg)
+    return "(" + " ".join(flags) + ")"
+
+
+def encode_mailbox_name(mailbox: str) -> str:
+    """Encode an IMAP mailbox name using RFC 3501 Modified UTF-7."""
+    result: list[str] = []
+    buffer: list[str] = []
+
+    def flush_buffer() -> None:
+        if not buffer:
+            return
+        text = "".join(buffer)
+        encoded = base64.b64encode(text.encode("utf-16-be")).decode("ascii")
+        result.append("&" + encoded.rstrip("=").replace("/", ",") + "-")
+        buffer.clear()
+
+    for char in mailbox:
+        codepoint = ord(char)
+        if char == "&":
+            flush_buffer()
+            result.append("&-")
+        elif 0x20 <= codepoint <= 0x7E:
+            flush_buffer()
+            result.append(char)
+        else:
+            buffer.append(char)
+
+    flush_buffer()
+    return "".join(result)
+
+
+def decode_mailbox_name(mailbox: str) -> str:
+    """Decode an IMAP mailbox name from RFC 3501 Modified UTF-7."""
+    result: list[str] = []
+    index = 0
+
+    while index < len(mailbox):
+        char = mailbox[index]
+        if char != "&":
+            result.append(char)
+            index += 1
+            continue
+
+        end = mailbox.find("-", index + 1)
+        if end == -1:
+            result.append(mailbox[index:])
+            break
+        if end == index + 1:
+            result.append("&")
+            index = end + 1
+            continue
+
+        encoded = mailbox[index + 1 : end].replace(",", "/")
+        padding = "=" * (-len(encoded) % 4)
+        try:
+            decoded = base64.b64decode(encoded + padding, validate=True).decode("utf-16-be")
+        except (binascii.Error, UnicodeDecodeError):
+            result.append(mailbox[index : end + 1])
+        else:
+            result.append(decoded)
+        index = end + 1
+
+    return "".join(result)
+
+
+def _skip_imap_whitespace(value: str, start: int) -> int:
+    """Return the next non-whitespace index in an IMAP response line."""
+    index = start
+    while index < len(value) and value[index].isspace():
+        index += 1
+    return index
+
+
+def _read_quoted_imap_token(value: str, start: int) -> tuple[str, int]:
+    """Read a quoted IMAP token."""
+    index = start + 1
+    token: list[str] = []
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and index + 1 < len(value):
+            token.append(value[index + 1])
+            index += 2
+            continue
+        if char == '"':
+            return "".join(token), index + 1
+        token.append(char)
+        index += 1
+    return "".join(token), index
+
+
+def _read_parenthesized_imap_token(value: str, start: int) -> tuple[str, int]:
+    """Read a parenthesized IMAP token."""
+    depth = 1
+    index = start + 1
+    token: list[str] = []
+    while index < len(value):
+        char = value[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return "".join(token), index + 1
+        token.append(char)
+        index += 1
+    return "".join(token), index
+
+
+def _read_atom_imap_token(value: str, start: int) -> tuple[str, int]:
+    """Read an atom IMAP token."""
+    index = start
+    while index < len(value) and not value[index].isspace():
+        index += 1
+    return value[start:index], index
+
+
+def _read_imap_list_token(value: str, start: int) -> tuple[str | None, int]:
+    """Read one token from an IMAP LIST response line."""
+    index = _skip_imap_whitespace(value, start)
+    if index >= len(value):
+        return None, index
+    if value[index] == '"':
+        return _read_quoted_imap_token(value, index)
+    if value[index] == "(":
+        return _read_parenthesized_imap_token(value, index)
+    return _read_atom_imap_token(value, index)
+
+
+def _parse_list_response(item: bytes | str) -> MailboxInfo | None:
+    """Parse one IMAP LIST response into a MailboxInfo object."""
+    item_str = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item)
+    item_str = item_str.strip()
+    if not item_str:
+        return None
+
+    flags: list[str] = []
+    position = 0
+    if item_str.startswith("("):
+        flags_token, position = _read_imap_list_token(item_str, position)
+        flags = [flag.strip() for flag in (flags_token or "").split() if flag.strip()]
+
+    delimiter_token, position = _read_imap_list_token(item_str, position)
+    mailbox_token, _position = _read_imap_list_token(item_str, position)
+    if delimiter_token is None or mailbox_token is None:
+        return None
+
+    delimiter = "" if delimiter_token.upper() == "NIL" else delimiter_token
+    return MailboxInfo(name=decode_mailbox_name(mailbox_token), delimiter=delimiter, flags=flags)
+
+
 def _quote_mailbox(mailbox: str) -> str:
     """Quote mailbox name for IMAP compatibility.
 
@@ -125,14 +295,71 @@ def _quote_mailbox(mailbox: str) -> str:
 
     Per RFC 3501 Section 9 (Formal Syntax), quoted strings must escape
     backslashes and double-quote characters with a preceding backslash.
+    Mailbox names with non-ASCII characters are encoded using Modified UTF-7
+    as required by RFC 3501 Section 5.1.3.
 
     See: https://github.com/ai-zerolab/mcp-email-server/issues/87
+    See: https://github.com/ai-zerolab/mcp-email-server/issues/172
     See: https://www.rfc-editor.org/rfc/rfc3501#section-9
     """
+    encoded = encode_mailbox_name(mailbox)
     # Per RFC 3501, literal double-quote characters in a quoted string must
     # be escaped with a backslash. Backslashes themselves must also be escaped.
-    escaped = mailbox.replace("\\", "\\\\").replace('"', r"\"")
+    escaped = encoded.replace("\\", "\\\\").replace('"', r"\"")
     return f'"{escaped}"'
+
+
+def _uid_sort_key(uid: bytes | str) -> int:
+    """Return a numeric sort key for IMAP UIDs."""
+    value = uid.decode() if isinstance(uid, bytes) else uid
+    return int(value)
+
+
+def _imap_status(response: Any) -> str:
+    """Return the normalized status from an aioimaplib response."""
+    if hasattr(response, "result"):
+        return str(response.result).upper()
+    if isinstance(response, tuple) and response:
+        return str(response[0]).upper()
+    return str(response).upper()
+
+
+def _format_imap_response_detail(response: Any) -> str:
+    """Return a compact, readable IMAP response detail string."""
+    status = _imap_status(response)
+    lines = getattr(response, "lines", None)
+    if lines is None and isinstance(response, tuple) and len(response) > 1:
+        lines = response[1]
+
+    detail_parts = []
+    for line in lines or []:
+        if isinstance(line, bytes):
+            detail_parts.append(line.decode("utf-8", errors="replace"))
+        else:
+            detail_parts.append(str(line))
+
+    detail = " ".join(part for part in detail_parts if part).strip()
+    return f"{status} {detail}".strip()
+
+
+def _raise_for_imap_error(response: Any, operation: str) -> None:
+    """Raise when an IMAP command returns a non-OK status."""
+    if _imap_status(response) != "OK":
+        detail = _format_imap_response_detail(response)
+        msg = f"{operation} failed" + (f": {detail}" if detail else "")
+        raise RuntimeError(msg)
+
+
+def _html_to_text(html: str) -> str:
+    """Convert an HTML email body to readable plain text."""
+    soup = BeautifulSoup(html, "html.parser")
+    for element in soup(["script", "style"]):
+        element.decompose()
+
+    text = soup.get_text(separator="\n")
+    text = re.sub(r"\n\s*\n", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
 
 
 async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
@@ -152,15 +379,51 @@ async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
         if response.result != "OK":
             # Fallback for strict servers (e.g., 163.com)
             # Send raw command with correct parenthesis format
+            new_tag = imap.protocol.new_tag()
+            if hasattr(new_tag, "__await__"):
+                new_tag = await new_tag
             await imap.protocol.execute(
                 aioimaplib.Command(
                     "ID",
-                    imap.protocol.new_tag(),
+                    new_tag,
                     '("name" "mcp-email-server" "version" "1.0.0")',
                 )
             )
     except Exception as e:
         logger.warning(f"IMAP ID command failed: {e!s}")
+
+
+async def _imap_login(
+    imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
+    user_name: str,
+    password: str,
+) -> None:
+    """Authenticate to IMAP and fail loudly when the server rejects credentials.
+
+    aioimaplib's ``login()`` returns a Response with a ``.result`` of "OK",
+    "NO", or "BAD". A "NO" response (e.g. wrong credentials, account locked,
+    or a transient rate-limit cool-down on servers like Proton Mail Bridge)
+    does NOT raise — and an unchecked caller will happily proceed to issue
+    SELECT/FETCH on a NONAUTH connection, producing the misleading error
+    ``command SELECT illegal in state NONAUTH``. Worse, each tool call then
+    opens a fresh TCP connection and re-attempts ``LOGIN``, which amplifies
+    rate-limits on servers that count failed-login attempts and locks the
+    account out for tens of minutes.
+
+    Raise immediately on a non-OK result so callers (and end users) see the
+    real error and back off, and so a one-off auth failure does not cascade
+    into a multi-minute lock-out.
+    """
+    response = await imap.login(user_name, password)
+    if response.result == "OK":
+        return
+    detail = " ".join(
+        line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
+        for line in (response.lines or [])
+    ).strip()
+    raise ConnectionError(
+        f"IMAP login failed for {user_name!r}: {response.result}" + (f" ({detail})" if detail else "")
+    )
 
 
 def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
@@ -320,6 +583,52 @@ def _format_forwarded_email_html(original_email: dict[str, Any]) -> str:
     )
 
 
+def _create_starttls_ssl_context(verify_ssl: bool) -> ssl.SSLContext:
+    """Create a concrete SSL context for asyncio STARTTLS upgrades."""
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    if not verify_ssl:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _imap_capabilities(imap: aioimaplib.IMAP4) -> set[str]:
+    """Return normalized capabilities from an aioimaplib protocol."""
+    return {
+        capability.decode("utf-8", errors="replace").upper()
+        if isinstance(capability, bytes)
+        else str(capability).upper()
+        for capability in getattr(imap.protocol, "capabilities", ())
+    }
+
+
+async def _imap_starttls(imap: aioimaplib.IMAP4, ssl_context: ssl.SSLContext, host: str) -> None:
+    """Upgrade an IMAP connection to TLS via STARTTLS."""
+    capabilities = _imap_capabilities(imap)
+    if "STARTTLS" not in capabilities:
+        await imap.protocol.capability()
+        capabilities = _imap_capabilities(imap)
+    if "STARTTLS" not in capabilities:
+        raise OSError("IMAP server does not advertise STARTTLS capability")
+
+    response = await imap.protocol.execute(
+        aioimaplib.Command("STARTTLS", imap.protocol.new_tag(), loop=imap.protocol.loop)
+    )
+    status = _imap_status(response)
+    if status != "OK":
+        raise OSError(f"STARTTLS command failed: {status}")
+
+    loop = asyncio.get_running_loop()
+    tls_transport = await loop.start_tls(
+        imap.protocol.transport,
+        imap.protocol,
+        ssl_context,
+        server_hostname=host,
+    )
+    imap.protocol.transport = tls_transport
+    await imap.protocol.capability()
+
+
 # Backwards-compatible alias
 _create_smtp_ssl_context = _create_ssl_context
 
@@ -338,11 +647,15 @@ class EmailClient:
     def _imap_connect(self, server: "EmailServer | None" = None) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
         """Create a new IMAP connection with the configured SSL context."""
         srv = server or self.email_server
+        # Use self.imap_class (patchable in tests) for the primary server;
+        # reconstruct for credential overrides that may differ in SSL mode.
+        if srv is self.email_server:
+            imap_cls = self.imap_class
+        else:
+            imap_cls = aioimaplib.IMAP4_SSL if srv.use_ssl else aioimaplib.IMAP4
         if srv.use_ssl:
             imap_ssl_context = _create_ssl_context(srv.verify_ssl)
-            imap_cls = aioimaplib.IMAP4_SSL if srv.use_ssl else aioimaplib.IMAP4
             return imap_cls(srv.host, srv.port, ssl_context=imap_ssl_context)
-        imap_cls = aioimaplib.IMAP4_SSL if srv.use_ssl else aioimaplib.IMAP4
         return imap_cls(srv.host, srv.port)
 
     @asynccontextmanager
@@ -376,6 +689,37 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
+    async def _connect_imap(self) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
+        """Create, greet, and optionally STARTTLS-upgrade an IMAP connection."""
+        imap = self._imap_connect()
+        return await self._prepare_imap_connection(imap, self.email_server)
+
+    @staticmethod
+    async def _prepare_imap_connection(
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        server: EmailServer,
+    ) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
+        """Wait for greeting and optionally STARTTLS-upgrade an IMAP connection."""
+        await imap._client_task
+        await imap.wait_hello_from_server()
+
+        if server.start_ssl:
+            ssl_context = _create_starttls_ssl_context(server.verify_ssl)
+            await _imap_starttls(imap, ssl_context, server.host)
+
+        return imap
+
+    @staticmethod
+    async def _connect_imap_server(server: EmailServer) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
+        """Create, greet, and optionally STARTTLS-upgrade an IMAP connection."""
+        if server.use_ssl:
+            imap_ssl_context = _create_ssl_context(server.verify_ssl)
+            imap = aioimaplib.IMAP4_SSL(server.host, server.port, ssl_context=imap_ssl_context)
+        else:
+            imap = aioimaplib.IMAP4(server.host, server.port)
+
+        return await EmailClient._prepare_imap_connection(imap, server)
+
     def _get_smtp_ssl_context(self) -> ssl.SSLContext | None:
         """Get SSL context for SMTP connections based on verify_ssl setting."""
         return _create_ssl_context(self.smtp_verify_ssl)
@@ -402,6 +746,38 @@ class EmailClient:
             return datetime.now(timezone.utc)
         except Exception:
             return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _normalize_attachment_name(name: str) -> str:
+        """Normalize attachment filenames for robust MIME round-trip matching."""
+        return unicodedata.normalize("NFC", name)
+
+    @staticmethod
+    def _is_attachment_part(part) -> bool:
+        """Determine whether a MIME part should be treated as an attachment.
+
+        A strict check on ``Content-Disposition: attachment`` misses a common case:
+        many clients (notably Apple Mail on iOS/macOS) send images, PDFs and other
+        files with ``Content-Disposition: inline`` (or no disposition header at all)
+        but with a filename parameter on the part. Those parts are real, user-facing
+        attachments — the user uploaded a file and expects it to show up — even
+        though they're inlined into the body via Content-ID references.
+
+        Treat a part as an attachment when:
+          - the disposition explicitly says ``attachment``, OR
+          - the part carries a filename (works for ``inline`` or no disposition).
+
+        Multipart container parts and bodyless text parts have no filename and an
+        empty disposition, so they are correctly excluded.
+        """
+        content_disposition = str(part.get("Content-Disposition", "")).lower()
+        if "attachment" in content_disposition:
+            return True
+        filename = part.get_filename()
+        # Be defensive: only trust real string filenames. (Unconfigured MagicMock
+        # instances in older tests return truthy MagicMock objects from
+        # ``get_filename`` and would otherwise misclassify text parts.)
+        return isinstance(filename, str) and bool(filename)
 
     def _parse_email_data(  # noqa: C901
         self,
@@ -430,33 +806,14 @@ class EmailClient:
         html_body = ""
         attachments = []
 
-        def _strip_html(html: str) -> str:
-            """Simple HTML to text conversion."""
-            import re
-
-            # Remove script and style elements
-            text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
-            # Convert common block elements to newlines
-            text = re.sub(r"<(br|p|div|tr|li)[^>]*/?>", "\n", text, flags=re.IGNORECASE)
-            # Remove all remaining HTML tags
-            text = re.sub(r"<[^>]+>", "", text)
-            # Decode common HTML entities
-            text = text.replace("&nbsp;", " ").replace("&amp;", "&")
-            text = text.replace("&lt;", "<").replace("&gt;", ">")
-            text = text.replace("&quot;", '"').replace("&#39;", "'")
-            # Collapse multiple newlines and whitespace
-            text = re.sub(r"\n\s*\n", "\n\n", text)
-            text = re.sub(r" +", " ", text)
-            return text.strip()
-
         if email_message.is_multipart():
             html_body = ""
             for part in email_message.walk():
                 content_type = part.get_content_type()
-                content_disposition = str(part.get("Content-Disposition", ""))
 
-                # Handle attachments
-                if "attachment" in content_disposition:
+                # Handle attachments — including inline-disposition parts with a
+                # filename (Apple Mail commonly sends photos this way).
+                if self._is_attachment_part(part):
                     filename = part.get_filename()
                     if filename:
                         attachments.append(filename)
@@ -568,7 +925,13 @@ class EmailClient:
         return search_criteria or ["ALL"]
 
     def _parse_headers(self, email_id: str, raw_headers: bytes) -> dict[str, Any] | None:
-        """Parse raw email headers into metadata dictionary."""
+        """Parse raw email headers into metadata dictionary.
+
+        Note: this parses only header data (BODY.PEEK[HEADER]) so it cannot
+        populate the attachments list — that requires fetching BODYSTRUCTURE
+        or the full body. The attachments list is intentionally returned
+        empty here; ``_parse_email_data`` populates it from the full body.
+        """
         try:
             parser = BytesParser(policy=default)
             email_message = parser.parsebytes(raw_headers)
@@ -576,12 +939,15 @@ class EmailClient:
             subject = email_message.get("Subject", "")
             sender = email_message.get("From", "")
             date_str = email_message.get("Date", "")
+            # Expose Message-ID for reply threading and de-duplication on the client.
+            message_id = email_message.get("Message-ID")
 
             to_addresses = self._parse_recipients(email_message)
             date = self._parse_date(date_str)
 
             return {
                 "email_id": email_id,
+                "message_id": message_id,
                 "subject": subject,
                 "from": sender,
                 "to": to_addresses,
@@ -598,11 +964,15 @@ class EmailClient:
         chunk: list[bytes],
         chunk_num: int,
         total_chunks: int,
+        timeout: float = 30.0,
     ) -> dict[str, datetime]:
         """Fetch INTERNALDATE for a single chunk of UIDs."""
         uid_list = ",".join(uid.decode() for uid in chunk)
         chunk_start = time.perf_counter()
-        _, data = await imap.uid("fetch", uid_list, "(INTERNALDATE)")
+        _, data = await asyncio.wait_for(
+            imap.uid("fetch", uid_list, "(INTERNALDATE)"),
+            timeout=timeout,
+        )
         chunk_elapsed = time.perf_counter() - chunk_start
 
         chunk_dates: dict[str, datetime] = {}
@@ -625,9 +995,15 @@ class EmailClient:
         self,
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
         email_ids: list[bytes],
-        chunk_size: int = 5000,
+        chunk_size: int = 500,
     ) -> dict[str, datetime]:
-        """Batch fetch INTERNALDATE for all UIDs in parallel chunks."""
+        """Batch fetch INTERNALDATE for all UIDs in sequential chunks.
+
+        Uses a conservative chunk_size (default 500) to avoid hitting
+        Python's recursion limit in aioimaplib's recursive response parser
+        (see: aioimaplib _handle_responses). IMAP connections are sequential
+        by protocol, so chunks must be fetched serially — not in parallel.
+        """
         if not email_ids:
             return {}
 
@@ -635,15 +1011,10 @@ class EmailClient:
         chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
         total_chunks = len(chunks)
 
-        # Fetch all chunks in parallel
-        tasks = [
-            self._fetch_dates_chunk(imap, chunk, chunk_num, total_chunks) for chunk_num, chunk in enumerate(chunks, 1)
-        ]
-        results = await asyncio.gather(*tasks)
-
-        # Merge results
+        # Fetch chunks sequentially (IMAP protocol is sequential on a single connection)
         uid_dates: dict[str, datetime] = {}
-        for chunk_dates in results:
+        for chunk_num, chunk in enumerate(chunks, 1):
+            chunk_dates = await self._fetch_dates_chunk(imap, chunk, chunk_num, total_chunks)
             uid_dates.update(chunk_dates)
 
         return uid_dates
@@ -687,33 +1058,6 @@ class EmailClient:
 
         return results
 
-    async def get_email_count(
-        self,
-        before: datetime | None = None,
-        since: datetime | None = None,
-        subject: str | None = None,
-        from_address: str | None = None,
-        to_address: str | None = None,
-        mailbox: str = DEFAULT_MAILBOX,
-        seen: bool | None = None,
-        flagged: bool | None = None,
-        answered: bool | None = None,
-    ) -> int:
-        async with self._imap_connection(mailbox) as imap:
-            search_criteria = self._build_search_criteria(
-                before,
-                since,
-                subject,
-                from_address=from_address,
-                to_address=to_address,
-                seen=seen,
-                flagged=flagged,
-                answered=answered,
-            )
-            logger.info(f"Count: Search criteria: {search_criteria}")
-            _, messages = await imap.uid_search(*search_criteria)
-            return len(messages[0].split())
-
     async def get_emails_metadata_page(
         self,
         page: int = 1,
@@ -749,8 +1093,12 @@ class EmailClient:
             )
             logger.info(f"Get metadata: Search criteria: {search_criteria}")
 
-            # Search for messages - use UID SEARCH for better compatibility
-            _, messages = await imap.uid_search(*search_criteria)
+            # Search for messages - use UID SEARCH for better compatibility.
+            # charset=None: aioimaplib defaults to "CHARSET utf-8", which Microsoft
+            # Exchange rejects with `NO [BADCHARSET (US-ASCII)] The specified charset
+            # is not supported.`, breaking all search/list operations. Omitting the
+            # CHARSET token works on Exchange and is harmless on other servers.
+            _, messages = await imap.uid_search(*search_criteria, charset=None)
 
             # Handle empty or None responses
             if not messages or not messages[0]:
@@ -764,7 +1112,7 @@ class EmailClient:
             # Normalize byte UIDs to strings once for use throughout
             str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in raw_ids]
 
-            # Phase 1: Batch fetch INTERNALDATE for sorting (parallel chunks)
+            # Phase 1: Batch fetch INTERNALDATE for sorting (sequential chunks)
             fetch_dates_start = time.perf_counter()
             uid_dates = await self._batch_fetch_dates(imap, raw_ids)
             fetch_dates_elapsed = time.perf_counter() - fetch_dates_start
@@ -840,12 +1188,14 @@ class EmailClient:
         return None
 
     async def _fetch_email_with_formats(self, imap, email_id: str) -> list | None:
-        """Try different fetch formats to get email data."""
-        fetch_formats = ["BODY.PEEK[]", "(BODY.PEEK[])", "RFC822", "BODY[]"]
+        """Try non-mutating fetch formats to get email data."""
+        fetch_formats = ["BODY.PEEK[]", "(BODY.PEEK[])"]
 
         for fetch_format in fetch_formats:
             try:
-                _, data = await imap.uid("fetch", email_id, fetch_format)
+                response = await imap.uid("fetch", email_id, fetch_format)
+                _raise_for_imap_error(response, f"FETCH email {email_id} with {fetch_format}")
+                _, data = response
 
                 if data and len(data) > 0 and self._check_email_content(data):
                     return data
@@ -856,8 +1206,13 @@ class EmailClient:
         return None
 
     async def get_email_body_by_id(
-        self, email_id: str, mailbox: str = DEFAULT_MAILBOX, max_body_length: int | None = MAX_BODY_LENGTH
+        self,
+        email_id: str,
+        mailbox: str = DEFAULT_MAILBOX,
+        max_body_length: int | None = MAX_BODY_LENGTH,
+        mark_as_read: bool = False,
     ) -> dict[str, Any] | None:
+        # Fetch the specific email by UID without implicitly marking it as read
         async with self._imap_connection(mailbox) as imap:
             data = await self._fetch_email_with_formats(imap, email_id)
             if not data:
@@ -870,10 +1225,19 @@ class EmailClient:
                 return None
 
             try:
-                return self._parse_email_data(raw_email, email_id, max_body_length=max_body_length)
+                email_data = self._parse_email_data(raw_email, email_id, max_body_length=max_body_length)
             except Exception as e:
                 logger.error(f"Error parsing email: {e!s}")
                 return None
+
+            if mark_as_read:
+                try:
+                    store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Seen)")
+                    _raise_for_imap_error(store_response, f"STORE \\Seen for email {email_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to mark email {email_id} as read: {e}")
+
+            return email_data
 
     async def download_attachment(
         self,
@@ -882,7 +1246,17 @@ class EmailClient:
         save_path: str,
         mailbox: str = DEFAULT_MAILBOX,
     ) -> dict[str, Any]:
-        """Download a specific attachment from an email and save it to disk."""
+        """Download a specific attachment from an email and save it to disk.
+
+        Args:
+            email_id: The UID of the email containing the attachment.
+            attachment_name: The filename of the attachment to download.
+            save_path: The local path where the attachment will be saved.
+            mailbox: The mailbox to search in (default: "INBOX").
+
+        Returns:
+            A dictionary with download result information.
+        """
         async with self._imap_connection(mailbox) as imap:
             data = await self._fetch_email_with_formats(imap, email_id)
             if not data:
@@ -902,16 +1276,21 @@ class EmailClient:
             # Find the attachment
             attachment_data = None
             mime_type = None
+            normalized_attachment_name = self._normalize_attachment_name(attachment_name)
 
             if email_message.is_multipart():
                 for part in email_message.walk():
-                    content_disposition = str(part.get("Content-Disposition", ""))
-                    if "attachment" in content_disposition:
-                        filename = part.get_filename()
-                        if filename == attachment_name:
-                            attachment_data = part.get_payload(decode=True)
-                            mime_type = part.get_content_type()
-                            break
+                    # Match attachments listed by ``_parse_email_data`` — this includes
+                    # inline-disposition parts with a filename (e.g. iOS Mail photos).
+                    if not self._is_attachment_part(part):
+                        continue
+                    filename = part.get_filename()
+                    if not isinstance(filename, str):
+                        continue
+                    if self._normalize_attachment_name(filename) == normalized_attachment_name:
+                        attachment_data = part.get_payload(decode=True)
+                        mime_type = part.get_content_type()
+                        break
 
             if attachment_data is None:
                 msg = f"Attachment '{attachment_name}' not found in email {email_id}"
@@ -1016,7 +1395,7 @@ class EmailClient:
 
         return msg
 
-    async def send_email(
+    def compose_message(
         self,
         recipients: list[str],
         subject: str,
@@ -1028,7 +1407,20 @@ class EmailClient:
         in_reply_to: str | None = None,
         references: str | None = None,
         extra_parts: list[MIMEApplication] | None = None,
-    ):
+        include_bcc_header: bool = False,
+        reply_to: str | None = None,
+    ) -> MIMEText | MIMEMultipart:
+        """Compose an email message without sending it.
+
+        Builds MIME structure, sets headers (Subject, From, To, Cc, Date,
+        Message-Id, threading headers). Synchronous — no I/O.
+
+        When ``include_bcc_header`` is True (used for local IMAP storage such
+        as Drafts or Sent copies), the Bcc header is included so mail clients
+        can display the BCC recipients.  When False (default, used for SMTP
+        sending), the Bcc header is omitted — BCC recipients are delivered
+        via the SMTP envelope only.
+        """
         # Convert body to HTML unless it's already raw HTML
         if not html:
             body = markdown_to_email_html(body, wrap_in_html=True)
@@ -1062,20 +1454,52 @@ class EmailClient:
         if cc:
             msg["Cc"] = ", ".join(cc)
 
+        # Add BCC header when saving locally (drafts, sent copies)
+        if bcc and include_bcc_header:
+            msg["Bcc"] = ", ".join(bcc)
+
         # Set threading headers for replies
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
         if references:
             msg["References"] = references
+        if reply_to:
+            msg["Reply-To"] = reply_to
 
-        # Set Date and Message-Id headers so the same values appear in both
-        # the SMTP-sent copy and the IMAP Sent folder copy
+        # Set Date and Message-Id headers
         msg["Date"] = email.utils.formatdate(localtime=True)
         sender_domain = self.sender.rsplit("@", 1)[-1].rstrip(">")
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
 
-        # Note: BCC recipients are not added to headers (they remain hidden)
-        # but will be included in the actual recipients for SMTP delivery
+        return msg
+
+    async def send_email(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        reply_to: str | None = None,
+        extra_parts: list[MIMEApplication] | None = None,
+    ) -> MIMEText | MIMEMultipart:
+        msg = self.compose_message(
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            extra_parts=extra_parts,
+            reply_to=reply_to,
+        )
 
         async with aiosmtplib.SMTP(
             hostname=self.email_server.host,
@@ -1113,17 +1537,10 @@ class EmailClient:
 
             # Search for folder with \Sent flag
             for folder in folders:
-                folder_str = folder.decode("utf-8") if isinstance(folder, bytes) else str(folder)
-                # IMAP LIST response format: (flags) "delimiter" "name"
-                # Example: (\Sent \HasNoChildren) "/" "Gesendete Objekte"
-                if r"\Sent" in folder_str or "\\Sent" in folder_str:
-                    # Extract folder name from the response
-                    # Split by quotes and get the last quoted part
-                    parts = folder_str.split('"')
-                    if len(parts) >= 3:
-                        folder_name = parts[-2]  # The folder name is the second-to-last quoted part
-                        logger.info(f"Found Sent folder by \\Sent flag: '{folder_name}'")
-                        return folder_name
+                mailbox = _parse_list_response(folder)
+                if mailbox and r"\Sent" in mailbox.flags:
+                    logger.info(f"Found Sent folder by \\Sent flag: '{mailbox.name}'")
+                    return mailbox.name
         except Exception as e:
             logger.debug(f"Error finding Sent folder by flag: {e}")
 
@@ -1185,6 +1602,8 @@ class EmailClient:
                 logger.warning("Could not find a valid Sent folder to save the message")
                 return False
 
+        except ConnectionError:
+            raise
         except Exception as e:
             logger.error(f"Error saving to Sent folder: {e}")
             return False
@@ -1210,6 +1629,66 @@ class EmailClient:
                 logger.error(f"Failed to {op_name} email {email_id}: {e}")
                 failed.append(email_id)
         return succeeded, failed
+
+    async def append_to_mailbox(
+        self,
+        msg: MIMEText | MIMEMultipart,
+        incoming_server: EmailServer,
+        mailbox: str,
+        flags: str = r"(\Draft \Seen)",
+    ) -> str | None:
+        """Append a message to the specified IMAP folder.
+
+        Unlike append_to_sent, this targets a single user-specified mailbox
+        without folder discovery. Returns the IMAP UID of the appended message
+        (if the server supports APPENDUID / RFC 4315), or ``"unknown"`` on
+        success without UID, or ``None`` on failure.
+        """
+        imap = await self._connect_imap_server(incoming_server)
+
+        try:
+            await _imap_login(imap, incoming_server.user_name, incoming_server.password.get_secret_value())
+            await _send_imap_id(imap)
+
+            result = await imap.select(_quote_mailbox(mailbox))
+            status = result[0] if isinstance(result, tuple) else result
+            if str(status).upper() != "OK":
+                logger.warning(f"Mailbox '{mailbox}' not found or not selectable: {status}")
+                return None
+
+            msg_bytes = msg.as_bytes()
+            append_result = await imap.append(
+                msg_bytes,
+                mailbox=_quote_mailbox(mailbox),
+                flags=flags,
+            )
+            append_status = append_result[0] if isinstance(append_result, tuple) else append_result
+            if str(append_status).upper() == "OK":
+                # Try to extract UID from APPENDUID response (RFC 4315)
+                uid = None
+                if isinstance(append_result, tuple) and len(append_result) > 1:
+                    for part in append_result[1]:
+                        part_str = part.decode("utf-8") if isinstance(part, bytes) else str(part)
+                        match = re.search(r"APPENDUID\s+\d+\s+(\d+)", part_str, re.IGNORECASE)
+                        if match:
+                            uid = match.group(1)
+                            break
+                logger.info(f"Saved email to '{mailbox}'" + (f" (UID {uid})" if uid else ""))
+                return uid or "unknown"
+            else:
+                logger.warning(f"Failed to append to '{mailbox}': {append_status}")
+                return None
+
+        except ConnectionError:
+            raise
+        except Exception as e:
+            logger.error(f"Error saving to mailbox '{mailbox}': {e}")
+            return None
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.debug(f"Error during logout: {e}")
 
     async def delete_emails(self, email_ids: list[str], mailbox: str = DEFAULT_MAILBOX) -> tuple[list[str], list[str]]:
         """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""
@@ -1287,50 +1766,6 @@ class EmailClient:
                     raise RuntimeError(f"COPY failed: {result}")
 
             return await self._batch_uid_operation(imap, email_ids, _op, "copy")
-
-    async def move_emails(
-        self,
-        email_ids: list[str],
-        destination_folder: str,
-        source_mailbox: str = DEFAULT_MAILBOX,
-    ) -> tuple[list[str], list[str]]:
-        """Move emails to a destination folder. Returns (moved_ids, failed_ids).
-
-        Attempts to use MOVE command first (RFC 6851), falls back to COPY + DELETE.
-        """
-        moved_ids = []
-        failed_ids = []
-
-        async with self._imap_connection(source_mailbox) as imap:
-            for email_id in email_ids:
-                try:
-                    # Try MOVE command first (RFC 6851)
-                    try:
-                        result = await imap.uid("move", email_id, _quote_mailbox(destination_folder))
-                        if _is_ok(result):
-                            moved_ids.append(email_id)
-                            logger.debug(f"Moved email {email_id} to {destination_folder} using MOVE")
-                            continue
-                    except Exception as move_error:
-                        logger.debug(f"MOVE command failed, falling back to COPY+DELETE: {move_error}")
-
-                    # Fallback: COPY + mark as deleted
-                    copy_result = await imap.uid("copy", email_id, _quote_mailbox(destination_folder))
-                    if _is_ok(copy_result):
-                        await imap.uid("store", email_id, "+FLAGS", IMAP_FLAG_DELETED)
-                        moved_ids.append(email_id)
-                        logger.debug(f"Moved email {email_id} to {destination_folder} using COPY+DELETE")
-                    else:
-                        logger.error(f"Failed to copy email {email_id}: {copy_result}")
-                        failed_ids.append(email_id)
-                except Exception as e:
-                    logger.error(f"Failed to move email {email_id}: {e}")
-                    failed_ids.append(email_id)
-
-            if moved_ids:
-                await imap.expunge()
-
-        return moved_ids, failed_ids
 
     async def create_folder(self, folder_name: str) -> tuple[bool, str]:
         """Create a new folder. Returns (success, message)."""
@@ -1490,14 +1925,121 @@ class EmailClient:
         """Delete emails from a specific folder. Returns (deleted_ids, failed_ids)."""
         return await self.delete_emails(email_ids, folder)
 
+    async def mark_emails_as_read(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
+        """Mark emails as read by setting the \\Seen flag. Returns (marked_ids, failed_ids)."""
+        imap = await self._connect_imap()
+        marked_ids: list[str] = []
+        failed_ids: list[str] = []
+
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+
+            for email_id in email_ids:
+                try:
+                    store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Seen)")
+                    _raise_for_imap_error(store_response, f"STORE \\Seen for email {email_id}")
+                    marked_ids.append(email_id)
+                except Exception as e:
+                    logger.error(f"Failed to mark email {email_id} as read: {e}")
+                    failed_ids.append(email_id)
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
+        return marked_ids, failed_ids
+
+    async def move_emails(
+        self, email_ids: list[str], source_mailbox: str, destination_mailbox: str
+    ) -> tuple[list[str], list[str]]:
+        """Move emails to a different mailbox. Uses IMAP MOVE (RFC 6851) with COPY+DELETE fallback."""
+        imap = await self._connect_imap()
+        moved_ids = []
+        failed_ids = []
+
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(source_mailbox))
+            _raise_for_imap_error(select_response, f"SELECT source mailbox {source_mailbox}")
+
+            capabilities = {str(capability).upper() for capability in getattr(imap, "capabilities", ())}
+            has_move = hasattr(imap, "move") and "MOVE" in capabilities
+
+            for email_id in email_ids:
+                try:
+                    if has_move:
+                        move_response = await imap.uid("move", email_id, _quote_mailbox(destination_mailbox))
+                        _raise_for_imap_error(move_response, f"MOVE email {email_id}")
+                    else:
+                        copy_response = await imap.uid("copy", email_id, _quote_mailbox(destination_mailbox))
+                        _raise_for_imap_error(copy_response, f"COPY email {email_id}")
+                        store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
+                        _raise_for_imap_error(store_response, f"STORE \\Deleted for email {email_id}")
+                    moved_ids.append(email_id)
+                except Exception as e:
+                    logger.error(f"Failed to move email {email_id}: {e}")
+                    failed_ids.append(email_id)
+
+            if not has_move and moved_ids:
+                try:
+                    expunge_response = await imap.expunge()
+                    _raise_for_imap_error(expunge_response, "EXPUNGE moved emails")
+                except Exception as e:
+                    logger.error(f"Failed to expunge moved emails: {e}")
+                    failed_ids.extend(moved_ids)
+                    moved_ids = []
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
+        return moved_ids, failed_ids
+
+    async def list_mailboxes(self, pattern: str = "*", reference: str = "") -> list[MailboxInfo]:
+        """List available IMAP mailboxes with flags and delimiter."""
+        imap = await self._connect_imap()
+        mailboxes = []
+
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+
+            quoted_ref = _quote_mailbox(reference) if reference else '""'
+            quoted_pattern = _quote_mailbox(pattern)
+            response = await imap.list(quoted_ref, quoted_pattern)
+            _raise_for_imap_error(response, f"LIST mailboxes with pattern {pattern}")
+            _, data = response
+
+            for item in data:
+                mailbox = _parse_list_response(item)
+                if mailbox:
+                    mailboxes.append(mailbox)
+        finally:
+            try:
+                await imap.logout()
+            except Exception as e:
+                logger.info(f"Error during logout: {e}")
+
+        return mailboxes
+
 
 class ClassicEmailHandler(EmailHandler):
     def __init__(self, email_settings: EmailSettings):
         self.email_settings = email_settings
         self.incoming_client = EmailClient(email_settings.incoming)
-        self.outgoing_client = EmailClient(
-            email_settings.outgoing,
-            sender=f"{email_settings.full_name} <{email_settings.email_address}>",
+        self.outgoing_client = (
+            EmailClient(
+                email_settings.outgoing,
+                sender=f"{email_settings.full_name} <{email_settings.email_address}>",
+            )
+            if email_settings.outgoing
+            else None
         )
         self.save_to_sent = email_settings.save_to_sent
         self.sent_folder_name = email_settings.sent_folder_name
@@ -1605,7 +2147,11 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         quote_reply: bool = True,
+        reply_to: str | None = None,
     ) -> EmailSendResponse:
+        if self.outgoing_client is None:
+            raise RuntimeError(f"SMTP is not configured for account '{self.email_settings.account_name}'")
+
         # Auto-quote the original message when replying
         if in_reply_to and quote_reply:
             original = await self._fetch_original_for_quote(in_reply_to)
@@ -1620,11 +2166,16 @@ class ClassicEmailHandler(EmailHandler):
                 body += _format_quoted_reply_html(original, service=self.email_service)
 
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references
+            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references, reply_to
         )
 
         # Save to Sent folder if enabled
         if self.save_to_sent and msg:
+            # Add BCC header to the saved copy so users can see who was BCC'd.
+            # This MUST happen after smtp.send_message() — that ordering is
+            # load-bearing for security (BCC must not appear in sent headers).
+            if bcc and msg["Bcc"] is None:
+                msg["Bcc"] = ", ".join(bcc)
             try:
                 await self.outgoing_client.append_to_sent(
                     msg,
@@ -1792,7 +2343,7 @@ class ClassicEmailHandler(EmailHandler):
 
         if trash_folder and not already_in_trash:
             # Move to Trash instead of permanent delete
-            moved_ids, failed_ids = await self.incoming_client.move_emails(email_ids, trash_folder, mailbox)
+            moved_ids, failed_ids = await self.incoming_client.move_emails(email_ids, mailbox, trash_folder)
             return EmailDeleteResponse(
                 success=len(failed_ids) == 0,
                 deleted_ids=moved_ids,
@@ -1821,7 +2372,7 @@ class ClassicEmailHandler(EmailHandler):
                 "(Archive, [Gmail]/All Mail) detected."
             )
 
-        moved_ids, failed_ids = await self.incoming_client.move_emails(email_ids, archive_folder, mailbox)
+        moved_ids, failed_ids = await self.incoming_client.move_emails(email_ids, mailbox, archive_folder)
         return EmailMoveResponse(
             success=len(failed_ids) == 0,
             moved_ids=moved_ids,
@@ -1829,6 +2380,73 @@ class ClassicEmailHandler(EmailHandler):
             source_mailbox=mailbox,
             destination_folder=archive_folder,
         )
+
+    async def save_to_mailbox(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        mailbox: str = "Drafts",
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        flags: list[str] | None = None,
+    ) -> str:
+        """Compose and save an email to the specified IMAP mailbox.
+
+        BCC headers are preserved in the saved message so mail clients can
+        display BCC recipients (unlike ``send_email``, where BCC is handled
+        via the SMTP envelope only).
+
+        Returns:
+            A string in the format ``<message-id>|uid:<uid>``.
+
+        Raises:
+            ValueError: If any flag in *flags* is invalid per RFC 3501.
+            RuntimeError: If the IMAP APPEND operation fails.
+        """
+        if self.outgoing_client is None:
+            raise RuntimeError(f"SMTP is not configured for account '{self.email_settings.account_name}'")
+
+        msg = self.outgoing_client.compose_message(
+            recipients,
+            subject,
+            body,
+            cc,
+            bcc,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            include_bcc_header=True,
+        )
+
+        flags_str = r"(\Draft \Seen)" if flags is None else _validate_flags(flags)
+
+        uid = await self.outgoing_client.append_to_mailbox(msg, self.email_settings.incoming, mailbox, flags_str)
+
+        if uid is None:
+            raise RuntimeError(f"Failed to save email to mailbox '{mailbox}'")
+
+        message_id = msg["Message-Id"] or "saved"
+        return f"{message_id}|uid:{uid}"
+
+    async def mark_emails_as_read(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
+        """Mark emails as read by their UIDs. Returns (marked_ids, failed_ids)."""
+        return await self.incoming_client.mark_emails_as_read(email_ids, mailbox)
+
+    async def move_emails(
+        self, email_ids: list[str], source_mailbox: str, destination_mailbox: str
+    ) -> tuple[list[str], list[str]]:
+        """Move emails between mailboxes. Returns (moved_ids, failed_ids)."""
+        return await self.incoming_client.move_emails(email_ids, source_mailbox, destination_mailbox)
+
+    async def list_mailboxes(self, pattern: str = "*", reference: str = "") -> list[MailboxInfo]:
+        """List available mailboxes with flags and delimiter."""
+        return await self.incoming_client.list_mailboxes(pattern, reference)
 
     async def download_attachment(
         self,
@@ -1861,22 +2479,6 @@ class ClassicEmailHandler(EmailHandler):
         """List all folders/mailboxes for the account."""
         folders = await self.incoming_client.list_folders()
         return FolderListResponse(folders=folders, total=len(folders))
-
-    async def move_emails(
-        self,
-        email_ids: list[str],
-        destination_folder: str,
-        source_mailbox: str = "INBOX",
-    ) -> EmailMoveResponse:
-        """Move emails to a destination folder."""
-        moved_ids, failed_ids = await self.incoming_client.move_emails(email_ids, destination_folder, source_mailbox)
-        return EmailMoveResponse(
-            success=len(failed_ids) == 0,
-            moved_ids=moved_ids,
-            failed_ids=failed_ids,
-            source_mailbox=source_mailbox,
-            destination_folder=destination_folder,
-        )
 
     async def copy_emails(
         self,

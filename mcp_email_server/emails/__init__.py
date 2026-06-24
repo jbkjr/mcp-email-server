@@ -15,6 +15,7 @@ if TYPE_CHECKING:
         FolderListResponse,
         FolderOperationResponse,
         LabelListResponse,
+        MailboxInfo,
     )
 
 
@@ -90,6 +91,7 @@ class EmailHandler(abc.ABC):
         in_reply_to: str | None = None,
         references: str | None = None,
         quote_reply: bool = True,
+        reply_to: str | None = None,
     ) -> "EmailSendResponse":
         """
         Send email
@@ -105,6 +107,7 @@ class EmailHandler(abc.ABC):
             in_reply_to: Message-ID of the email being replied to (for threading).
             references: Space-separated Message-IDs for the thread chain.
             quote_reply: When replying, auto-fetch and append the quoted original message.
+            reply_to: Address to set as Reply-To header (overrides From for replies).
         """
 
     @abc.abstractmethod
@@ -134,6 +137,23 @@ class EmailHandler(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def save_to_mailbox(
+        self,
+        recipients: list[str],
+        subject: str,
+        body: str,
+        mailbox: str = "Drafts",
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        html: bool = False,
+        attachments: list[str] | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+        flags: list[str] | None = None,
+    ) -> str:
+        """Compose an email and save it to the specified IMAP folder via APPEND."""
+
+    @abc.abstractmethod
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> "EmailDeleteResponse":
         """
         Delete emails by their IDs.
@@ -150,6 +170,38 @@ class EmailHandler(abc.ABC):
 
         Returns:
             EmailMoveResponse with operation results.
+        """
+
+    @abc.abstractmethod
+    async def mark_emails_as_read(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
+        """
+        Mark emails as read by their IDs. Returns (marked_ids, failed_ids)
+        """
+
+    @abc.abstractmethod
+    async def move_emails(
+        self, email_ids: list[str], source_mailbox: str, destination_mailbox: str
+    ) -> tuple[list[str], list[str]]:
+        """
+        Move emails between mailboxes. Returns (moved_ids, failed_ids)
+
+        Args:
+            email_ids: List of email UIDs to move.
+            source_mailbox: The mailbox to move emails from.
+            destination_mailbox: The mailbox to move emails to.
+        """
+
+    @abc.abstractmethod
+    async def list_mailboxes(self, pattern: str = "*", reference: str = "") -> list["MailboxInfo"]:
+        """
+        List available mailboxes/folders in the account.
+
+        Args:
+            pattern: IMAP LIST pattern (e.g., "*" for all, "INBOX.*" for INBOX children).
+            reference: IMAP LIST reference name (namespace prefix).
+
+        Returns:
+            List of MailboxInfo with name, delimiter, and flags.
         """
 
     @abc.abstractmethod
@@ -180,25 +232,6 @@ class EmailHandler(abc.ABC):
 
         Returns:
             FolderListResponse with list of folders and their metadata.
-        """
-
-    @abc.abstractmethod
-    async def move_emails(
-        self,
-        email_ids: list[str],
-        destination_folder: str,
-        source_mailbox: str = "INBOX",
-    ) -> "EmailMoveResponse":
-        """
-        Move emails to a destination folder.
-
-        Args:
-            email_ids: List of email UIDs to move.
-            destination_folder: The target folder name.
-            source_mailbox: The source mailbox (default: "INBOX").
-
-        Returns:
-            EmailMoveResponse with operation results.
         """
 
     @abc.abstractmethod

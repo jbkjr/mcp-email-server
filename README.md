@@ -73,8 +73,9 @@ You can also configure the email server using environment variables, which is pa
 | `MCP_EMAIL_SERVER_IMAP_HOST`                  | IMAP server host                                       | -             | Yes      |
 | `MCP_EMAIL_SERVER_IMAP_PORT`                  | IMAP server port                                       | `993`         | No       |
 | `MCP_EMAIL_SERVER_IMAP_SSL`                   | Enable IMAP SSL                                        | `true`        | No       |
+| `MCP_EMAIL_SERVER_IMAP_START_SSL`             | Enable IMAP STARTTLS                                   | `false`       | No       |
 | `MCP_EMAIL_SERVER_IMAP_VERIFY_SSL`            | Verify IMAP SSL certificates (disable for self-signed) | `true`        | No       |
-| `MCP_EMAIL_SERVER_SMTP_HOST`                  | SMTP server host                                       | -             | Yes      |
+| `MCP_EMAIL_SERVER_SMTP_HOST`                  | SMTP server host; omit for read-only mode              | -             | No       |
 | `MCP_EMAIL_SERVER_SMTP_PORT`                  | SMTP server port                                       | `465`         | No       |
 | `MCP_EMAIL_SERVER_SMTP_SSL`                   | Enable SMTP SSL                                        | `true`        | No       |
 | `MCP_EMAIL_SERVER_SMTP_START_SSL`             | Enable STARTTLS                                        | `false`       | No       |
@@ -83,6 +84,57 @@ You can also configure the email server using environment variables, which is pa
 | `MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT`   | Enable folder management tools                         | `false`       | No       |
 | `MCP_EMAIL_SERVER_SAVE_TO_SENT`               | Save sent emails to IMAP Sent folder                   | `true`        | No       |
 | `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`           | Custom Sent folder name (auto-detect if not set)       | -             | No       |
+| `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS`         | Recipient allowlist (comma-separated); empty = all     | -             | No       |
+
+### Read-only IMAP mode
+
+SMTP configuration is optional. When `MCP_EMAIL_SERVER_SMTP_HOST` is omitted, the account runs in read-only mode and exposes only read/mailbox-management tools. Outbound compose tools such as `send_email` and `save_to_mailbox` are hidden when every configured email account is read-only.
+
+```json
+{
+  "mcpServers": {
+    "zerolib-email": {
+      "command": "uvx",
+      "args": ["mcp-email-server@latest", "stdio"],
+      "env": {
+        "MCP_EMAIL_SERVER_EMAIL_ADDRESS": "john@example.com",
+        "MCP_EMAIL_SERVER_PASSWORD": "your_password",
+        "MCP_EMAIL_SERVER_IMAP_HOST": "imap.gmail.com"
+      }
+    }
+  }
+}
+```
+
+### HTTP Transport Security
+
+HTTP transports (`sse` and `streamable-http`) validate request `Host` and `Origin` headers to protect against DNS rebinding attacks. Localhost is allowed by default. For Docker networks or reverse proxies, configure the expected service names explicitly.
+
+| Variable                              | Description                                                      | Default           |
+| ------------------------------------- | ---------------------------------------------------------------- | ----------------- |
+| `MCP_HOST`                            | HTTP bind host for `streamable-http`                             | `localhost`       |
+| `MCP_PORT`                            | HTTP bind port for `streamable-http`                             | `9557`            |
+| `MCP_ALLOWED_HOSTS`                   | Comma-separated allowed `Host` values. Supports `host:*` ports   | Localhost hosts   |
+| `MCP_ALLOWED_ORIGINS`                 | Comma-separated allowed `Origin` values. Supports `host:*` ports | Localhost origins |
+| `MCP_ENABLE_DNS_REBINDING_PROTECTION` | Enable DNS rebinding protection                                  | `true`            |
+
+Docker Compose example:
+
+```yaml
+services:
+  mcp-email-server:
+    image: ghcr.io/ai-zerolab/mcp-email-server:latest
+    command: ["streamable-http"]
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 9557
+      MCP_ALLOWED_HOSTS: mcp-email-server:*,localhost:*,127.0.0.1:*
+      MCP_ALLOWED_ORIGINS: http://mcp-email-server:*,http://localhost:*,http://127.0.0.1:*
+```
+
+Bare host entries such as `MCP_ALLOWED_HOSTS=mcp-email-server` also allow any port on that host. `MCP_ENABLE_DNS_REBINDING_PROTECTION=false`, `MCP_ALLOWED_HOSTS=*`, or `MCP_ALLOWED_ORIGINS=*` disables Host and Origin validation entirely. Use those options only in isolated local development environments.
+
+IPv6 literals in allowlists should use bracketed notation, such as `[::1]:*` and `http://[::1]:*`.
 
 ### Enabling Attachment Downloads
 
@@ -186,9 +238,28 @@ sent_folder_name = "INBOX.Sent"
 
 **To disable saving to Sent folder**, set `MCP_EMAIL_SERVER_SAVE_TO_SENT=false` or `save_to_sent = false` in your TOML config.
 
-### Self-Signed Certificates (e.g., ProtonMail Bridge)
+### Restricting Recipients (Allowlist)
 
-If you're using a local mail server with self-signed certificates (like ProtonMail Bridge), you'll need to disable SSL certificate verification:
+By default the server can send to any address. Set `allowed_recipients` to restrict **both**
+`send_email` and `save_to_mailbox` to a trusted set. Leave it empty (the default) to allow all.
+
+```toml
+allowed_recipients = ["alice@example.com", "bob@example.com"]
+```
+
+Or via environment variable (comma-separated):
+
+```
+MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS="alice@example.com,bob@example.com"
+```
+
+When configured, any To/CC/BCC address not on the list is rejected with a clear error. Matching is
+case-insensitive and understands the `Name <addr@example.com>` form. The `list_allowed_recipients`
+tool appears only when an allowlist is configured, so default installs keep a minimal tool surface.
+
+### Self-Signed Certificates and IMAP STARTTLS (e.g., ProtonMail Bridge)
+
+Local mail bridges such as ProtonMail Bridge commonly use STARTTLS with self-signed certificates. Configure IMAP with plaintext connect plus STARTTLS upgrade, and disable certificate verification for the local bridge certificate:
 
 ```json
 {
@@ -197,6 +268,10 @@ If you're using a local mail server with self-signed certificates (like ProtonMa
       "command": "uvx",
       "args": ["mcp-email-server@latest", "stdio"],
       "env": {
+        "MCP_EMAIL_SERVER_IMAP_HOST": "127.0.0.1",
+        "MCP_EMAIL_SERVER_IMAP_PORT": "1143",
+        "MCP_EMAIL_SERVER_IMAP_SSL": "false",
+        "MCP_EMAIL_SERVER_IMAP_START_SSL": "true",
         "MCP_EMAIL_SERVER_IMAP_VERIFY_SSL": "false",
         "MCP_EMAIL_SERVER_SMTP_VERIFY_SSL": "false"
       }
@@ -213,6 +288,10 @@ account_name = "protonmail"
 # ... other settings ...
 
 [emails.incoming]
+host = "127.0.0.1"
+port = 1143
+use_ssl = false
+start_ssl = true
 verify_ssl = false
 
 [emails.outgoing]
