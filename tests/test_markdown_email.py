@@ -214,7 +214,7 @@ class TestSendEmailWithMarkdown:
 
             # Check body is passed through without markdown wrapping
             payload = message.get_payload(decode=True).decode("utf-8")
-            assert "<p>This is <strong>raw</strong> HTML.</p>" == payload
+            assert payload == "<p>This is <strong>raw</strong> HTML.</p>"
 
     @pytest.mark.asyncio
     async def test_send_email_preserves_unicode(self, email_client):

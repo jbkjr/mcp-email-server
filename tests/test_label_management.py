@@ -18,10 +18,10 @@ from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient
 from mcp_email_server.emails.models import (
     EmailLabelsResponse,
     EmailMoveResponse,
-    Folder,
     FolderOperationResponse,
     Label,
     LabelListResponse,
+    MailboxInfo,
 )
 
 # ============================================================================
@@ -464,16 +464,16 @@ class TestEmailClientLabels:
     async def test_list_labels_filters_labels_prefix(self, email_client):
         """Test list_labels filters only Labels/ prefix folders."""
         mock_folders = [
-            Folder(name="INBOX", delimiter="/", flags=[]),
-            Folder(name="Sent", delimiter="/", flags=[]),
-            Folder(name="Labels/Important", delimiter="/", flags=[]),
-            Folder(name="Labels/Work", delimiter="/", flags=[]),
-            Folder(name="Folders/Archive", delimiter="/", flags=[]),
+            MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+            MailboxInfo(name="Sent", delimiter="/", flags=[]),
+            MailboxInfo(name="Labels/Important", delimiter="/", flags=[]),
+            MailboxInfo(name="Labels/Work", delimiter="/", flags=[]),
+            MailboxInfo(name="Folders/Archive", delimiter="/", flags=[]),
         ]
 
         mock_list = AsyncMock(return_value=mock_folders)
 
-        with patch.object(email_client, "list_folders", mock_list):
+        with patch.object(email_client, "list_mailboxes", mock_list):
             result = await email_client.list_labels()
 
             assert len(result) == 2
@@ -486,13 +486,13 @@ class TestEmailClientLabels:
     async def test_list_labels_empty(self, email_client):
         """Test list_labels returns empty list when no labels exist."""
         mock_folders = [
-            Folder(name="INBOX", delimiter="/", flags=[]),
-            Folder(name="Sent", delimiter="/", flags=[]),
+            MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+            MailboxInfo(name="Sent", delimiter="/", flags=[]),
         ]
 
         mock_list = AsyncMock(return_value=mock_folders)
 
-        with patch.object(email_client, "list_folders", mock_list):
+        with patch.object(email_client, "list_mailboxes", mock_list):
             result = await email_client.list_labels()
 
             assert len(result) == 0
@@ -504,8 +504,8 @@ class TestEmailClientLabels:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(
             return_value=(
                 "OK",
@@ -526,8 +526,8 @@ class TestEmailClientLabels:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         # search returns sequence numbers
         mock_imap.search = AsyncMock(return_value=("OK", [b"1"]))
         # fetch returns UID for the sequence number
@@ -547,8 +547,8 @@ class TestEmailClientLabels:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         # search returns empty when not found
         mock_imap.search = AsyncMock(return_value=("OK", [b""]))
         mock_imap.logout = AsyncMock()
@@ -566,13 +566,13 @@ class TestEmailClientLabelEdgeCases:
     async def test_list_labels_skips_labels_folder_itself(self, email_client):
         """Test that list_labels skips the 'Labels' folder itself if it exists."""
         mock_folders = [
-            Folder(name="Labels", delimiter="/", flags=["\\HasChildren"]),
-            Folder(name="Labels/Important", delimiter="/", flags=[]),
+            MailboxInfo(name="Labels", delimiter="/", flags=["\\HasChildren"]),
+            MailboxInfo(name="Labels/Important", delimiter="/", flags=[]),
         ]
 
         mock_list = AsyncMock(return_value=mock_folders)
 
-        with patch.object(email_client, "list_folders", mock_list):
+        with patch.object(email_client, "list_mailboxes", mock_list):
             result = await email_client.list_labels()
 
             # Should only include "Important", not the "Labels" folder itself

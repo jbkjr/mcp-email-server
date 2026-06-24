@@ -14,7 +14,7 @@ from mcp_email_server.emails.models import (
     EmailMetadata,
     EmailMetadataPageResponse,
     EmailMoveResponse,
-    Folder,
+    MailboxInfo,
 )
 
 
@@ -300,11 +300,11 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_delete_emails(self, classic_handler):
         """Test delete_emails permanently deletes when no Trash folder is detected."""
-        mock_list = AsyncMock(return_value=[Folder(name="INBOX", delimiter="/", flags=[])])
+        mock_list = AsyncMock(return_value=[MailboxInfo(name="INBOX", delimiter="/", flags=[])])
         mock_delete = AsyncMock(return_value=(["123", "456"], []))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
         ):
             result = await classic_handler.delete_emails(
@@ -323,11 +323,11 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_delete_emails_with_failures(self, classic_handler):
         """Test delete_emails permanently deletes from Trash with some failures."""
-        mock_list = AsyncMock(return_value=[Folder(name="Trash", delimiter="/", flags=["\\Trash"])])
+        mock_list = AsyncMock(return_value=[MailboxInfo(name="Trash", delimiter="/", flags=["\\Trash"])])
         mock_delete = AsyncMock(return_value=(["123"], ["456"]))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
         ):
             result = await classic_handler.delete_emails(
@@ -345,11 +345,11 @@ class TestClassicEmailHandler:
     @pytest.mark.asyncio
     async def test_delete_emails_custom_mailbox(self, classic_handler):
         """Test delete_emails permanently deletes from custom mailbox when no Trash detected."""
-        mock_list = AsyncMock(return_value=[Folder(name="INBOX", delimiter="/", flags=[])])
+        mock_list = AsyncMock(return_value=[MailboxInfo(name="INBOX", delimiter="/", flags=[])])
         mock_delete = AsyncMock(return_value=(["789"], []))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
         ):
             result = await classic_handler.delete_emails(
@@ -400,51 +400,6 @@ class TestClassicEmailHandler:
             assert result.marked_ids == ["123"]
             assert result.failed_ids == ["456"]
             assert result.marked_as == "unread"
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read(self, classic_handler):
-        """Test mark_emails_as_read method."""
-        mock_mark = AsyncMock(return_value=(["123", "456"], []))
-
-        with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
-            marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
-                email_ids=["123", "456"],
-                mailbox="INBOX",
-            )
-
-            assert marked_ids == ["123", "456"]
-            assert failed_ids == []
-            mock_mark.assert_called_once_with(["123", "456"], "INBOX")
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_with_failures(self, classic_handler):
-        """Test mark_emails_as_read method with some failures."""
-        mock_mark = AsyncMock(return_value=(["123"], ["456"]))
-
-        with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
-            marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
-                email_ids=["123", "456"],
-                mailbox="INBOX",
-            )
-
-            assert marked_ids == ["123"]
-            assert failed_ids == ["456"]
-            mock_mark.assert_called_once_with(["123", "456"], "INBOX")
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_custom_mailbox(self, classic_handler):
-        """Test mark_emails_as_read method with custom mailbox."""
-        mock_mark = AsyncMock(return_value=(["789"], []))
-
-        with patch.object(classic_handler.incoming_client, "mark_emails_as_read", mock_mark):
-            marked_ids, failed_ids = await classic_handler.mark_emails_as_read(
-                email_ids=["789"],
-                mailbox="Archive",
-            )
-
-            assert marked_ids == ["789"]
-            assert failed_ids == []
-            mock_mark.assert_called_once_with(["789"], "Archive")
 
     @pytest.mark.asyncio
     async def test_download_attachment(self, classic_handler, tmp_path):
@@ -735,94 +690,6 @@ class TestEmailClientGetEmailBodyById:
         assert mock_imap.uid.call_count == 2
 
 
-class TestEmailClientMarkAsRead:
-    """Test EmailClient.mark_emails_as_read with mock IMAP."""
-
-    @pytest.fixture
-    def email_client(self, email_settings):
-        return EmailClient(email_settings.incoming)
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_success(self, email_client, mock_imap):
-        """Test marking emails as read sets \\Seen flag via IMAP STORE."""
-        mock_imap.uid = AsyncMock(return_value=("OK", [b"1 STORE +FLAGS (\\Seen)"]))
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            marked_ids, failed_ids = await email_client.mark_emails_as_read(["123", "456"])
-
-        assert marked_ids == ["123", "456"]
-        assert failed_ids == []
-        assert mock_imap.uid.call_count == 2
-        mock_imap.uid.assert_any_call("store", "123", "+FLAGS", r"(\Seen)")
-        mock_imap.uid.assert_any_call("store", "456", "+FLAGS", r"(\Seen)")
-        mock_imap.logout.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_partial_failure(self, email_client, mock_imap):
-        """Test marking emails handles partial failures gracefully."""
-        mock_imap.uid = AsyncMock(side_effect=[("OK", []), Exception("IMAP error")])
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            marked_ids, failed_ids = await email_client.mark_emails_as_read(["123", "456"])
-
-        assert marked_ids == ["123"]
-        assert failed_ids == ["456"]
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_treats_no_response_as_failure(self, email_client, mock_imap):
-        """Test IMAP NO STORE responses are reported as failed ids."""
-        mock_imap.uid = AsyncMock(return_value=("NO", [b"STORE failed"]))
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            marked_ids, failed_ids = await email_client.mark_emails_as_read(["123"])
-
-        assert marked_ids == []
-        assert failed_ids == ["123"]
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_raises_on_select_failure(self, email_client, mock_imap):
-        """Test mailbox selection failures are surfaced."""
-        mock_imap.select = AsyncMock(return_value=("NO", [b"unknown mailbox"]))
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            with pytest.raises(RuntimeError, match="SELECT mailbox Archive failed"):
-                await email_client.mark_emails_as_read(["123"], mailbox="Archive")
-
-        mock_imap.logout.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_custom_mailbox(self, email_client, mock_imap):
-        """Test marking emails in a custom mailbox."""
-        mock_imap.uid = AsyncMock(return_value=("OK", []))
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            await email_client.mark_emails_as_read(["123"], mailbox="Archive")
-
-        mock_imap.select.assert_called_once()
-        # Verify the mailbox was quoted and passed to select
-        select_arg = mock_imap.select.call_args[0][0]
-        assert "Archive" in select_arg
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_logout_on_error(self, email_client, mock_imap):
-        """Test that IMAP logout is called even when errors occur."""
-        mock_imap.login = AsyncMock(side_effect=Exception("auth failed"))
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            with pytest.raises(Exception, match="auth failed"):
-                await email_client.mark_emails_as_read(["123"])
-
-        mock_imap.logout.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_mark_emails_as_read_empty_list(self, email_client, mock_imap):
-        """Test marking empty list returns empty results."""
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            marked_ids, failed_ids = await email_client.mark_emails_as_read([])
-
-        assert marked_ids == []
-        assert failed_ids == []
-
 
 class TestEmailClientBatchMethods:
     """Test batch fetch methods for performance optimization."""
@@ -942,12 +809,12 @@ class TestFindSpecialFolder:
     async def test_finds_folder_by_flag(self, classic_handler):
         """Test finding a folder by its RFC 6154 flag."""
         folders = [
-            Folder(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
-            Folder(name="Bin", delimiter="/", flags=["\\Trash", "\\HasNoChildren"]),
+            MailboxInfo(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+            MailboxInfo(name="Bin", delimiter="/", flags=["\\Trash", "\\HasNoChildren"]),
         ]
         mock_list = AsyncMock(return_value=folders)
 
-        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result = await classic_handler._find_special_folder("\\Trash", ["Trash", "Deleted Items"])
 
         assert result == "Bin"
@@ -956,12 +823,12 @@ class TestFindSpecialFolder:
     async def test_falls_back_to_common_name(self, classic_handler):
         """Test fallback to common folder names when flag not found."""
         folders = [
-            Folder(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
-            Folder(name="Trash", delimiter="/", flags=["\\HasNoChildren"]),
+            MailboxInfo(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+            MailboxInfo(name="Trash", delimiter="/", flags=["\\HasNoChildren"]),
         ]
         mock_list = AsyncMock(return_value=folders)
 
-        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result = await classic_handler._find_special_folder("\\Trash", ["Trash", "Deleted Items"])
 
         assert result == "Trash"
@@ -970,12 +837,12 @@ class TestFindSpecialFolder:
     async def test_returns_none_when_not_found(self, classic_handler):
         """Test returns None when no matching folder exists."""
         folders = [
-            Folder(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
-            Folder(name="Sent", delimiter="/", flags=["\\Sent"]),
+            MailboxInfo(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+            MailboxInfo(name="Sent", delimiter="/", flags=["\\Sent"]),
         ]
         mock_list = AsyncMock(return_value=folders)
 
-        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result = await classic_handler._find_special_folder("\\Trash", ["Trash", "Deleted Items"])
 
         assert result is None
@@ -983,10 +850,10 @@ class TestFindSpecialFolder:
     @pytest.mark.asyncio
     async def test_caches_positive_result(self, classic_handler):
         """Test that positive results are cached."""
-        folders = [Folder(name="Trash", delimiter="/", flags=["\\Trash"])]
+        folders = [MailboxInfo(name="Trash", delimiter="/", flags=["\\Trash"])]
         mock_list = AsyncMock(return_value=folders)
 
-        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result1 = await classic_handler._find_special_folder("\\Trash", ["Trash"])
             result2 = await classic_handler._find_special_folder("\\Trash", ["Trash"])
 
@@ -997,10 +864,10 @@ class TestFindSpecialFolder:
     @pytest.mark.asyncio
     async def test_caches_negative_result(self, classic_handler):
         """Test that negative results are cached."""
-        folders = [Folder(name="INBOX", delimiter="/", flags=[])]
+        folders = [MailboxInfo(name="INBOX", delimiter="/", flags=[])]
         mock_list = AsyncMock(return_value=folders)
 
-        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             result1 = await classic_handler._find_special_folder("\\Archive", ["Archive"])
             result2 = await classic_handler._find_special_folder("\\Archive", ["Archive"])
 
@@ -1016,14 +883,14 @@ class TestDeleteEmailsSafeDelete:
     async def test_moves_to_trash_when_found(self, classic_handler):
         """Test delete_emails moves to Trash folder when it exists."""
         folders = [
-            Folder(name="INBOX", delimiter="/", flags=[]),
-            Folder(name="Trash", delimiter="/", flags=["\\Trash"]),
+            MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+            MailboxInfo(name="Trash", delimiter="/", flags=["\\Trash"]),
         ]
         mock_list = AsyncMock(return_value=folders)
         mock_move = AsyncMock(return_value=(["123", "456"], []))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "move_emails", mock_move),
         ):
             result = await classic_handler.delete_emails(["123", "456"], "INBOX")
@@ -1039,12 +906,12 @@ class TestDeleteEmailsSafeDelete:
     @pytest.mark.asyncio
     async def test_permanent_delete_when_no_trash(self, classic_handler):
         """Test delete_emails permanently deletes when Trash folder not found."""
-        folders = [Folder(name="INBOX", delimiter="/", flags=[])]
+        folders = [MailboxInfo(name="INBOX", delimiter="/", flags=[])]
         mock_list = AsyncMock(return_value=folders)
         mock_delete = AsyncMock(return_value=(["123"], []))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
         ):
             result = await classic_handler.delete_emails(["123"], "INBOX")
@@ -1058,12 +925,12 @@ class TestDeleteEmailsSafeDelete:
     @pytest.mark.asyncio
     async def test_permanent_delete_when_already_in_trash(self, classic_handler):
         """Test delete_emails permanently deletes when already in Trash."""
-        folders = [Folder(name="Trash", delimiter="/", flags=["\\Trash"])]
+        folders = [MailboxInfo(name="Trash", delimiter="/", flags=["\\Trash"])]
         mock_list = AsyncMock(return_value=folders)
         mock_delete = AsyncMock(return_value=(["123"], []))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "delete_emails", mock_delete),
         ):
             result = await classic_handler.delete_emails(["123"], "Trash")
@@ -1076,12 +943,12 @@ class TestDeleteEmailsSafeDelete:
     @pytest.mark.asyncio
     async def test_move_to_trash_with_failures(self, classic_handler):
         """Test delete_emails reports failures when moving to Trash."""
-        folders = [Folder(name="Trash", delimiter="/", flags=["\\Trash"])]
+        folders = [MailboxInfo(name="Trash", delimiter="/", flags=["\\Trash"])]
         mock_list = AsyncMock(return_value=folders)
         mock_move = AsyncMock(return_value=(["123"], ["456"]))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "move_emails", mock_move),
         ):
             result = await classic_handler.delete_emails(["123", "456"], "INBOX")
@@ -1099,14 +966,14 @@ class TestArchiveEmails:
     async def test_archives_when_folder_found(self, classic_handler):
         """Test archive_emails moves to Archive folder when found."""
         folders = [
-            Folder(name="INBOX", delimiter="/", flags=[]),
-            Folder(name="Archive", delimiter="/", flags=["\\Archive"]),
+            MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+            MailboxInfo(name="Archive", delimiter="/", flags=["\\Archive"]),
         ]
         mock_list = AsyncMock(return_value=folders)
         mock_move = AsyncMock(return_value=(["123", "456"], []))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "move_emails", mock_move),
         ):
             result = await classic_handler.archive_emails(["123", "456"], "INBOX")
@@ -1122,14 +989,14 @@ class TestArchiveEmails:
     async def test_archives_with_gmail_all_mail(self, classic_handler):
         """Test archive_emails finds [Gmail]/All Mail by fallback name."""
         folders = [
-            Folder(name="INBOX", delimiter="/", flags=[]),
-            Folder(name="[Gmail]/All Mail", delimiter="/", flags=["\\All"]),
+            MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+            MailboxInfo(name="[Gmail]/All Mail", delimiter="/", flags=["\\All"]),
         ]
         mock_list = AsyncMock(return_value=folders)
         mock_move = AsyncMock(return_value=(["123"], []))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "move_emails", mock_move),
         ):
             result = await classic_handler.archive_emails(["123"], "INBOX")
@@ -1140,22 +1007,22 @@ class TestArchiveEmails:
     @pytest.mark.asyncio
     async def test_raises_when_archive_not_found(self, classic_handler):
         """Test archive_emails raises ValueError when Archive folder not found."""
-        folders = [Folder(name="INBOX", delimiter="/", flags=[])]
+        folders = [MailboxInfo(name="INBOX", delimiter="/", flags=[])]
         mock_list = AsyncMock(return_value=folders)
 
-        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
             with pytest.raises(ValueError, match="Archive folder not found"):
                 await classic_handler.archive_emails(["123"], "INBOX")
 
     @pytest.mark.asyncio
     async def test_archive_with_failures(self, classic_handler):
         """Test archive_emails reports partial failures."""
-        folders = [Folder(name="Archive", delimiter="/", flags=["\\Archive"])]
+        folders = [MailboxInfo(name="Archive", delimiter="/", flags=["\\Archive"])]
         mock_list = AsyncMock(return_value=folders)
         mock_move = AsyncMock(return_value=(["123"], ["456"]))
 
         with (
-            patch.object(classic_handler.incoming_client, "list_folders", mock_list),
+            patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list),
             patch.object(classic_handler.incoming_client, "move_emails", mock_move),
         ):
             result = await classic_handler.archive_emails(["123", "456"], "INBOX")

@@ -107,7 +107,7 @@ async def test_imap_starttls_raises_when_command_fails():
 
 
 @pytest.mark.asyncio
-async def test_connect_imap_uses_implicit_tls_when_use_ssl_true():
+async def test_imap_connect_uses_implicit_tls_when_use_ssl_true():
     server = EmailServer(
         user_name="user",
         password="secret",
@@ -118,17 +118,18 @@ async def test_connect_imap_uses_implicit_tls_when_use_ssl_true():
     )
     mock_imap = _make_imap()
 
+    # Construct the client while IMAP4_SSL is patched so imap_class picks up the mock.
     with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4_SSL", return_value=mock_imap) as mock_ssl:
-        result = await EmailClient._connect_imap_server(server)
+        client = EmailClient(server)
+        result = client._imap_connect()
 
     assert result is mock_imap
     mock_ssl.assert_called_once()
     assert mock_ssl.call_args.kwargs["ssl_context"].verify_mode == ssl.CERT_NONE
-    mock_imap.wait_hello_from_server.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_connect_imap_uses_plain_connection_without_starttls():
+async def test_imap_connection_uses_plain_connection_without_starttls():
     server = EmailServer(
         user_name="user",
         password="secret",
@@ -138,18 +139,21 @@ async def test_connect_imap_uses_plain_connection_without_starttls():
         start_ssl=False,
     )
     mock_imap = _make_imap()
+    mock_imap.login = AsyncMock(return_value=Response("OK"))
+    mock_imap.id = AsyncMock(return_value=Response("OK"))
+    mock_imap.logout = AsyncMock()
+    client = EmailClient(server)
 
-    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", return_value=mock_imap) as mock_plain:
+    with patch.object(client, "_imap_connect", return_value=mock_imap):
         with patch("mcp_email_server.emails.classic._imap_starttls", new=AsyncMock()) as mock_starttls:
-            result = await EmailClient._connect_imap_server(server)
+            async with client._imap_connection(mailbox=None) as imap:
+                assert imap is mock_imap
 
-    assert result is mock_imap
-    mock_plain.assert_called_once_with("imap.example.com", 143)
     mock_starttls.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_connect_imap_uses_starttls_when_configured():
+async def test_imap_connection_uses_starttls_when_configured():
     server = EmailServer(
         user_name="user",
         password="secret",
@@ -160,13 +164,16 @@ async def test_connect_imap_uses_starttls_when_configured():
         verify_ssl=False,
     )
     mock_imap = _make_imap()
+    mock_imap.login = AsyncMock(return_value=Response("OK"))
+    mock_imap.id = AsyncMock(return_value=Response("OK"))
+    mock_imap.logout = AsyncMock()
+    client = EmailClient(server)
 
-    with patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", return_value=mock_imap) as mock_plain:
+    with patch.object(client, "_imap_connect", return_value=mock_imap):
         with patch("mcp_email_server.emails.classic._imap_starttls", new=AsyncMock()) as mock_starttls:
-            result = await EmailClient._connect_imap_server(server)
+            async with client._imap_connection(mailbox=None) as imap:
+                assert imap is mock_imap
 
-    assert result is mock_imap
-    mock_plain.assert_called_once_with("127.0.0.1", 1143)
     mock_starttls.assert_awaited_once()
     starttls_context = mock_starttls.await_args.args[1]
     assert starttls_context.verify_mode == ssl.CERT_NONE

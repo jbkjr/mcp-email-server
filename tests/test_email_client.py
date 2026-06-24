@@ -15,7 +15,6 @@ from mcp_email_server.emails.classic import (
     _detect_email_service,
     _format_forwarded_email_html,
     _format_quoted_reply_html,
-    _html_to_text,
     _imap_login,
 )
 
@@ -103,32 +102,6 @@ class TestEmailClient:
         assert result["body"] == "This is a test email body"
         assert isinstance(result["date"], datetime)
         assert result["attachments"] == []
-
-    def test_html_to_text_removes_scripts_and_preserves_readable_text(self):
-        """HTML fallback extraction uses an HTML parser for readable plain text."""
-        html = """
-        <html>
-          <head><style>.hidden { display: none; }</style><script>alert('x')</script></head>
-          <body>
-            <h1>Title &amp; Updates</h1>
-            <p>Hello&nbsp;<strong>there</strong></p>
-            <div>Line<br>Break</div>
-            <ul><li>One</li><li>Two</li></ul>
-          </body>
-        </html>
-        """
-
-        result = _html_to_text(html)
-
-        assert "alert" not in result
-        assert "display" not in result
-        assert "Title & Updates" in result
-        assert "Hello" in result
-        assert "there" in result
-        assert "Line" in result
-        assert "Break" in result
-        assert "One" in result
-        assert "Two" in result
 
     def test_parse_email_data_html_single_part_falls_back_to_text(self):
         """Single-part HTML emails are converted to plain text."""
@@ -483,7 +456,7 @@ class TestEmailClient:
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
@@ -525,7 +498,7 @@ class TestSendEmailMessageIdAndDate:
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
@@ -546,7 +519,7 @@ class TestSendEmailMessageIdAndDate:
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
@@ -564,7 +537,7 @@ class TestSendEmailMessageIdAndDate:
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
@@ -613,7 +586,7 @@ class TestSendEmailReplyHeaders:
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
@@ -634,7 +607,7 @@ class TestSendEmailReplyHeaders:
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
@@ -655,7 +628,7 @@ class TestSendEmailReplyHeaders:
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp):
@@ -682,8 +655,8 @@ class TestDeleteEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.expunge = AsyncMock()
         mock_imap.logout = AsyncMock()
@@ -701,8 +674,8 @@ class TestDeleteEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.expunge = AsyncMock()
         mock_imap.logout = AsyncMock()
 
@@ -729,8 +702,8 @@ class TestDeleteEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.expunge = AsyncMock()
         mock_imap.logout = AsyncMock(side_effect=OSError("Connection closed"))
@@ -751,8 +724,8 @@ class TestMarkEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.logout = AsyncMock()
 
@@ -778,8 +751,8 @@ class TestMarkEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.logout = AsyncMock()
 
@@ -805,8 +778,8 @@ class TestMarkEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         # First call succeeds, second raises exception
         mock_imap.uid = AsyncMock(side_effect=[None, Exception("Email not found")])
         mock_imap.logout = AsyncMock()
@@ -828,8 +801,8 @@ class TestMarkEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock()
 
         with patch.object(email_client, "_imap_connect", return_value=mock_imap):
@@ -848,8 +821,8 @@ class TestMarkEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.logout = AsyncMock()
 
@@ -870,8 +843,8 @@ class TestMarkEmails:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=(None, None))
         mock_imap.logout = AsyncMock(side_effect=OSError("Connection closed"))
 
@@ -949,7 +922,7 @@ class TestSmtpSslContext:
         mock_smtp = AsyncMock()
         mock_smtp.__aenter__.return_value = mock_smtp
         mock_smtp.__aexit__.return_value = None
-        mock_smtp.login = AsyncMock()
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_smtp.send_message = AsyncMock()
 
         with patch("aiosmtplib.SMTP", return_value=mock_smtp) as mock_smtp_class:
@@ -1692,7 +1665,7 @@ class TestAutoQuoteReply:
 
         with (
             patch.object(handler.incoming_client, "search_by_message_id", return_value=None),
-            patch.object(handler.incoming_client, "list_folders", return_value=[]),
+            patch.object(handler.incoming_client, "list_mailboxes", return_value=[]),
             patch.object(handler.outgoing_client, "send_email", return_value=MagicMock()) as mock_send,
         ):
             await handler.send_email(
@@ -1724,9 +1697,9 @@ class TestAutoQuoteReply:
             "attachments": [],
         }
 
-        from mcp_email_server.emails.models import Folder
+        from mcp_email_server.emails.models import MailboxInfo
 
-        sent_folder = Folder(name="Sent", delimiter="/", flags=["\\Sent", "\\HasNoChildren"])
+        sent_folder = MailboxInfo(name="Sent", delimiter="/", flags=["\\Sent", "\\HasNoChildren"])
 
         # First search (INBOX) returns None, second search (Sent) returns UID
         search_side_effects = [None, "99"]
@@ -1736,7 +1709,7 @@ class TestAutoQuoteReply:
                 handler.incoming_client, "search_by_message_id", side_effect=search_side_effects
             ),
             patch.object(
-                handler.incoming_client, "list_folders", return_value=[sent_folder]
+                handler.incoming_client, "list_mailboxes", return_value=[sent_folder]
             ),
             patch.object(
                 handler.incoming_client, "get_email_body_by_id", return_value=original_email
@@ -2044,8 +2017,8 @@ class TestExtractAttachments:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock()
 
         with (
@@ -2080,8 +2053,8 @@ class TestExtractAttachments:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock()
 
         with (
@@ -2104,8 +2077,8 @@ class TestExtractAttachments:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock()
 
         with (

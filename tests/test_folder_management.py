@@ -9,16 +9,12 @@ from mcp_email_server.app import (
     copy_emails,
     create_folder,
     delete_folder,
-    list_folders,
-    move_emails,
     rename_folder,
 )
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails.classic import ClassicEmailHandler, EmailClient
 from mcp_email_server.emails.models import (
     EmailMoveResponse,
-    Folder,
-    FolderListResponse,
     FolderOperationResponse,
 )
 
@@ -29,18 +25,6 @@ from mcp_email_server.emails.models import (
 
 class TestFolderManagementDisabled:
     """Test that folder management tools raise PermissionError when disabled."""
-
-    @pytest.mark.asyncio
-    async def test_list_folders_disabled(self):
-        """Test list_folders raises PermissionError when disabled."""
-        mock_settings = MagicMock()
-        mock_settings.enable_folder_management = False
-
-        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
-            with pytest.raises(PermissionError) as exc_info:
-                await list_folders(account_name="test_account")
-
-            assert "Folder management is disabled" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_copy_emails_disabled(self):
@@ -101,33 +85,6 @@ class TestFolderManagementDisabled:
 
 class TestFolderManagementEnabled:
     """Test that folder management tools work when enabled."""
-
-    @pytest.mark.asyncio
-    async def test_list_folders_enabled(self):
-        """Test list_folders works when enabled."""
-        mock_settings = MagicMock()
-        mock_settings.enable_folder_management = True
-
-        folder_response = FolderListResponse(
-            folders=[
-                Folder(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
-                Folder(name="Sent", delimiter="/", flags=["\\HasNoChildren", "\\Sent"]),
-                Folder(name="Archive", delimiter="/", flags=["\\HasNoChildren"]),
-            ],
-            total=3,
-        )
-
-        mock_handler = AsyncMock()
-        mock_handler.list_folders.return_value = folder_response
-
-        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
-            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
-                result = await list_folders(account_name="test_account")
-
-                assert result == folder_response
-                assert len(result.folders) == 3
-                assert result.folders[0].name == "INBOX"
-                mock_handler.list_folders.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_copy_emails_enabled(self):
@@ -275,25 +232,6 @@ class TestClassicEmailHandlerFolders:
     """Test ClassicEmailHandler folder operations."""
 
     @pytest.mark.asyncio
-    async def test_list_folders(self, classic_handler):
-        """Test list_folders handler method."""
-        # EmailClient.list_folders returns list[Folder], not FolderListResponse
-        mock_folders = [
-            Folder(name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
-            Folder(name="Sent", delimiter="/", flags=["\\Sent"]),
-        ]
-
-        mock_list = AsyncMock(return_value=mock_folders)
-
-        with patch.object(classic_handler.incoming_client, "list_folders", mock_list):
-            result = await classic_handler.list_folders()
-
-            assert isinstance(result, FolderListResponse)
-            assert len(result.folders) == 2
-            assert result.total == 2
-            mock_list.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_copy_emails(self, classic_handler):
         """Test copy_emails handler method."""
         # EmailClient.copy_emails returns (copied_ids, failed_ids) tuple
@@ -379,45 +317,14 @@ class TestEmailClientFolders:
     """Test EmailClient folder operations."""
 
     @pytest.mark.asyncio
-    async def test_list_folders(self, email_client):
-        """Test list_folders IMAP operation."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    b'(\\HasNoChildren) "/" "INBOX"',
-                    b'(\\HasNoChildren \\Sent) "/" "Sent"',
-                    b'(\\HasChildren) "/" "Folders"',
-                ],
-            )
-        )
-        mock_imap.logout = AsyncMock()
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            result = await email_client.list_folders()
-
-            # EmailClient.list_folders returns list[Folder]
-            assert isinstance(result, list)
-            assert len(result) == 3
-            assert result[0].name == "INBOX"
-            assert result[1].name == "Sent"
-            assert "\\Sent" in result[1].flags
-            mock_imap.list.assert_called_once_with('""', "*")
-
-    @pytest.mark.asyncio
     async def test_copy_emails(self, email_client):
         """Test copy_emails IMAP operation."""
         mock_imap = AsyncMock()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=("OK", [b"[COPYUID 1234 1:2 100:101]"]))
         mock_imap.logout = AsyncMock()
 
@@ -436,7 +343,7 @@ class TestEmailClientFolders:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.create = AsyncMock(return_value=("OK", [b"CREATE completed"]))
         mock_imap.logout = AsyncMock()
 
@@ -455,7 +362,7 @@ class TestEmailClientFolders:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.delete = AsyncMock(return_value=("OK", [b"DELETE completed"]))
         mock_imap.logout = AsyncMock()
 
@@ -474,7 +381,7 @@ class TestEmailClientFolders:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.rename = AsyncMock(return_value=("OK", [b"RENAME completed"]))
         mock_imap.logout = AsyncMock()
 
@@ -496,8 +403,8 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         # Simulate failure for one email
         mock_imap.uid = AsyncMock(side_effect=[("OK", []), ("NO", [b"Message not found"])])
         mock_imap.logout = AsyncMock()
@@ -516,7 +423,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.create = AsyncMock(return_value=("NO", [b"Folder already exists"]))
         mock_imap.logout = AsyncMock()
 
@@ -527,41 +434,13 @@ class TestEmailClientFolderEdgeCases:
             assert success is False
 
     @pytest.mark.asyncio
-    async def test_list_folders_special_characters(self, email_client):
-        """Test list_folders with special characters in folder names."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    b'(\\HasNoChildren) "/" "INBOX"',
-                    b'(\\HasNoChildren) "/" "Folders/My Folder"',
-                    b'(\\HasNoChildren) "/" "[Gmail]/Sent Mail"',
-                ],
-            )
-        )
-        mock_imap.logout = AsyncMock()
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            result = await email_client.list_folders()
-
-            # EmailClient.list_folders returns list[Folder]
-            assert len(result) == 3
-            assert result[1].name == "Folders/My Folder"
-            assert result[2].name == "[Gmail]/Sent Mail"
-
-    @pytest.mark.asyncio
     async def test_create_folder_exception(self, email_client):
         """Test create_folder handles exceptions (covers 979-981)."""
         mock_imap = AsyncMock()
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.create = AsyncMock(side_effect=Exception("Connection lost"))
         mock_imap.logout = AsyncMock()
 
@@ -578,7 +457,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.create = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
@@ -595,7 +474,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.delete = AsyncMock(return_value=("NO", [b"Folder not empty"]))
         mock_imap.logout = AsyncMock()
 
@@ -612,7 +491,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.delete = AsyncMock(side_effect=Exception("Connection lost"))
         mock_imap.logout = AsyncMock()
 
@@ -629,7 +508,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.delete = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
@@ -646,7 +525,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.rename = AsyncMock(return_value=("NO", [b"Folder does not exist"]))
         mock_imap.logout = AsyncMock()
 
@@ -663,7 +542,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.rename = AsyncMock(side_effect=Exception("Connection lost"))
         mock_imap.logout = AsyncMock()
 
@@ -680,7 +559,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.rename = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
@@ -690,97 +569,6 @@ class TestEmailClientFolderEdgeCases:
             # Should complete despite logout error
             assert success is True
 
-    def test_parse_list_response_empty_string(self, email_client):
-        """Test _parse_list_response with empty string (covers 804-805)."""
-        result = email_client._parse_list_response("")
-        assert result is None
-
-    def test_parse_list_response_list_completed(self, email_client):
-        """Test _parse_list_response with 'LIST completed.' (covers 804-805)."""
-        result = email_client._parse_list_response("LIST completed.")
-        assert result is None
-
-    def test_parse_list_response_no_parentheses(self, email_client):
-        """Test _parse_list_response with no parentheses (covers 811-812)."""
-        result = email_client._parse_list_response("invalid folder response")
-        assert result is None
-
-    def test_parse_list_response_malformed_parts(self, email_client):
-        """Test _parse_list_response with malformed parts (covers 827-830)."""
-        # Has parentheses but not enough quoted parts
-        result = email_client._parse_list_response(b'(\\HasNoChildren) "/"')
-        assert result is None
-
-    def test_parse_list_response_empty_flags(self, email_client):
-        """Test _parse_list_response with empty flags."""
-        # Empty flags but valid format
-        result = email_client._parse_list_response(b'() "/" "test"')
-        assert result is not None
-        assert result.name == "test"
-        assert result.flags == []
-
-    def test_parse_list_response_folder_constructor_exception(self, email_client):
-        """Test _parse_list_response handles Folder constructor exception (covers 827-828)."""
-        from mcp_email_server.emails.models import Folder
-
-        # Mock Folder to raise an exception
-        with patch("mcp_email_server.emails.classic.Folder", side_effect=ValueError("Test error")):
-            result = email_client._parse_list_response(b'(\\HasNoChildren) "/" "INBOX"')
-            assert result is None
-
-    @pytest.mark.asyncio
-    async def test_list_folders_logout_error(self, email_client):
-        """Test list_folders handles logout error (covers 857-858)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [b'(\\HasNoChildren) "/" "INBOX"'],
-            )
-        )
-        mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            result = await email_client.list_folders()
-
-            # Should complete despite logout error
-            assert len(result) == 1
-            assert result[0].name == "INBOX"
-
-    @pytest.mark.asyncio
-    async def test_list_folders_with_invalid_items(self, email_client):
-        """Test list_folders filters out invalid/unparseable items (covers 848->846)."""
-        mock_imap = AsyncMock()
-        mock_imap._client_task = asyncio.Future()
-        mock_imap._client_task.set_result(None)
-        mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.list = AsyncMock(
-            return_value=(
-                "OK",
-                [
-                    b'(\\HasNoChildren) "/" "INBOX"',
-                    b"",  # Empty string - should be filtered out
-                    b"LIST completed.",  # Invalid - should be filtered out
-                    b'(\\HasNoChildren) "/" "Sent"',
-                    b"invalid folder response",  # No parentheses - should be filtered out
-                ],
-            )
-        )
-        mock_imap.logout = AsyncMock()
-
-        with patch.object(email_client, "_imap_connect", return_value=mock_imap):
-            result = await email_client.list_folders()
-
-            # Only valid folders should be returned
-            assert len(result) == 2
-            assert result[0].name == "INBOX"
-            assert result[1].name == "Sent"
-
     @pytest.mark.asyncio
     async def test_copy_emails_exception(self, email_client):
         """Test copy_emails handles exception during copy (covers 888-890)."""
@@ -788,8 +576,8 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(side_effect=Exception("Connection lost"))
         mock_imap.logout = AsyncMock()
 
@@ -806,8 +594,8 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout error"))
 
@@ -825,8 +613,8 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
-        mock_imap.select = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_imap.select = AsyncMock(return_value=("OK", []))
         # Return a string instead of tuple
         mock_imap.uid = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()
@@ -843,7 +631,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         # Return a string instead of tuple
         mock_imap.create = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()
@@ -860,7 +648,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         # Return a string instead of tuple
         mock_imap.delete = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()
@@ -877,7 +665,7 @@ class TestEmailClientFolderEdgeCases:
         mock_imap._client_task = asyncio.Future()
         mock_imap._client_task.set_result(None)
         mock_imap.wait_hello_from_server = AsyncMock()
-        mock_imap.login = AsyncMock()
+        mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         # Return a string instead of tuple
         mock_imap.rename = AsyncMock(return_value="OK")
         mock_imap.logout = AsyncMock()

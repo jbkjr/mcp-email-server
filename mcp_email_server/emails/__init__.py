@@ -12,7 +12,6 @@ if TYPE_CHECKING:
         EmailMetadataPageResponse,
         EmailMoveResponse,
         EmailSendResponse,
-        FolderListResponse,
         FolderOperationResponse,
         LabelListResponse,
         MailboxInfo,
@@ -173,12 +172,6 @@ class EmailHandler(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def mark_emails_as_read(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:
-        """
-        Mark emails as read by their IDs. Returns (marked_ids, failed_ids)
-        """
-
-    @abc.abstractmethod
     async def move_emails(
         self, email_ids: list[str], source_mailbox: str, destination_mailbox: str
     ) -> tuple[list[str], list[str]]:
@@ -223,15 +216,6 @@ class EmailHandler(abc.ABC):
 
         Returns:
             AttachmentDownloadResponse with download result information.
-        """
-
-    @abc.abstractmethod
-    async def list_folders(self) -> "FolderListResponse":
-        """
-        List all folders/mailboxes for the account.
-
-        Returns:
-            FolderListResponse with list of folders and their metadata.
         """
 
     @abc.abstractmethod

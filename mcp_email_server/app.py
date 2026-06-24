@@ -23,7 +23,6 @@ from mcp_email_server.emails.models import (
     EmailMetadataPageResponse,
     EmailMoveResponse,
     EmailSendResponse,
-    FolderListResponse,
     FolderOperationResponse,
     LabelListResponse,
     MailboxInfo,
@@ -482,26 +481,6 @@ async def mark_emails(
 
 
 @mcp.tool(
-    description="Mark one or more emails as read by their email_id. Use list_emails_metadata first to get the email_id."
-)
-async def mark_emails_as_read(
-    account_name: Annotated[str, Field(description="The name of the email account.")],
-    email_ids: Annotated[
-        list[str],
-        Field(description="List of email_id to mark as read (obtained from list_emails_metadata)."),
-    ],
-    mailbox: Annotated[str, Field(default="INBOX", description="The mailbox containing the emails.")] = "INBOX",
-) -> str:
-    handler = dispatch_handler(account_name)
-    marked_ids, failed_ids = await handler.mark_emails_as_read(email_ids, mailbox)
-
-    result = f"Successfully marked {len(marked_ids)} email(s) as read"
-    if failed_ids:
-        result += f", failed to mark {len(failed_ids)} email(s): {', '.join(failed_ids)}"
-    return result
-
-
-@mcp.tool(
     description="Move one or more emails between IMAP folders by their email_id. Use list_emails_metadata first to get the email_id and list_mailboxes to discover available folders."
 )
 async def move_emails(
@@ -576,17 +555,6 @@ def _check_folder_management_enabled() -> None:
             "or 'MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true' environment variable to enable this feature."
         )
         raise PermissionError(msg)
-
-
-@mcp.tool(
-    description="List all folders/mailboxes for an email account. Returns folder names, hierarchy delimiters, and IMAP flags. Requires enable_folder_management=true.",
-)
-async def list_folders(
-    account_name: Annotated[str, Field(description="The name of the email account.")],
-) -> FolderListResponse:
-    _check_folder_management_enabled()
-    handler = dispatch_handler(account_name)
-    return await handler.list_folders()
 
 
 @mcp.tool(

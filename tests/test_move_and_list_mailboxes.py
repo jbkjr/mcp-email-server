@@ -286,7 +286,7 @@ class TestEmailClientMoveEmails:
         mock_imap.select = AsyncMock(return_value=Response("NO", [b"source missing"]))
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
-            with pytest.raises(RuntimeError, match="SELECT source mailbox Missing"):
+            with pytest.raises(RuntimeError, match="SELECT mailbox Missing"):
                 await email_client.move_emails(["100"], "Missing", "Archive")
 
         mock_imap.uid.assert_not_called()

@@ -73,21 +73,6 @@ class AttachmentDownloadResponse(BaseModel):
     saved_path: str
 
 
-class Folder(BaseModel):
-    """IMAP folder/mailbox information"""
-
-    name: str
-    delimiter: str
-    flags: list[str]
-
-
-class FolderListResponse(BaseModel):
-    """Response for list_folders operation"""
-
-    folders: list[Folder]
-    total: int
-
-
 class FolderOperationResponse(BaseModel):
     """Response for folder operations (create, delete, rename)"""
 
