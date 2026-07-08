@@ -126,3 +126,4 @@ skip_empty = true
 [tool.coverage.run]
 branch = true
 source = ["mcp_email_server"]
+omit = ["mcp_email_server/ui.py"]

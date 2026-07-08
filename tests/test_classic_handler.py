@@ -139,6 +139,7 @@ class TestClassicEmailHandler:
                 body=None,
                 text=None,
                 has_attachment=None,
+                allowed_senders=[],
             )
 
     @pytest.mark.asyncio
@@ -182,6 +183,7 @@ class TestClassicEmailHandler:
                 body=None,
                 text=None,
                 has_attachment=None,
+                allowed_senders=[],
             )
 
     @pytest.mark.asyncio
@@ -382,7 +384,7 @@ class TestClassicEmailHandler:
             assert result.failed_ids == []
             assert result.mailbox == "INBOX"
             assert result.marked_as == "read"
-            mock_mark.assert_called_once_with(["123", "456"], "read", "INBOX")
+            mock_mark.assert_called_once_with(["123", "456"], "read", "INBOX", allowed_senders=[], report_blocked_mutations=False)
 
     @pytest.mark.asyncio
     async def test_mark_emails_with_failures(self, classic_handler):
@@ -430,7 +432,7 @@ class TestClassicEmailHandler:
             assert result.size == 1024
             assert result.saved_path == save_path
 
-            mock_download.assert_called_once_with("123", "document.pdf", save_path, "INBOX")
+            mock_download.assert_called_once_with("123", "document.pdf", save_path, "INBOX", allowed_senders=[])
 
     @pytest.mark.asyncio
     async def test_send_email_with_reply_headers(self, classic_handler):
@@ -511,7 +513,7 @@ class TestClassicEmailHandler:
             assert result.emails[0].body == "Test email body"
 
             # Verify the client method was called correctly
-            mock_get_body.assert_called_once_with("123", "INBOX", 20000)
+            mock_get_body.assert_called_once_with("123", "INBOX", allowed_senders=[], body_offset=0, max_body_length=20000)
 
     @pytest.mark.asyncio
     async def test_get_emails_content_mark_as_read_true(self, classic_handler):

@@ -54,9 +54,10 @@ class EmailHandler(abc.ABC):
             seen: Filter by read status (True=read, False=unread, None=all).
             flagged: Filter by flagged/starred status (True=flagged, False=unflagged, None=all).
             answered: Filter by replied status (True=replied, False=not replied, None=all).
-            body: Search for text in the email body.
-            text: Search for text in the entire email (headers + body).
-            has_attachment: Filter by attachment presence (True/False/None).
+            body: Search for text in the email body (IMAP BODY).
+            text: Search for text in the entire message, headers + body (IMAP TEXT).
+            has_attachment: Filter by attachment presence (True/False/None) via a
+                multipart/mixed Content-Type heuristic.
         """
 
     @abc.abstractmethod
@@ -64,8 +65,9 @@ class EmailHandler(abc.ABC):
         self,
         email_ids: list[str],
         mailbox: str = "INBOX",
-        max_body_length: int | None = 20000,
         mark_as_read: bool = False,
+        body_offset: int = 0,
+        max_body_length: int | None = 20000,
     ) -> "EmailContentBatchResponse":
         """
         Get full content (including body) of multiple emails by their email IDs (IMAP UIDs).
@@ -73,8 +75,11 @@ class EmailHandler(abc.ABC):
         Args:
             email_ids: List of email UIDs to retrieve.
             mailbox: Mailbox to search in.
-            max_body_length: Maximum body length before truncation. 0 or None for no limit.
             mark_as_read: If True, mark successfully fetched emails as read.
+            body_offset: Character offset into each body to start reading from (for paging).
+            max_body_length: Maximum number of body characters to return, counted from
+                body_offset. 0 or None for no limit. If more remains, the body ends with
+                the '...[TRUNCATED]' marker.
         """
 
     @abc.abstractmethod

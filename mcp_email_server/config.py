@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import datetime
+import fnmatch
 import os
 from collections.abc import Iterable
-from email.utils import parseaddr
+from email.utils import getaddresses, parseaddr
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -40,9 +41,30 @@ def normalize_address(raw: str) -> str:
     return addr.strip().lower()
 
 
+def sender_allowed(sender: str, patterns: list[str]) -> bool:
+    """Return True if exactly one sender address matches any allowlist pattern.
+
+    An empty allowlist allows everyone. When an allowlist is configured, malformed, empty, or
+    multi-address From headers fail closed rather than relying on parser leniency.
+    """
+    if not patterns:
+        return True
+
+    addrs = [addr.strip().lower() for _name, addr in getaddresses([sender]) if addr.strip()]
+    if len(addrs) != 1:
+        return False
+
+    return any(fnmatch.fnmatchcase(addrs[0], pattern.lower()) for pattern in patterns)
+
+
 def _normalize_address_list(raw: Iterable[str]) -> list[str]:
     """Normalize each address, drop empties, de-duplicate (order-preserving)."""
     return list(dict.fromkeys(a for a in (normalize_address(x) for x in raw) if a))
+
+
+def _normalize_pattern_list(raw: Iterable[str]) -> list[str]:
+    """Lowercase, strip, de-duplicate (order-preserving). Glob characters are preserved."""
+    return list(dict.fromkeys(p.strip().lower() for p in raw if p.strip()))
 
 
 CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH)).expanduser().resolve()
@@ -264,18 +286,23 @@ class Settings(BaseSettings):
     enable_attachment_download: bool = False
     enable_folder_management: bool = False
     allowed_recipients: list[str] = []
+    allowed_senders: list[str] = []
+    report_blocked_mutations: bool = False
 
     model_config = SettingsConfigDict(toml_file=CONFIG_PATH, validate_assignment=True, revalidate_instances="always")
+
+    def _apply_bool_env_override(self, attr: str, env_var: str) -> None:
+        value = os.getenv(env_var)
+        if value is not None:
+            setattr(self, attr, _parse_bool_env(value, False))
+            logger.info(f"Set {attr}={getattr(self, attr)} from environment variable")
 
     def __init__(self, **data: Any) -> None:
         """Initialize Settings with support for environment variables."""
         super().__init__(**data)
 
-        # Check for enable_attachment_download from environment variable
-        env_enable_attachment = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
-        if env_enable_attachment is not None:
-            self.enable_attachment_download = _parse_bool_env(env_enable_attachment, False)
-            logger.info(f"Set enable_attachment_download={self.enable_attachment_download} from environment variable")
+        self._apply_bool_env_override("enable_attachment_download", "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
+        self._apply_bool_env_override("report_blocked_mutations", "MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS")
 
         # Check for enable_folder_management from environment variable
         env_enable_folder = os.getenv("MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT")
@@ -291,6 +318,15 @@ class Settings(BaseSettings):
         env_allowed = os.getenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS")
         if env_allowed is not None:
             self.allowed_recipients = _normalize_address_list(env_allowed.split(","))
+
+        # Normalise allowed_senders from TOML (lowercased, de-duplicated; globs preserved)
+        if self.allowed_senders:
+            self.allowed_senders = _normalize_pattern_list(self.allowed_senders)
+
+        # Environment variable overrides TOML (comma-separated); an empty string clears the allowlist.
+        env_senders = os.getenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS")
+        if env_senders is not None:
+            self.allowed_senders = _normalize_pattern_list(env_senders.split(","))
 
         # Check for email configuration from environment variables
         env_email = EmailSettings.from_env()

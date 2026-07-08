@@ -658,7 +658,7 @@ class TestDeleteEmails:
         mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=(None, None))
-        mock_imap.expunge = AsyncMock()
+        mock_imap.expunge = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock()
 
         with patch.object(email_client, "_imap_connect", return_value=mock_imap):
@@ -676,7 +676,7 @@ class TestDeleteEmails:
         mock_imap.wait_hello_from_server = AsyncMock()
         mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.expunge = AsyncMock()
+        mock_imap.expunge = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock()
 
         call_count = [0]
@@ -705,7 +705,7 @@ class TestDeleteEmails:
         mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.select = AsyncMock(return_value=("OK", []))
         mock_imap.uid = AsyncMock(return_value=(None, None))
-        mock_imap.expunge = AsyncMock()
+        mock_imap.expunge = AsyncMock(return_value=("OK", []))
         mock_imap.logout = AsyncMock(side_effect=OSError("Connection closed"))
 
         with patch.object(email_client, "_imap_connect", return_value=mock_imap):

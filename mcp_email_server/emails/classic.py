@@ -22,7 +22,7 @@ from typing import Any
 import aioimaplib
 import aiosmtplib
 
-from mcp_email_server.config import EmailServer, EmailSettings
+from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.html_utils import html_to_text
 from mcp_email_server.emails.markdown_utils import markdown_to_email_html, wrap_html_document
@@ -342,6 +342,14 @@ def _format_imap_response_detail(response: Any) -> str:
 def _raise_for_imap_error(response: Any, operation: str) -> None:
     """Raise when an IMAP command returns a non-OK status."""
     if _imap_status(response) != "OK":
+        detail = _format_imap_response_detail(response)
+        msg = f"{operation} failed" + (f": {detail}" if detail else "")
+        raise RuntimeError(msg)
+
+
+def _raise_for_imap_command_failure(response: Any, operation: str) -> None:
+    """Raise only when an IMAP command reports an explicit failure status."""
+    if _imap_status(response) in {"NO", "BAD"}:
         detail = _format_imap_response_detail(response)
         msg = f"{operation} failed" + (f": {detail}" if detail else "")
         raise RuntimeError(msg)
@@ -744,6 +752,7 @@ class EmailClient:
         self,
         raw_email: bytes,
         email_id: str | None = None,
+        body_offset: int = 0,
         max_body_length: int | None = MAX_BODY_LENGTH,
     ) -> dict[str, Any]:
         """Parse raw email data into a structured dictionary."""
@@ -813,8 +822,21 @@ class EmailClient:
                     body = html_to_text(raw_body)
                 else:
                     body = raw_body
-        if max_body_length and body and len(body) > max_body_length:
-            body = body[:max_body_length] + "...[TRUNCATED]"
+        if body_offset < 0:
+            raise ValueError("body_offset must be >= 0")
+
+        # Windowed body read. ``max_body_length`` of 0 or None means "no limit": return the full
+        # body from ``body_offset`` onward. Otherwise return at most ``max_body_length`` characters
+        # and append the ``...[TRUNCATED]`` marker when more of the body remains, so callers can
+        # page through a long email by re-requesting with ``body_offset += max_body_length``.
+        if body:
+            if max_body_length:
+                window = body[body_offset : body_offset + max_body_length]
+                if body_offset + max_body_length < len(body):
+                    window += "...[TRUNCATED]"
+                body = window
+            else:
+                body = body[body_offset:]
         return {
             "email_id": email_id or "",
             "message_id": message_id,
@@ -858,16 +880,20 @@ class EmailClient:
             search_criteria.extend(["BEFORE", before.strftime("%d-%b-%Y").upper()])
         if since:
             search_criteria.extend(["SINCE", since.strftime("%d-%b-%Y").upper()])
-        if subject:
-            search_criteria.extend(["SUBJECT", EmailClient._sanitize_imap_value(subject)])
-        if body:
-            search_criteria.extend(["BODY", EmailClient._sanitize_imap_value(body)])
-        if text:
-            search_criteria.extend(["TEXT", EmailClient._sanitize_imap_value(text)])
-        if from_address:
-            search_criteria.extend(["FROM", EmailClient._sanitize_imap_value(from_address)])
-        if to_address:
-            search_criteria.extend(["TO", EmailClient._sanitize_imap_value(to_address)])
+        # Substring-match fields (IMAP keyword, value)
+        text_criteria = [
+            ("SUBJECT", subject),
+            ("BODY", body),
+            ("TEXT", text),
+            ("FROM", from_address),
+            ("TO", to_address),
+        ]
+        for keyword, value in text_criteria:
+            if value:
+                search_criteria.extend([keyword, EmailClient._sanitize_imap_value(value)])
+
+        # Attachment heuristic: most attachments are carried in multipart/mixed.
+        # May miss some types (e.g. inline images) or yield false positives.
         if has_attachment is True:
             search_criteria.extend(["HEADER", "Content-Type", "multipart/mixed"])
         elif has_attachment is False:
@@ -1019,6 +1045,73 @@ class EmailClient:
 
         return results
 
+    async def _batch_fetch_senders(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_ids: list[bytes] | list[str],
+        chunk_size: int = 500,
+    ) -> dict[str, str]:
+        """Batch fetch the From header for all UIDs (chunked, sequential), for allowlist filtering.
+
+        Returns {uid: raw From header}. Fetches only HEADER.FIELDS (FROM) to stay light and reuses
+        _parse_headers (which tolerates a From-only header block).
+        """
+        if not email_ids:
+            return {}
+
+        chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
+        senders: dict[str, str] = {}
+        for chunk in chunks:
+            str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in chunk]
+            uid_list = ",".join(str_ids)
+            fetch_response = await imap.uid("fetch", uid_list, "BODY.PEEK[HEADER.FIELDS (FROM)]")
+            _raise_for_imap_command_failure(fetch_response, f"FETCH From headers for UIDs {uid_list}")
+            _, data = fetch_response
+            for i, item in enumerate(data):
+                if not isinstance(item, bytes) or b"BODY[HEADER" not in item:
+                    continue
+                uid_match = re.search(rb"UID (\d+)", item)
+                if uid_match and i + 1 < len(data) and isinstance(data[i + 1], bytearray):
+                    meta = self._parse_headers(uid_match.group(1).decode(), bytes(data[i + 1]))
+                    if meta:
+                        senders[meta["email_id"]] = meta["from"]
+                elif i + 2 < len(data) and isinstance(data[i + 1], bytearray):
+                    uid_after = re.search(rb"UID (\d+)", data[i + 2]) if isinstance(data[i + 2], bytes) else None
+                    if uid_after:
+                        meta = self._parse_headers(uid_after.group(1).decode(), bytes(data[i + 1]))
+                        if meta:
+                            senders[meta["email_id"]] = meta["from"]
+        return senders
+
+    async def _enforce_sender_allowlist(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_id: str,
+        allowed_senders: list[str] | None,
+    ) -> None:
+        """Raise ValueError (identical to not-found) when sender is not on the allowlist.
+
+        No-op when ``allowed_senders`` is empty or None (backwards-compatible).
+        """
+        if allowed_senders:
+            uid_senders = await self._batch_fetch_senders(imap, [email_id])
+            if not sender_allowed(uid_senders.get(email_id, ""), allowed_senders):
+                msg = f"Failed to fetch email with UID {email_id}"
+                logger.error(msg)
+                raise ValueError(msg)
+
+    async def _blocked_uids(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_ids: list[str],
+        allowed_senders: list[str] | None,
+    ) -> set[str]:
+        """UIDs whose From is not on the allowlist. Empty set when no allowlist (no IMAP work)."""
+        if not allowed_senders:
+            return set()
+        uid_senders = await self._batch_fetch_senders(imap, email_ids)
+        return {uid for uid in email_ids if not sender_allowed(uid_senders.get(uid, ""), allowed_senders)}
+
     async def get_emails_metadata_page(
         self,
         page: int = 1,
@@ -1036,6 +1129,7 @@ class EmailClient:
         body: str | None = None,
         text: str | None = None,
         has_attachment: bool | None = None,
+        allowed_senders: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Fetch email metadata for a page, returning (metadata_list, total_count) in a single IMAP session."""
         async with self._imap_connection(mailbox) as imap:
@@ -1055,11 +1149,18 @@ class EmailClient:
             logger.info(f"Get metadata: Search criteria: {search_criteria}")
 
             # Search for messages - use UID SEARCH for better compatibility.
-            # charset=None: aioimaplib defaults to "CHARSET utf-8", which Microsoft
-            # Exchange rejects with `NO [BADCHARSET (US-ASCII)] The specified charset
-            # is not supported.`, breaking all search/list operations. Omitting the
-            # CHARSET token works on Exchange and is harmless on other servers.
-            _, messages = await imap.uid_search(*search_criteria, charset=None)
+            # charset handling: aioimaplib defaults to "CHARSET utf-8", which
+            # Microsoft Exchange rejects with `NO [BADCHARSET (US-ASCII)] The
+            # specified charset is not supported.`, breaking all search/list
+            # operations — so ASCII-only user searches omit the CHARSET token.
+            # However, RFC 3501 requires a charset declaration for non-ASCII
+            # search values: without it, servers such as Coremail interpret the
+            # raw UTF-8 bytes as US-ASCII and silently return zero matches. Base
+            # the decision only on user-supplied text fields, not on generated
+            # criteria such as locale-dependent date strings.
+            search_text_values = (subject, body, text, from_address, to_address)
+            charset = "utf-8" if any(value and not value.isascii() for value in search_text_values) else None
+            _, messages = await imap.uid_search(*search_criteria, charset=charset)
 
             # Handle empty or None responses
             if not messages or not messages[0]:
@@ -1067,11 +1168,23 @@ class EmailClient:
                 return [], 0
 
             raw_ids = messages[0].split()
+
+            # Sender allowlist: filter candidates BEFORE sorting/pagination so total + pages stay honest.
+            if allowed_senders:
+                uid_senders = await self._batch_fetch_senders(imap, raw_ids)
+                raw_ids = [
+                    uid for uid in raw_ids if sender_allowed(uid_senders.get(uid.decode(), ""), allowed_senders)
+                ]
+                logger.info(f"Sender allowlist active: {len(raw_ids)} of {len(uid_senders)} match")
+
             total = len(raw_ids)
             logger.info(f"Found {total} email IDs")
 
             # Normalize byte UIDs to strings once for use throughout
             str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in raw_ids]
+
+            if not raw_ids:
+                return [], 0
 
             # Phase 1: Batch fetch INTERNALDATE for sorting (sequential chunks)
             fetch_dates_start = time.perf_counter()
@@ -1170,11 +1283,21 @@ class EmailClient:
         self,
         email_id: str,
         mailbox: str = DEFAULT_MAILBOX,
-        max_body_length: int | None = MAX_BODY_LENGTH,
         mark_as_read: bool = False,
+        allowed_senders: list[str] | None = None,
+        body_offset: int = 0,
+        max_body_length: int | None = MAX_BODY_LENGTH,
     ) -> dict[str, Any] | None:
-        # Fetch the specific email by UID without implicitly marking it as read
         async with self._imap_connection(mailbox) as imap:
+            # Sender allowlist: check the From header BEFORE reading the body, so a blocked
+            # message is never fetched/parsed, never marked read, and is indistinguishable from
+            # a missing/inaccessible one (caller sees None either way).
+            if allowed_senders:
+                uid_senders = await self._batch_fetch_senders(imap, [email_id])
+                if not sender_allowed(uid_senders.get(email_id, ""), allowed_senders):
+                    return None
+
+            # Fetch the specific email by UID without implicitly marking it as read
             data = await self._fetch_email_with_formats(imap, email_id)
             if not data:
                 logger.error(f"Failed to fetch UID {email_id} with any format")
@@ -1186,7 +1309,9 @@ class EmailClient:
                 return None
 
             try:
-                email_data = self._parse_email_data(raw_email, email_id, max_body_length=max_body_length)
+                email_data = self._parse_email_data(
+                    raw_email, email_id, body_offset=body_offset, max_body_length=max_body_length
+                )
             except Exception as e:
                 logger.error(f"Error parsing email: {e!s}")
                 return None
@@ -1206,6 +1331,7 @@ class EmailClient:
         attachment_name: str,
         save_path: str,
         mailbox: str = DEFAULT_MAILBOX,
+        allowed_senders: list[str] | None = None,
     ) -> dict[str, Any]:
         """Download a specific attachment from an email and save it to disk.
 
@@ -1214,11 +1340,18 @@ class EmailClient:
             attachment_name: The filename of the attachment to download.
             save_path: The local path where the attachment will be saved.
             mailbox: The mailbox to search in (default: "INBOX").
+            allowed_senders: Optional sender allowlist; when set, a non-allowed sender's
+                message is treated as not found and its body is never fetched.
 
         Returns:
             A dictionary with download result information.
         """
         async with self._imap_connection(mailbox) as imap:
+            # Read-path allowlist: check the From header before fetching the body, so a
+            # blocked sender's message is never read. Blocked fails identically to a missing
+            # UID (same ValueError below), so it does not reveal whether the message exists.
+            await self._enforce_sender_allowlist(imap, email_id, allowed_senders)
+
             data = await self._fetch_email_with_formats(imap, email_id)
             if not data:
                 msg = f"Failed to fetch email with UID {email_id}"
@@ -1403,8 +1536,13 @@ class EmailClient:
         else:
             msg["Subject"] = subject
 
-        # Handle sender name with special characters
-        if any(ord(c) > 127 for c in self.sender):
+        sender_name, sender_address = email.utils.parseaddr(self.sender)
+
+        # Encode only the display name. RFC 2047 encoded-words must not cover the
+        # addr-spec, otherwise strict clients may show the raw encoded blob.
+        if sender_address:
+            msg["From"] = email.utils.formataddr((str(Header(sender_name, "utf-8")), sender_address))
+        elif any(ord(c) > 127 for c in self.sender):
             msg["From"] = Header(self.sender, "utf-8")
         else:
             msg["From"] = self.sender
@@ -1429,7 +1567,8 @@ class EmailClient:
 
         # Set Date and Message-Id headers
         msg["Date"] = email.utils.formatdate(localtime=True)
-        sender_domain = self.sender.rsplit("@", 1)[-1].rstrip(">")
+        sender_for_domain = sender_address or self.sender
+        sender_domain = sender_for_domain.rsplit("@", 1)[-1].rstrip(">")
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
 
         return msg
@@ -1640,15 +1779,43 @@ class EmailClient:
             logger.error(f"Error saving to mailbox '{mailbox}': {e}")
             return None
 
-    async def delete_emails(self, email_ids: list[str], mailbox: str = DEFAULT_MAILBOX) -> tuple[list[str], list[str]]:
-        """Delete emails by their UIDs. Returns (deleted_ids, failed_ids)."""
+    async def delete_emails(
+        self,
+        email_ids: list[str],
+        mailbox: str = DEFAULT_MAILBOX,
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Delete emails by their UIDs. Returns (deleted_ids, failed_ids).
+
+        A blocked sender's UID is never flagged \\Deleted: by default it is reported as a
+        no-op success (indistinguishable from a nonexistent UID); when
+        report_blocked_mutations is True it is reported in failed_ids instead.
+        """
         async with self._imap_connection(mailbox) as imap:
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            allowed_ids = [email_id for email_id in email_ids if email_id not in blocked]
+
             async def _op(imap: Any, email_id: str) -> None:
                 await imap.uid("store", email_id, "+FLAGS", IMAP_FLAG_DELETED)
 
-            deleted, failed = await self._batch_uid_operation(imap, email_ids, _op, "delete")
-            await imap.expunge()
+            deleted, failed = await self._batch_uid_operation(imap, allowed_ids, _op, "delete")
+            if deleted:  # only expunge when messages were actually flagged \Deleted (never for no-op blocked UIDs)
+                try:
+                    expunge_response = await imap.expunge()
+                    _raise_for_imap_error(expunge_response, "EXPUNGE deleted emails")
+                except Exception as e:
+                    logger.error(f"Failed to expunge deleted emails: {e}")
+                    failed.extend(deleted)
+                    deleted = []
 
+        # Blocked UIDs are never flagged: reported as no-op success by default, or in
+        # failed_ids when report_blocked_mutations is set.
+        blocked_ids = [email_id for email_id in email_ids if email_id in blocked]
+        if report_blocked_mutations:
+            failed.extend(blocked_ids)
+        else:
+            deleted.extend(blocked_ids)
         return deleted, failed
 
     async def copy_emails(
@@ -1779,9 +1946,19 @@ class EmailClient:
         return None
 
     async def mark_emails(
-        self, email_ids: list[str], mark_as: str, mailbox: str = DEFAULT_MAILBOX
+        self,
+        email_ids: list[str],
+        mark_as: str,
+        mailbox: str = DEFAULT_MAILBOX,
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
     ) -> tuple[list[str], list[str]]:
-        """Mark emails as read or unread. Returns (marked_ids, failed_ids)."""
+        """Mark emails as read or unread. Returns (marked_ids, failed_ids).
+
+        A blocked sender's UID is never flagged: by default it is reported as a no-op success
+        (indistinguishable from a nonexistent UID); when report_blocked_mutations is True it is
+        reported in failed_ids instead.
+        """
         if mark_as == "read":
             flag_op = "+FLAGS"
         elif mark_as == "unread":
@@ -1790,10 +1967,20 @@ class EmailClient:
             raise ValueError(f"Invalid mark_as value: {mark_as}. Must be 'read' or 'unread'.")
 
         async with self._imap_connection(mailbox) as imap:
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            allowed_ids = [email_id for email_id in email_ids if email_id not in blocked]
+
             async def _op(imap: Any, email_id: str) -> None:
                 await imap.uid("store", email_id, flag_op, IMAP_FLAG_SEEN)
 
-            return await self._batch_uid_operation(imap, email_ids, _op, f"mark as {mark_as}")
+            marked, failed = await self._batch_uid_operation(imap, allowed_ids, _op, f"mark as {mark_as}")
+
+        blocked_ids = [email_id for email_id in email_ids if email_id in blocked]
+        if report_blocked_mutations:
+            failed.extend(blocked_ids)
+        else:
+            marked.extend(blocked_ids)
+        return marked, failed
 
     async def search_message_id_in_folders(
         self, message_id: str, folders: list[str]
@@ -1825,9 +2012,18 @@ class EmailClient:
         return await self.delete_emails(email_ids, folder)
 
     async def move_emails(
-        self, email_ids: list[str], source_mailbox: str, destination_mailbox: str
+        self,
+        email_ids: list[str],
+        source_mailbox: str,
+        destination_mailbox: str,
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
     ) -> tuple[list[str], list[str]]:
-        """Move emails to a different mailbox. Uses IMAP MOVE (RFC 6851) with COPY+DELETE fallback."""
+        """Move emails to a different mailbox. Uses IMAP MOVE (RFC 6851) with COPY+DELETE fallback.
+
+        A blocked sender's UID is never copied/moved: reported as a no-op success by default,
+        or in failed_ids when report_blocked_mutations is True.
+        """
         moved_ids = []
         failed_ids = []
 
@@ -1835,7 +2031,12 @@ class EmailClient:
             capabilities = {str(capability).upper() for capability in getattr(imap, "capabilities", ())}
             has_move = hasattr(imap, "move") and "MOVE" in capabilities
 
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            copied: list[str] = []  # allowed UIDs that actually completed COPY+STORE on the fallback path
             for email_id in email_ids:
+                if email_id in blocked:
+                    (failed_ids if report_blocked_mutations else moved_ids).append(email_id)
+                    continue
                 try:
                     if has_move:
                         move_response = await imap.uid("move", email_id, _quote_mailbox(destination_mailbox))
@@ -1845,19 +2046,20 @@ class EmailClient:
                         _raise_for_imap_error(copy_response, f"COPY email {email_id}")
                         store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
                         _raise_for_imap_error(store_response, f"STORE \\Deleted for email {email_id}")
+                        copied.append(email_id)
                     moved_ids.append(email_id)
                 except Exception as e:
                     logger.error(f"Failed to move email {email_id}: {e}")
                     failed_ids.append(email_id)
 
-            if not has_move and moved_ids:
+            if copied:  # only expunge when real COPY+STORE happened — never for blocked/no-op UIDs
                 try:
                     expunge_response = await imap.expunge()
                     _raise_for_imap_error(expunge_response, "EXPUNGE moved emails")
                 except Exception as e:
                     logger.error(f"Failed to expunge moved emails: {e}")
-                    failed_ids.extend(moved_ids)
-                    moved_ids = []
+                    failed_ids.extend(copied)
+                    moved_ids = [uid for uid in moved_ids if uid not in set(copied)]
 
         return moved_ids, failed_ids
 
@@ -1930,6 +2132,7 @@ class ClassicEmailHandler(EmailHandler):
             body=body,
             text=text,
             has_attachment=has_attachment,
+            allowed_senders=get_settings().allowed_senders,
         )
         emails = [EmailMetadata.from_email(data) for data in email_data_list]
         return EmailMetadataPageResponse(
@@ -1946,31 +2149,44 @@ class ClassicEmailHandler(EmailHandler):
         self,
         email_ids: list[str],
         mailbox: str = "INBOX",
-        max_body_length: int | None = MAX_BODY_LENGTH,
         mark_as_read: bool = False,
+        body_offset: int = 0,
+        max_body_length: int | None = MAX_BODY_LENGTH,
     ) -> EmailContentBatchResponse:
-        """Batch retrieve email body content"""
+        """Batch retrieve email body content, honoring the sender allowlist.
+
+        The allowlist is enforced in the read path: get_email_body_by_id checks the From header
+        before fetching the body, so a blocked message is never read or marked and returns None —
+        indistinguishable from a missing/inaccessible one (both land in failed_ids).
+        """
+        allowed_senders = get_settings().allowed_senders
         emails = []
         failed_ids = []
 
         for email_id in email_ids:
             try:
-                email_data = await self.incoming_client.get_email_body_by_id(email_id, mailbox, max_body_length)
-                if email_data:
-                    emails.append(
-                        EmailBodyResponse(
-                            email_id=email_data["email_id"],
-                            message_id=email_data.get("message_id"),
-                            subject=email_data["subject"],
-                            sender=email_data["from"],
-                            recipients=email_data["to"],
-                            date=email_data["date"],
-                            body=email_data["body"],
-                            attachments=email_data["attachments"],
-                        )
-                    )
-                else:
+                email_data = await self.incoming_client.get_email_body_by_id(
+                    email_id,
+                    mailbox,
+                    allowed_senders=allowed_senders,
+                    body_offset=body_offset,
+                    max_body_length=max_body_length,
+                )
+                if not email_data:
                     failed_ids.append(email_id)
+                    continue
+                emails.append(
+                    EmailBodyResponse(
+                        email_id=email_data["email_id"],
+                        message_id=email_data.get("message_id"),
+                        subject=email_data["subject"],
+                        sender=email_data["from"],
+                        recipients=email_data["to"],
+                        date=email_data["date"],
+                        body=email_data["body"],
+                        attachments=email_data["attachments"],
+                    )
+                )
             except Exception as e:
                 logger.error(f"Failed to retrieve email {email_id}: {e}")
                 failed_ids.append(email_id)
@@ -2289,7 +2505,14 @@ class ClassicEmailHandler(EmailHandler):
         self, email_ids: list[str], source_mailbox: str, destination_mailbox: str
     ) -> tuple[list[str], list[str]]:
         """Move emails between mailboxes. Returns (moved_ids, failed_ids)."""
-        return await self.incoming_client.move_emails(email_ids, source_mailbox, destination_mailbox)
+        settings = get_settings()
+        return await self.incoming_client.move_emails(
+            email_ids,
+            source_mailbox,
+            destination_mailbox,
+            allowed_senders=settings.allowed_senders,
+            report_blocked_mutations=settings.report_blocked_mutations,
+        )
 
     async def list_mailboxes(self, pattern: str = "*", reference: str = "") -> list[MailboxInfo]:
         """List available mailboxes with flags and delimiter."""
@@ -2313,7 +2536,10 @@ class ClassicEmailHandler(EmailHandler):
         Returns:
             AttachmentDownloadResponse with download result information.
         """
-        result = await self.incoming_client.download_attachment(email_id, attachment_name, save_path, mailbox)
+        allowed_senders = get_settings().allowed_senders
+        result = await self.incoming_client.download_attachment(
+            email_id, attachment_name, save_path, mailbox, allowed_senders=allowed_senders
+        )
         return AttachmentDownloadResponse(
             email_id=result["email_id"],
             attachment_name=result["attachment_name"],
@@ -2480,7 +2706,14 @@ class ClassicEmailHandler(EmailHandler):
         mailbox: str = "INBOX",
     ) -> EmailMarkResponse:
         """Mark emails as read or unread."""
-        marked_ids, failed_ids = await self.incoming_client.mark_emails(email_ids, mark_as, mailbox)
+        settings = get_settings()
+        marked_ids, failed_ids = await self.incoming_client.mark_emails(
+            email_ids,
+            mark_as,
+            mailbox,
+            allowed_senders=settings.allowed_senders,
+            report_blocked_mutations=settings.report_blocked_mutations,
+        )
         return EmailMarkResponse(
             success=len(failed_ids) == 0,
             marked_ids=marked_ids,

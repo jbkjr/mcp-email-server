@@ -284,7 +284,7 @@ class TestMcpTools:
             assert result.emails[0].subject == "Test Subject"
 
             # Verify dispatch_handler and get_emails_content were called correctly
-            mock_handler.get_emails_content.assert_called_once_with(["12345"], "INBOX", 20000, mark_as_read=False)
+            mock_handler.get_emails_content.assert_called_once_with(["12345"], "INBOX", mark_as_read=False, body_offset=0, max_body_length=20000)
 
     @pytest.mark.asyncio
     async def test_get_emails_content_batch(self):
@@ -340,7 +340,7 @@ class TestMcpTools:
             assert result.emails[1].email_id == "12346"
 
             # Verify dispatch_handler and get_emails_content were called correctly
-            mock_handler.get_emails_content.assert_called_once_with(["12345", "12346", "12347"], "INBOX", 20000, mark_as_read=False)
+            mock_handler.get_emails_content.assert_called_once_with(["12345", "12346", "12347"], "INBOX", mark_as_read=False, body_offset=0, max_body_length=20000)
 
     @pytest.mark.asyncio
     async def test_get_emails_content_with_mailbox(self):
@@ -374,7 +374,7 @@ class TestMcpTools:
             )
 
             assert result == batch_response
-            mock_handler.get_emails_content.assert_called_once_with(["12345"], "Sent", 20000, mark_as_read=False)
+            mock_handler.get_emails_content.assert_called_once_with(["12345"], "Sent", mark_as_read=False, body_offset=0, max_body_length=20000)
 
     @pytest.mark.asyncio
     async def test_tool_visibility_hides_outbound_tools_for_read_only_accounts(self):
@@ -782,7 +782,7 @@ class TestMcpTools:
                 mark_as_read=True,
             )
 
-            mock_handler.get_emails_content.assert_called_once_with(["123"], "INBOX", 20000, mark_as_read=True)
+            mock_handler.get_emails_content.assert_called_once_with(["123"], "INBOX", mark_as_read=True, body_offset=0, max_body_length=20000)
 
     @pytest.mark.asyncio
     async def test_forward_email(self):

@@ -40,6 +40,10 @@ def _has_allowed_recipients() -> bool:
     return bool(get_settings().allowed_recipients)
 
 
+def _has_allowed_senders() -> bool:
+    return bool(get_settings().allowed_senders)
+
+
 def _enforce_recipient_allowlist(
     recipients: list[str],
     cc: list[str] | None,
@@ -159,15 +163,19 @@ async def list_emails_metadata(
     ] = None,
     body: Annotated[
         str | None,
-        Field(default=None, description="Search for text in the email body (IMAP BODY search)."),
+        Field(default=None, description="Search for text in the email body (IMAP BODY)."),
     ] = None,
     text: Annotated[
         str | None,
-        Field(default=None, description="Search for text in the entire email including headers and body (IMAP TEXT search)."),
+        Field(default=None, description="Search for text in the entire message — headers and body (IMAP TEXT)."),
     ] = None,
     has_attachment: Annotated[
         bool | None,
-        Field(default=None, description="Filter by attachment presence: True=has attachments, False=no attachments, None=all."),
+        Field(
+            default=None,
+            description="Filter by attachment presence: True=has attachment, False=none, None=all "
+            "(multipart/mixed heuristic; may miss inline images or yield false positives).",
+        ),
     ] = None,
 ) -> EmailMetadataPageResponse:
     handler = dispatch_handler(account_name)
@@ -203,19 +211,38 @@ async def get_emails_content(
         ),
     ],
     mailbox: Annotated[str, Field(default="INBOX", description="IMAP folder path. Standard: INBOX, Sent, Drafts, Trash. Provider-specific: Gmail uses '[Gmail]/...' prefix; ProtonMail Bridge uses 'Folders/<name>' and 'Labels/<name>'.")] = "INBOX",
-    max_body_length: Annotated[
-        int | None,
-        Field(default=20000, description="Maximum body length in characters before truncation. Set to 0 or null for no limit. Default: 20000."),
-    ] = 20000,
     mark_as_read: Annotated[
         bool,
         Field(default=False, description="Mark fetched emails as read. Default: False (emails remain unread)."),
     ] = False,
+    body_offset: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Character offset into each email body to start reading from. Use together "
+            "with max_body_length to page through long emails: if a returned body ends with the "
+            "'...[TRUNCATED]' marker, fetch the next chunk with body_offset += max_body_length.",
+        ),
+    ] = 0,
+    max_body_length: Annotated[
+        int | None,
+        Field(
+            default=20000,
+            description="Maximum number of body characters to return, counted from body_offset. "
+            "Set to 0 or null for no limit (returns the full body from body_offset). Otherwise, if "
+            "the body extends past the window, the '...[TRUNCATED]' marker is appended. Default: 20000.",
+        ),
+    ] = 20000,
 ) -> EmailContentBatchResponse:
     handler = dispatch_handler(account_name)
-    # Treat 0 as no limit
-    effective_limit = max_body_length if max_body_length else None
-    return await handler.get_emails_content(email_ids, mailbox, effective_limit, mark_as_read=mark_as_read)
+    return await handler.get_emails_content(
+        email_ids,
+        mailbox,
+        mark_as_read=mark_as_read,
+        body_offset=body_offset,
+        max_body_length=max_body_length,
+    )
 
 
 @mcp.tool(
@@ -227,6 +254,20 @@ async def get_emails_content(
 )
 async def list_allowed_recipients() -> list[str]:
     return get_settings().allowed_recipients
+
+
+@mcp.tool(
+    description=(
+        "List the configured inbound sender allowlist — the address patterns whose mail the server "
+        "will read or act on. When configured, only these senders' mail is visible to the read tools "
+        "(list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation "
+        "tools (delete_emails, mark_emails_as_read, move_emails, archive_emails). Only available when an "
+        "allowlist is configured."
+    ),
+    visible_if=_has_allowed_senders,
+)
+async def list_allowed_senders() -> list[str]:
+    return get_settings().allowed_senders
 
 
 @mcp.tool(
