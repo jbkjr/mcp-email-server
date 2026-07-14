@@ -10,6 +10,7 @@ from mcp_email_server.config import (
     AccountAttributes,
     EmailSettings,
     ProviderSettings,
+    clear_settings_cache,
     get_settings,
     normalize_address,
 )
@@ -113,8 +114,18 @@ async def list_available_accounts() -> list[AccountAttributes]:
 @mcp.tool(description="Add a new email account configuration to the settings.")
 async def add_email_account(email: EmailSettings) -> str:
     settings = get_settings()
-    settings.add_email(email)
-    settings.store()
+    try:
+        settings.add_email(email)
+        settings.store()
+    except Exception:
+        # add_email() reassigns settings.emails, and pydantic's validate_assignment
+        # applies the new value BEFORE running the check_unique_account_names
+        # after-validator — so even a rejected duplicate-name add leaves the cached
+        # instance mutated. store() can also mutate-then-fail (e.g. a locked
+        # keychain in explicit keyring mode). Either way, discard the cache so later
+        # tool calls don't see a phantom/corrupted account that isn't actually on disk.
+        clear_settings_cache()
+        raise
     return f"Successfully added email account '{email.account_name}'"
 
 
@@ -247,8 +258,8 @@ async def get_emails_content(
 
 @mcp.tool(
     description=(
-        "List the configured outbound recipient allowlist — the addresses that send_email and "
-        "save_to_mailbox are permitted to send to. Only available when an allowlist is configured."
+        "List the configured recipient allowlist — the addresses that send_email is permitted to "
+        "send to and save_to_mailbox is permitted to address. Only available when an allowlist is configured."
     ),
     visible_if=_has_allowed_recipients,
 )
@@ -394,8 +405,8 @@ async def forward_email(
 @mcp.tool(
     description="Compose an email and save it to an IMAP folder (e.g., Drafts). "
     "Same parameters as send_email, but saves instead of sending. "
-    "Default folder is Drafts with \\Draft and \\Seen flags.",
-    visible_if=_has_send_capable_account,
+    "Default folder is Drafts with \\Draft and \\Seen flags. "
+    "Pure IMAP operation — works without SMTP configuration.",
 )
 async def save_to_mailbox(
     account_name: Annotated[str, Field(description="The name of the email account.")],

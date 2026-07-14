@@ -59,6 +59,7 @@ class TestClassicEmailHandler:
         assert handler.incoming_client.email_server == email_settings.incoming
         assert handler.outgoing_client.email_server == email_settings.outgoing
         assert handler.outgoing_client.sender == f"{email_settings.full_name} <{email_settings.email_address}>"
+        assert handler.incoming_client.sender == f"{email_settings.full_name} <{email_settings.email_address}>"
 
     def test_init_read_only_account(self):
         """Read-only accounts initialize without an outgoing SMTP client."""
@@ -276,8 +277,8 @@ class TestClassicEmailHandler:
             )
 
     @pytest.mark.asyncio
-    async def test_read_only_account_rejects_save_to_mailbox(self):
-        """Read-only accounts cannot compose and save outbound drafts."""
+    async def test_read_only_account_can_save_to_mailbox(self):
+        """save_to_mailbox is a pure IMAP operation and works without SMTP."""
         email_settings = EmailSettings(
             account_name="read_only",
             full_name="Read Only",
@@ -291,13 +292,18 @@ class TestClassicEmailHandler:
             ),
         )
         handler = ClassicEmailHandler(email_settings)
+        mock_append = AsyncMock(return_value="42")
 
-        with pytest.raises(RuntimeError, match="SMTP is not configured"):
-            await handler.save_to_mailbox(
+        with patch.object(handler.incoming_client, "append_to_mailbox", mock_append):
+            result = await handler.save_to_mailbox(
                 recipients=["recipient@example.com"],
                 subject="Test Subject",
                 body="Test Body",
             )
+
+        assert "uid:42" in result
+        appended_msg = mock_append.call_args[0][0]
+        assert appended_msg["From"] == "Read Only <read-only@example.com>"
 
     @pytest.mark.asyncio
     async def test_delete_emails(self, classic_handler):

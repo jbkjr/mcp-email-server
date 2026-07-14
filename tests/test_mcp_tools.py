@@ -121,6 +121,59 @@ class TestMcpTools:
             mock_settings.store.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_add_email_account_duplicate_name_does_not_corrupt_cache(self, tmp_path, monkeypatch):
+        """A rejected duplicate-name add must not leave a mutated account list cached.
+
+        Settings.add_email() reassigns settings.emails, and pydantic's
+        validate_assignment applies the new value BEFORE the
+        check_unique_account_names after-validator raises — so a naive
+        `settings.add_email(email); settings.store()` sequence leaves the cached
+        Settings instance corrupted even though the raise happened before store().
+        """
+        import mcp_email_server.config as config_module
+        from mcp_email_server.config import Settings
+
+        cfg = tmp_path / "config.toml"
+        monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
+        config_module._settings = None
+
+        email_settings = EmailSettings(
+            account_name="dup",
+            full_name="Test User",
+            email_address="test@example.com",
+            incoming=EmailServer(user_name="test_user", password="test_password", host="imap.example.com", port=993),
+        )
+        duplicate = EmailSettings(
+            account_name="dup",
+            full_name="Someone Else",
+            email_address="other@example.com",
+            incoming=EmailServer(user_name="other_user", password="other_password", host="imap.other.com", port=993),
+        )
+
+        try:
+            await add_email_account(email_settings)
+
+            with pytest.raises(Exception, match="Duplicate account name"):
+                await add_email_account(duplicate)
+
+            # The cache must have been discarded, not left holding two "dup" entries.
+            reloaded = config_module.get_settings()
+            assert [e.account_name for e in reloaded.emails] == ["dup"]
+
+            # A subsequent, non-conflicting add must succeed rather than tripping
+            # over a corrupted duplicate that was never actually persisted.
+            new_account = EmailSettings(
+                account_name="brand_new",
+                full_name="New User",
+                email_address="new@example.com",
+                incoming=EmailServer(user_name="new_user", password="new_password", host="imap.new.com", port=993),
+            )
+            result = await add_email_account(new_account)
+            assert result == "Successfully added email account 'brand_new'"
+        finally:
+            config_module._settings = None
+
+    @pytest.mark.asyncio
     async def test_list_emails_metadata(self):
         """Test list_emails_metadata MCP tool."""
         # Create test data
@@ -378,7 +431,7 @@ class TestMcpTools:
 
     @pytest.mark.asyncio
     async def test_tool_visibility_hides_outbound_tools_for_read_only_accounts(self):
-        """Read-only deployments should hide outbound tools from MCP clients."""
+        """Read-only deployments hide send_email but keep IMAP-only tools like save_to_mailbox."""
         read_only_account = EmailSettings(
             account_name="read_only",
             full_name="Read Only",
@@ -398,7 +451,7 @@ class TestMcpTools:
             tool_names = {tool.name for tool in await app_module.mcp.list_tools()}
 
         assert "send_email" not in tool_names
-        assert "save_to_mailbox" not in tool_names
+        assert "save_to_mailbox" in tool_names
         assert "list_emails_metadata" in tool_names
         assert "get_emails_content" in tool_names
 
