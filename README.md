@@ -248,7 +248,21 @@ enable_attachment_download = true
 # ... your email configuration
 ```
 
-Once enabled, you can use the `download_attachment` tool to save email attachments to a specified path.
+Once enabled, you can use the `download_attachment` tool to save email attachments to disk.
+
+`save_path` is optional. Omit it and the attachment is saved under the current user's
+`~/Downloads/mcp-email-server` directory, using a sanitized, length-bounded version of the
+attachment name plus a cryptographically random suffix. Path separators, traversal segments,
+and Unicode control/format characters (including right-to-left override extension spoofing)
+in a provider-supplied attachment name are stripped, so the write can never escape that
+directory or silently overwrite an existing file. The directory is created owner-only
+(`0700`) and default downloads are written owner-only (`0600`); the `~/Downloads` parent
+itself is left untouched.
+
+Supplying `save_path` keeps the previous behavior exactly: the path is used as given (with
+`~` expanded and made absolute). An absolute path is recommended; a relative path resolves
+against the server process's working directory. Either way, the returned `saved_path`
+reports the resolved absolute destination.
 
 ### Enabling Folder Management
 

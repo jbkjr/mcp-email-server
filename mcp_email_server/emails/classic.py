@@ -24,6 +24,11 @@ import aiosmtplib
 
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
 from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails.attachment_paths import (
+    prepare_private_directory,
+    resolve_attachment_destination,
+    write_private_file,
+)
 from mcp_email_server.emails.html_utils import html_to_text
 from mcp_email_server.emails.markdown_utils import markdown_to_email_html, wrap_html_document
 from mcp_email_server.emails.models import (
@@ -1329,7 +1334,7 @@ class EmailClient:
         self,
         email_id: str,
         attachment_name: str,
-        save_path: str,
+        save_path: str | None = None,
         mailbox: str = DEFAULT_MAILBOX,
         allowed_senders: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -1338,7 +1343,9 @@ class EmailClient:
         Args:
             email_id: The UID of the email containing the attachment.
             attachment_name: The filename of the attachment to download.
-            save_path: The local path where the attachment will be saved.
+            save_path: Explicit destination path. When omitted, the attachment is
+                saved with a sanitized randomized name under the current user's
+                ``Downloads/mcp-email-server`` directory.
             mailbox: The mailbox to search in (default: "INBOX").
             allowed_senders: Optional sender allowlist; when set, a non-allowed sender's
                 message is treated as not found and its body is never fetched.
@@ -1346,6 +1353,10 @@ class EmailClient:
         Returns:
             A dictionary with download result information.
         """
+        # Resolve the destination before connecting, so an unusable target fails
+        # before any message is fetched or decoded.
+        save_file, used_default = resolve_attachment_destination(save_path, attachment_name)
+
         async with self._imap_connection(mailbox) as imap:
             # Read-path allowlist: check the From header before fetching the body, so a
             # blocked sender's message is never read. Blocked fails identically to a missing
@@ -1391,12 +1402,16 @@ class EmailClient:
                 logger.error(msg)
                 raise ValueError(msg)
 
-            # Save to disk
-            save_file = Path(save_path)
-            save_file.parent.mkdir(parents=True, exist_ok=True)
-            save_file.write_bytes(attachment_data)
+            # Save to disk. The default area is created owner-only and the file is
+            # written owner-only; an explicit path keeps its original behavior.
+            if used_default:
+                prepare_private_directory(save_file.parent)
+                write_private_file(save_file, attachment_data)
+            else:
+                save_file.parent.mkdir(parents=True, exist_ok=True)
+                save_file.write_bytes(attachment_data)
 
-            logger.info(f"Attachment '{attachment_name}' saved to {save_path}")
+            logger.info(f"Attachment '{attachment_name}' saved to {save_file}")
 
             return {
                 "email_id": email_id,
@@ -2513,15 +2528,17 @@ class ClassicEmailHandler(EmailHandler):
         self,
         email_id: str,
         attachment_name: str,
-        save_path: str,
+        save_path: str | None = None,
         mailbox: str = "INBOX",
     ) -> AttachmentDownloadResponse:
-        """Download an email attachment and save it to the specified path.
+        """Download an email attachment and save it to disk.
 
         Args:
             email_id: The UID of the email containing the attachment.
             attachment_name: The filename of the attachment to download.
-            save_path: The local path where the attachment will be saved.
+            save_path: Explicit destination path. When omitted, the attachment is
+                saved with a sanitized randomized name under the current user's
+                ``Downloads/mcp-email-server`` directory.
             mailbox: The mailbox to search in (default: "INBOX").
 
         Returns:
