@@ -8,7 +8,7 @@ import ssl
 import time
 import unicodedata
 from collections.abc import AsyncGenerator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.application import MIMEApplication
@@ -16,6 +16,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.policy import default
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,21 @@ ARCHIVE_FOLDER_CANDIDATES = [
     "[Gmail]/All Mail",
     "INBOX.Archive",
 ]
+
+# Matches the wire marker that introduces a full-message FETCH literal, e.g.
+# b'1 FETCH (UID 42 BODY[] {79}'. Anchored at the start of the response line and
+# followed by the literal payload as the next item of the response list.
+_FETCH_MESSAGE_MARKER_RE = re.compile(
+    rb"(?:\d+\s+)?FETCH\b.*(?:BODY(?:\.PEEK)?\[\]|RFC822)(?=$|[\s<{])",
+    re.IGNORECASE,
+)
+
+# Trailing IMAP literal declaration, e.g. the '{79}' of b'1 FETCH (UID 42 BODY[] {79}'.
+_IMAP_LITERAL_SIZE_RE = re.compile(rb"\{(\d+)\}\s*$")
+
+
+class ImapTransportError(ConnectionError):
+    """An IMAP command failed at the transport boundary, leaving the stream unusable."""
 
 
 def _detect_email_service(email_settings: EmailSettings) -> str:
@@ -360,35 +376,78 @@ def _raise_for_imap_command_failure(response: Any, operation: str) -> None:
         raise RuntimeError(msg)
 
 
+def _discard_imap_after_id_failure(
+    imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
+    command: aioimaplib.Command,
+) -> None:
+    """Abort an IMAP stream whose ID response boundary is no longer known.
+
+    A timeout, cancellation or transport error leaves us unable to tell how much
+    of the ID response is still in flight, so every subsequent command on that
+    connection risks being matched against the wrong reply. Tear the stream down
+    instead of handing a desynchronized connection back to the caller.
+    """
+    protocol = imap.protocol
+    if protocol is None:
+        return
+    transport = protocol.transport
+    if transport is not None:
+        with suppress(Exception):
+            if isinstance(transport, asyncio.WriteTransport):
+                transport.abort()
+            else:
+                transport.close()
+    imap.protocol = None
+    pending_command = protocol.pending_async_commands.get(command.untagged_resp_name)
+    if pending_command is command:
+        protocol.pending_async_commands.pop(command.untagged_resp_name, None)
+    command.close(b"IMAP ID connection aborted", "KO")
+
+
 async def _send_imap_id(imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL) -> None:
-    """Send IMAP ID command with fallback for strict servers like 163.com.
+    """Send one compact RFC 2971 ID command when the server advertises it.
 
-    aioimaplib's id() method sends ID command with spaces between parentheses
-    and content (e.g., 'ID ( "name" "value" )'), which some strict IMAP servers
-    like 163.com reject with 'BAD Parse command error'.
+    aioimaplib's ``id()`` formats the parameter list with spaces immediately
+    inside the parentheses (``ID ( "name" "value" )``), which the RFC 2971
+    grammar does not permit and strict servers such as 163.com reject with
+    'BAD Parse command error'. Send the conformant compact form directly rather
+    than issuing a malformed command first and retrying it, and skip the command
+    entirely on servers that never advertised the optional ID extension.
 
-    This function first tries the standard id() method, and if it fails,
-    falls back to sending a raw command with correct format.
+    A tagged non-OK reply is informational and stays non-fatal. A timeout,
+    cancellation or transport failure is not: the response boundary becomes
+    unknown, so the stream is discarded and the error propagates.
 
     See: https://github.com/ai-zerolab/mcp-email-server/issues/85
+    See: https://github.com/Wh1isper/mcp-email-server/issues/217
     """
+    protocol = imap.protocol
+    if protocol is None:
+        logger.warning("IMAP ID command failed: IMAP protocol is not connected")
+        return
+    if "ID" not in _imap_capabilities(imap):
+        return
+    command = aioimaplib.Command(
+        "ID",
+        protocol.new_tag(),
+        '("name" "mcp-email-server" "version" "1.0.0")',
+        timeout=imap.timeout,
+    )
     try:
-        response = await imap.id(name="mcp-email-server", version="1.0.0")
-        if response.result != "OK":
-            # Fallback for strict servers (e.g., 163.com)
-            # Send raw command with correct parenthesis format
-            new_tag = imap.protocol.new_tag()
-            if hasattr(new_tag, "__await__"):
-                new_tag = await new_tag
-            await imap.protocol.execute(
-                aioimaplib.Command(
-                    "ID",
-                    new_tag,
-                    '("name" "mcp-email-server" "version" "1.0.0")',
-                )
-            )
+        response = await protocol.execute(command)
+    except asyncio.CancelledError:
+        _discard_imap_after_id_failure(imap, command)
+        raise
+    except aioimaplib.CommandTimeout:
+        _discard_imap_after_id_failure(imap, command)
+        logger.warning("IMAP ID command timed out")
+        raise TimeoutError("IMAP ID command timed out") from None
     except Exception as e:
+        _discard_imap_after_id_failure(imap, command)
         logger.warning(f"IMAP ID command failed: {e!s}")
+        raise ImapTransportError("IMAP ID command failed (TRANSPORT)") from None
+    if _imap_status(response) != "OK":
+        logger.warning(f"IMAP ID command failed: {_format_imap_response_detail(response)}")
 
 
 async def _imap_login(
@@ -1240,30 +1299,30 @@ class EmailClient:
             return results, total
 
     def _check_email_content(self, data: list) -> bool:
-        """Check if the fetched data contains actual email content."""
-        for item in data:
-            if isinstance(item, bytes) and b"FETCH (" in item and b"RFC822" not in item and b"BODY" not in item:
-                # This is just metadata, not actual content
-                continue
-            elif isinstance(item, bytes | bytearray) and len(item) > 100:
-                # This looks like email content
-                return True
-        return False
+        """Check whether a FETCH response contains a full-message literal."""
+        return self._extract_raw_email(data) is not None
 
     def _extract_raw_email(self, data: list) -> bytes | None:
-        """Extract raw email bytes from IMAP response data."""
-        # The email content is typically at index 1 as a bytearray
-        if len(data) > 1 and isinstance(data[1], bytearray):
-            return bytes(data[1])
+        """Extract the full-message literal that follows its FETCH marker.
 
-        # Search through all items for email content
-        for item in data:
-            if isinstance(item, bytes | bytearray) and len(item) > 100:
-                # Skip IMAP protocol responses
-                if isinstance(item, bytes) and b"FETCH" in item:
-                    continue
-                # This is likely the email content
-                return bytes(item) if isinstance(item, bytearray) else item
+        Identify the body structurally rather than by payload size: a short
+        message is still a message, and a long line of protocol metadata is not.
+        """
+        for marker, payload in pairwise(data):
+            if not isinstance(marker, bytes) or _FETCH_MESSAGE_MARKER_RE.match(marker) is None:
+                continue
+            if not isinstance(payload, bytes | bytearray):
+                continue
+
+            literal_size = _IMAP_LITERAL_SIZE_RE.search(marker)
+            if literal_size is not None and len(payload) != int(literal_size.group(1)):
+                continue
+            # aioimaplib represents parsed literals as bytearray. Plain bytes are
+            # accepted only when the wire marker supplies the literal length.
+            if isinstance(payload, bytearray):
+                return bytes(payload)
+            if literal_size is not None:
+                return payload
         return None
 
     async def _fetch_email_with_formats(self, imap, email_id: str) -> list | None:
