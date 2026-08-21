@@ -2,10 +2,17 @@ import asyncio
 import ssl
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aioimaplib
 import pytest
 
 from mcp_email_server.config import EmailServer, EmailSettings
-from mcp_email_server.emails.classic import EmailClient, _create_starttls_ssl_context, _imap_starttls
+from mcp_email_server.emails.classic import (
+    EmailClient,
+    ImapTransportError,
+    _create_starttls_ssl_context,
+    _imap_starttls,
+    _send_imap_id,
+)
 
 
 class Response:
@@ -16,16 +23,18 @@ class Response:
 
 def _make_imap(capabilities=("IMAP4rev1", "STARTTLS")):
     imap = AsyncMock()
+    imap.timeout = 10
     imap._client_task = asyncio.Future()
     imap._client_task.set_result(None)
     imap.wait_hello_from_server = AsyncMock()
     imap.protocol = MagicMock()
     imap.protocol.capabilities = set(capabilities)
+    imap.protocol.pending_async_commands = {}
     imap.protocol.loop = asyncio.get_event_loop()
     imap.protocol.new_tag.return_value = "A001"
     imap.protocol.execute = AsyncMock(return_value=Response("OK"))
     imap.protocol.capability = AsyncMock()
-    imap.protocol.transport = MagicMock()
+    imap.protocol.transport = MagicMock(spec=asyncio.Transport)
     return imap
 
 
@@ -104,6 +113,154 @@ async def test_imap_starttls_raises_when_command_fails():
 
     with pytest.raises(OSError, match="STARTTLS command failed: NO"):
         await _imap_starttls(imap, ssl.create_default_context(), "127.0.0.1")
+
+
+@pytest.mark.asyncio
+async def test_send_imap_id_sends_one_compact_command():
+    # Bytes/lowercase capabilities exercise the normalization in _imap_capabilities.
+    imap = _make_imap(capabilities=(b"imap4rev1", b"id"))
+
+    await _send_imap_id(imap)
+
+    imap.id.assert_not_awaited()
+    imap.protocol.execute.assert_awaited_once()
+    command = imap.protocol.execute.await_args.args[0]
+    assert command.name == "ID"
+    assert command.tag == "A001"
+    assert command.args == ('("name" "mcp-email-server" "version" "1.0.0")',)
+    assert command._timeout == imap.timeout
+
+
+@pytest.mark.asyncio
+async def test_send_imap_id_skips_server_without_capability():
+    imap = _make_imap(capabilities=("IMAP4rev1",))
+
+    await _send_imap_id(imap)
+
+    imap.id.assert_not_awaited()
+    imap.protocol.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_imap_id_logs_non_ok_response_without_retrying():
+    imap = _make_imap(capabilities=("IMAP4rev1", "ID"))
+    imap.protocol.execute.return_value = Response("BAD", [b"malformed command"])
+
+    with patch("mcp_email_server.emails.classic.logger.warning") as mock_warning:
+        await _send_imap_id(imap)
+
+    # Non-OK is informational: no retry, no abort, connection stays usable.
+    imap.protocol.execute.assert_awaited_once()
+    assert imap.protocol is not None
+    imap.protocol.transport.abort.assert_not_called()
+    mock_warning.assert_called_once_with("IMAP ID command failed: BAD malformed command")
+
+
+@pytest.mark.asyncio
+async def test_send_imap_id_discards_connection_after_timeout():
+    imap = _make_imap(capabilities=("IMAP4rev1", "ID"))
+    protocol = imap.protocol
+
+    async def time_out(command: aioimaplib.Command) -> None:
+        protocol.pending_async_commands["ID"] = command
+        raise aioimaplib.CommandTimeout(command)
+
+    protocol.execute.side_effect = time_out
+
+    with (
+        patch("mcp_email_server.emails.classic.logger.warning") as mock_warning,
+        pytest.raises(TimeoutError, match="IMAP ID command timed out"),
+    ):
+        await _send_imap_id(imap)
+
+    assert imap.protocol is None
+    assert protocol.pending_async_commands == {}
+    protocol.transport.abort.assert_called_once_with()
+    mock_warning.assert_called_once_with("IMAP ID command timed out")
+
+
+@pytest.mark.asyncio
+async def test_send_imap_id_discards_connection_on_cancellation():
+    imap = _make_imap(capabilities=("IMAP4rev1", "ID"))
+    protocol = imap.protocol
+    command_started = asyncio.Event()
+
+    async def wait_for_response(command: aioimaplib.Command) -> None:
+        protocol.pending_async_commands["ID"] = command
+        command_started.set()
+        await asyncio.Future()
+
+    protocol.execute.side_effect = wait_for_response
+    operation = asyncio.create_task(_send_imap_id(imap))
+    await command_started.wait()
+    operation.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+
+    assert imap.protocol is None
+    assert protocol.pending_async_commands == {}
+    protocol.transport.abort.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_send_imap_id_discards_connection_after_transport_failure():
+    imap = _make_imap(capabilities=("IMAP4rev1", "ID"))
+    protocol = imap.protocol
+    protocol.execute.side_effect = ConnectionError("provider detail")
+
+    with (
+        patch("mcp_email_server.emails.classic.logger.warning") as mock_warning,
+        pytest.raises(ImapTransportError, match=r"IMAP ID command failed \(TRANSPORT\)"),
+    ):
+        await _send_imap_id(imap)
+
+    assert imap.protocol is None
+    protocol.transport.abort.assert_called_once_with()
+    mock_warning.assert_called_once_with("IMAP ID command failed: provider detail")
+
+
+@pytest.mark.asyncio
+async def test_send_imap_id_closes_non_write_transport():
+    imap = _make_imap(capabilities=("IMAP4rev1", "ID"))
+    protocol = imap.protocol
+    protocol.transport = MagicMock(spec=asyncio.ReadTransport)
+    protocol.execute.side_effect = ConnectionError("provider detail")
+
+    with pytest.raises(ImapTransportError):
+        await _send_imap_id(imap)
+
+    protocol.transport.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_send_imap_id_handles_missing_protocol():
+    imap = AsyncMock()
+    imap.protocol = None
+
+    with patch("mcp_email_server.emails.classic.logger.warning") as mock_warning:
+        await _send_imap_id(imap)
+
+    imap.id.assert_not_awaited()
+    mock_warning.assert_called_once_with("IMAP ID command failed: IMAP protocol is not connected")
+
+
+@pytest.mark.asyncio
+async def test_imap_connection_sends_id_when_server_advertises_it():
+    """An ID-capable server still gets exactly one ID command from _imap_connection."""
+    server = EmailServer(user_name="user", password="secret", host="imap.example.com", port=143, use_ssl=False)
+    mock_imap = _make_imap(capabilities=("IMAP4rev1", "ID"))
+    mock_imap.login = AsyncMock(return_value=Response("OK"))
+    mock_imap.logout = AsyncMock()
+    client = EmailClient(server)
+
+    with patch.object(client, "_imap_connect", return_value=mock_imap):
+        async with client._imap_connection(mailbox=None) as imap:
+            assert imap is mock_imap
+
+    mock_imap.id.assert_not_awaited()
+    mock_imap.protocol.execute.assert_awaited_once()
+    assert mock_imap.protocol.execute.await_args.args[0].name == "ID"
 
 
 @pytest.mark.asyncio
