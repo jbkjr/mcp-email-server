@@ -593,3 +593,102 @@ def test_report_blocked_mutations_env_overrides_toml(tmp_path, monkeypatch):
         assert config_module.get_settings(reload=True).report_blocked_mutations is True
     finally:
         config_module._settings = None
+
+
+# ---------------------------------------------------------------------------
+# Provider-compatibility identification headers (upstream #219)
+# ---------------------------------------------------------------------------
+
+
+def test_identification_headers_default_to_safe_values():
+    server = EmailServer(user_name="u", password=SecretStr("p"), host="smtp.example.com", port=465)
+
+    assert server.smtp_user_agent == "mcp-email-server"
+    assert server.smtp_x_mailer == "mcp-email-server"
+
+
+def test_identification_headers_absent_from_existing_config_use_defaults():
+    """Config files written before these fields existed must still load."""
+    email = EmailSettings.model_validate({
+        "account_name": "legacy",
+        "full_name": "Legacy User",
+        "email_address": "legacy@example.com",
+        "incoming": {
+            "user_name": "legacy",
+            "password": "pw",
+            "host": "imap.example.com",
+            "port": 993,
+            "use_ssl": True,
+        },
+        "outgoing": {
+            "user_name": "legacy",
+            "password": "pw",
+            "host": "smtp.example.com",
+            "port": 465,
+            "use_ssl": True,
+        },
+    })
+
+    assert email.incoming.smtp_user_agent == "mcp-email-server"
+    assert email.outgoing.smtp_x_mailer == "mcp-email-server"
+
+
+def test_identification_headers_round_trip_through_toml(tmp_path, monkeypatch):
+    """New fields must survive the store/load cycle the keyring migration uses."""
+    import mcp_email_server.config as config_module
+
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
+    monkeypatch.setattr(config_module, "CONFIG_PATH", cfg)
+    config_module._settings = None
+    try:
+        settings = config_module.get_settings(reload=True)
+        settings.add_email(
+            EmailSettings.init(
+                account_name="acct",
+                full_name="Test User",
+                email_address="test@example.com",
+                user_name="u",
+                password="p",
+                imap_host="imap.example.com",
+                smtp_host="smtp.example.com",
+                smtp_user_agent="Acme Mailer/2.1",
+                smtp_x_mailer="Acme-X",
+            )
+        )
+        settings.store()
+
+        reloaded = config_module.get_settings(reload=True)
+        account = reloaded.get_account("acct")
+        assert account.outgoing.smtp_user_agent == "Acme Mailer/2.1"
+        assert account.outgoing.smtp_x_mailer == "Acme-X"
+        assert account.incoming.smtp_user_agent == "Acme Mailer/2.1"
+    finally:
+        config_module._settings = None
+
+
+@pytest.mark.parametrize("field", ["smtp_user_agent", "smtp_x_mailer"])
+@pytest.mark.parametrize("injected", ["bad\r\nBcc: attacker@example.com", "bad\nX-Evil: 1", "bad\x7f"])
+def test_identification_headers_reject_control_characters(field, injected):
+    with pytest.raises(ValidationError, match="control characters"):
+        EmailServer(
+            user_name="u",
+            password=SecretStr("p"),
+            host="smtp.example.com",
+            port=465,
+            **{field: injected},
+        )
+
+
+def test_identification_headers_are_stripped():
+    server = EmailServer(
+        user_name="u",
+        password=SecretStr("p"),
+        host="smtp.example.com",
+        port=465,
+        smtp_user_agent="  Acme Mailer  ",
+        smtp_x_mailer="   ",
+    )
+
+    assert server.smtp_user_agent == "Acme Mailer"
+    assert server.smtp_x_mailer == ""
