@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable
 from dataclasses import dataclass
+from email.message import Message
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -16,6 +17,9 @@ from mcp_email_server.application.mutations import (
     BatchMutationOutcome,
     DeleteCommand,
     DeliveryMutationOutcome,
+    ForwardCommand,
+    ForwardSource,
+    ForwardSourcePart,
     MoveCommand,
     MutationAccountSnapshot,
     MutationProjection,
@@ -161,6 +165,79 @@ class ClassicMutationProvider:
                 command.in_reply_to,
                 command.references,
                 command.reply_to,
+            )
+        )
+
+    async def _read_forward_source(
+        self,
+        command: ForwardCommand,
+        account: MutationAccountSnapshot,
+    ) -> ForwardSource:
+        source = await self._handler.incoming_client.fetch_forward_source(
+            command.source_email_id,
+            command.source_mailbox,
+            list(account.allowed_senders),
+            command.include_attachments,
+        )
+        return ForwardSource(
+            subject=source["subject"],
+            sender=source["from"],
+            recipients=tuple(source["recipients"]),
+            date=source["date"],
+            body_text=source["body"],
+            parts=tuple(
+                ForwardSourcePart(
+                    content_type=part.get_content_type(),
+                    filename=part.get_filename(),
+                    # The serialized part is what the SMTP transaction actually carries,
+                    # so it is the only honest size to bound the forward against.
+                    byte_size=len(part.as_bytes()),
+                    raw_part=part,
+                )
+                for part in source["parts"]
+            ),
+        )
+
+    async def fetch_forward_source(
+        self,
+        command: ForwardCommand,
+        account: MutationAccountSnapshot,
+    ) -> ForwardSource:
+        # Sentinel ValueErrors (missing, blocked, unreadable, oversized, unparseable)
+        # reach the workflow unchanged; anything else is sanitized before it escapes.
+        return await _bounded_mutation_call(self._read_forward_source(command, account))
+
+    async def forward(
+        self,
+        command: ForwardCommand,
+        source: ForwardSource,
+        account: MutationAccountSnapshot,
+    ) -> DeliveryMutationOutcome:
+        del account
+        client = self._handler.outgoing_client
+        if client is None:
+            raise MutationProviderError("capability_unavailable: SMTP is not configured for this account")
+        extra_parts: list[Message] = []
+        for part in source.parts:
+            raw_part = part.raw_part
+            if not isinstance(raw_part, Message):
+                raise MutationProviderError("provider_failure: forwarded part evidence is invalid")
+            extra_parts.append(raw_part)
+        return await _bounded_mutation_call(
+            client.send_email_with_outcome(
+                list(command.recipients),
+                # The application layer already derived the subject and prefixed the
+                # caller's note above the composed block: send both verbatim.
+                command.subject,
+                command.body,
+                list(command.cc) or None,
+                list(command.bcc) or None,
+                command.html,
+                list(command.attachments) or None,
+                command.in_reply_to,
+                command.references,
+                None,
+                extra_parts=extra_parts,
             )
         )
 

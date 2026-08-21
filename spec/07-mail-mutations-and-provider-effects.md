@@ -168,6 +168,39 @@ forbidden; operator reconciliation is required.
 Message-ID or other local identifiers can aid reconciliation but do not create
 exactly-once guarantees.
 
+### Forward
+
+Forwarding an existing message is a send workflow with one additional preceding
+provider effect. It performs three independent effects, each preceded by a fresh
+read and validation of current account lifecycle, capability, and policy:
+
+1. a bounded IMAP read of the source message in the requested source mailbox;
+2. SMTP delivery of the newly composed message;
+3. the IMAP sent-copy APPEND described above.
+
+The source read MUST complete successfully before an SMTP session is opened. A
+failed, denied, cancelled, or ambiguous source read aborts the workflow with no
+delivery attempt, because a forward delivered without the parts it was supposed
+to carry is silent content loss rather than partial success. The service MUST
+NOT substitute an empty or partial body for an unreadable source.
+
+The composed subject derives from the source subject with one `Fwd:` prefix and
+is not prefixed again when the source subject already carries that prefix in any
+letter case. Forwarded content is re-composed as a bounded plain-text block
+carrying the original's originator, recipient, date, and subject headers; it does
+not reproduce the source's HTML rendering, and it is bounded by the same compose
+body limits as other send input. Re-attached parts preserve their source MIME
+main type, subtype, and parameters rather than being coerced into
+`application/*`.
+
+The source read is a mail read and is subject to the sender allowlist under the
+same privacy rule as every other read path: a blocked source is not
+distinguishable from a missing one. The forward's own recipients are subject to
+the recipient allowlist before any provider effect. Delivery and sent-copy
+outcomes are represented independently under the rules above; an ambiguous SMTP
+outcome is `unknown`, sets `reconciliation_needed`, and is never automatically
+replayed.
+
 ## Authority Changes Between Effects
 
 Before sent-copy, destination creation, or another independent effect, the
@@ -229,3 +262,8 @@ enter public errors.
     SMTPUTF8 detection and pre-effect rejection, display-name downgrade without
     a false SMTPUTF8 requirement, pre-SELECT RFC 6855 negotiation, exact literal8
     APPEND framing, and abort/no-replay behavior at ambiguous framing boundaries.
+12. Forward executes source read, SMTP delivery, and sent copy as three
+    independent effects with authority revalidated before each. Tests prove that a
+    failed, denied, or allowlist-blocked source read aborts before any SMTP
+    session opens, that re-attached parts preserve source MIME type and
+    parameters, and that an existing `Fwd:` subject prefix is not duplicated.

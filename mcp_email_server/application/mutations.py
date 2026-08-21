@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, TypeVar
 
@@ -263,6 +263,49 @@ class SendCommand(ComposeCommand):
         _validate_optional_header("reply_to", self.reply_to)
 
 
+@dataclass(frozen=True)
+class ForwardSourcePart:
+    """One retained body part of a forwarded message.
+
+    ``raw_part`` is opaque to the application layer: MIME construction stays in
+    the provider adapter, while the application only bounds declared sizes.
+    """
+
+    content_type: str
+    filename: str | None
+    byte_size: int
+    raw_part: object
+
+
+@dataclass(frozen=True)
+class ForwardSource:
+    """Provider evidence about the message a forward is derived from.
+
+    ``body_text`` is the provider-composed forwarded block (its own quoting
+    header plus the original text); the application only prefixes the caller's
+    note and never formats the block itself.
+    """
+
+    subject: str
+    sender: str
+    recipients: tuple[str, ...]
+    date: str
+    body_text: str
+    parts: tuple[ForwardSourcePart, ...]
+
+
+@dataclass(frozen=True)
+class ForwardCommand(ComposeCommand):
+    source_email_id: str = ""
+    source_mailbox: str = "INBOX"
+    include_attachments: bool = True
+
+    def validate(self) -> None:
+        super().validate()
+        validate_imap_uid(self.source_email_id, field_name="email_id")
+        validate_mailbox_name(self.source_mailbox)
+
+
 class MutationAccountAuthority(Protocol):
     def resolve(
         self,
@@ -310,6 +353,19 @@ class MutationProvider(Protocol):
         sent_message: object,
         bcc: tuple[str, ...],
     ) -> SentCopyMutationOutcome: ...
+
+    async def fetch_forward_source(
+        self,
+        command: ForwardCommand,
+        account: MutationAccountSnapshot,
+    ) -> ForwardSource: ...
+
+    async def forward(
+        self,
+        command: ForwardCommand,
+        source: ForwardSource,
+        account: MutationAccountSnapshot,
+    ) -> DeliveryMutationOutcome: ...
 
 
 @dataclass(frozen=True)
@@ -424,6 +480,50 @@ def _validate_attachments(attachments: tuple[str, ...]) -> None:
         total_size += size
         if total_size > APPLICATION_LIMITS.total_attachment_bytes:
             raise ValueError(f"attachments exceed {APPLICATION_LIMITS.total_attachment_bytes} bytes in total")
+
+
+def _forwarded_subject(subject: str) -> str:
+    """Return the derived forward subject without stacking a second prefix."""
+
+    return subject if subject.casefold().startswith("fwd:") else f"Fwd: {subject}"
+
+
+def _forwarded_body(note: str, block: str) -> str:
+    """Join the caller's note with the provider-composed forwarded block."""
+
+    return f"{note}\n\n{block}" if note else block
+
+
+def _validate_forward_source(source: ForwardSource) -> ForwardSource:
+    """Bound in-memory forwarded parts and derived content before any delivery.
+
+    ``_validate_attachments`` bounds caller-supplied filesystem paths; forwarded
+    parts never touch the filesystem, so their declared sizes are bounded here
+    against the same limits.
+    """
+
+    if len(source.parts) > APPLICATION_LIMITS.attachments:
+        raise ValueError(f"forwarded message must contain at most {APPLICATION_LIMITS.attachments} parts")
+    total_size = 0
+    for part in source.parts:
+        if not isinstance(part.byte_size, int) or isinstance(part.byte_size, bool) or part.byte_size < 0:
+            raise ValueError("forwarded part size must be a non-negative integer")
+        if part.byte_size > APPLICATION_LIMITS.attachment_bytes:
+            raise ValueError(f"a forwarded part exceeds {APPLICATION_LIMITS.attachment_bytes} bytes")
+        total_size += part.byte_size
+        if total_size > APPLICATION_LIMITS.total_attachment_bytes:
+            raise ValueError(f"forwarded parts exceed {APPLICATION_LIMITS.total_attachment_bytes} bytes in total")
+    validate_controlled_string(
+        _forwarded_subject(source.subject),
+        field_name="subject",
+        maximum_bytes=APPLICATION_LIMITS.subject_bytes,
+        allow_empty=True,
+    )
+    if not isinstance(source.body_text, str):
+        raise ValueError("body must be a string")  # noqa: TRY004 - stable validation contract
+    if len(source.body_text.encode("utf-8")) > APPLICATION_LIMITS.body_bytes:
+        raise ValueError(f"body exceeds {APPLICATION_LIMITS.body_bytes} bytes")
+    return source
 
 
 def _validate_optional_header(name: str, value: str | None) -> None:
@@ -628,6 +728,89 @@ class _MutationWorkflow:
             return False
         return True
 
+    async def _complete_send(
+        self,
+        account: MutationAccountSnapshot,
+        delivery: DeliveryMutationOutcome,
+        bcc: tuple[str, ...],
+    ) -> SendMutationOutcome:
+        """Attach the independent Sent copy to already-authoritative delivery.
+
+        Every submission workflow shares this tail so the ambiguity and
+        ``reconciliation_needed`` semantics have exactly one owner.
+        """
+
+        if not delivery.has_accepted_recipient or delivery.sent_message is None:
+            return _validate_send_result(SendMutationOutcome(delivery.outcomes, SentCopyMutationOutcome("skipped")))
+
+        # Saving the copy is a separate provider effect and therefore gets a fresh
+        # lifecycle/credential resolution. SMTP delivery is never rewritten.
+        try:
+            sent_access = self._open(account, purpose="sent-copy")
+        except Exception:
+            # SMTP delivery is already authoritative. Lifecycle or credential
+            # failure before opening the independent copy cannot erase it.
+            return _validate_send_result(
+                SendMutationOutcome(
+                    delivery.outcomes,
+                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
+                )
+            )
+        try:
+            sent_copy = await _bounded_provider_effect(sent_access.provider.save_sent_copy(delivery.sent_message, bcc))
+        except MutationProviderError:
+            # Typed APPEND-boundary cancellation is returned by the provider;
+            # escaped setup/cancellation happened before APPEND started.
+            return _validate_send_result(
+                SendMutationOutcome(
+                    delivery.outcomes,
+                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
+                )
+            )
+        except TimeoutError:
+            return _validate_send_result(
+                SendMutationOutcome(
+                    delivery.outcomes,
+                    SentCopyMutationOutcome("unknown", detail="provider-timeout"),
+                    reconciliation_needed=True,
+                )
+            )
+        except asyncio.CancelledError:
+            # Provider adapters use typed unknown outcomes once APPEND may have
+            # started; an escaped cancellation is therefore pre-effect setup.
+            return _validate_send_result(
+                SendMutationOutcome(
+                    delivery.outcomes,
+                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
+                )
+            )
+        except Exception:
+            # Treat an untyped provider escape conservatively rather than claim
+            # that an APPEND definitely did not happen.
+            return _validate_send_result(
+                SendMutationOutcome(
+                    delivery.outcomes,
+                    SentCopyMutationOutcome("unknown", detail="sent-copy"),
+                )
+            )
+        sent_copy = _validate_sent_copy_result(sent_copy)
+        reconciliation_needed = False
+        if sent_copy.status in ("succeeded", "unknown") and sent_copy.mailbox is not None:
+            invalidated = await self._invalidate(sent_access.account, (sent_copy.mailbox,))
+            reconciliation_needed = not invalidated
+        return _validate_send_result(SendMutationOutcome(delivery.outcomes, sent_copy, reconciliation_needed))
+
+    @staticmethod
+    def _delivery_timeout(command: ComposeCommand) -> SendMutationOutcome:
+        recipients = (*command.recipients, *command.cc, *command.bcc)
+        return _validate_send_result(
+            SendMutationOutcome(
+                tuple(TargetMutationOutcome(recipient, "unknown", "provider-timeout") for recipient in recipients),
+                SentCopyMutationOutcome("skipped"),
+                reconciliation_needed=True,
+            )
+        )
+
 
 class SetEmailFlagsService(_MutationWorkflow):
     async def execute(self, command: SetEmailFlagsCommand) -> BatchMutationOutcome:
@@ -810,79 +993,40 @@ class SendService(_MutationWorkflow):
                 await _bounded_provider_effect(access.provider.send(command, access.account))
             )
         except TimeoutError:
-            recipients = (*command.recipients, *command.cc, *command.bcc)
-            return _validate_send_result(
-                SendMutationOutcome(
-                    tuple(TargetMutationOutcome(recipient, "unknown", "provider-timeout") for recipient in recipients),
-                    SentCopyMutationOutcome("skipped"),
-                    reconciliation_needed=True,
-                )
-            )
-        if not delivery.has_accepted_recipient or delivery.sent_message is None:
-            return _validate_send_result(SendMutationOutcome(delivery.outcomes, SentCopyMutationOutcome("skipped")))
+            return self._delivery_timeout(command)
+        return await self._complete_send(account, delivery, command.bcc)
 
-        # Saving the copy is a separate provider effect and therefore gets a fresh
-        # lifecycle/credential resolution. SMTP delivery is never rewritten.
+
+class ForwardService(_MutationWorkflow):
+    async def execute(self, command: ForwardCommand) -> SendMutationOutcome:
+        command.validate()
+        account = self._resolve(command.account_name)
+        _validate_recipient_policy(command, account)
+        incoming = self._open(account, purpose="incoming")
+        _validate_recipient_policy(command, incoming.account)
         try:
-            sent_access = self._providers.open(
-                command.account_name,
-                expected_mode=account.mode,
-                purpose="sent-copy",
-            )
-        except Exception:
-            # SMTP delivery is already authoritative. Lifecycle or credential
-            # failure before opening the independent copy cannot erase it.
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
-                )
-            )
+            source = await _bounded_provider_effect(incoming.provider.fetch_forward_source(command, incoming.account))
+        except TimeoutError:
+            # Retrieval is a read, not an effect: a forward must never be
+            # submitted without the content and parts it was meant to carry.
+            raise MutationProviderError("forward source retrieval timed out") from None
+        _validate_forward_source(source)
+        forwarded = replace(
+            command,
+            subject=_forwarded_subject(source.subject),
+            body=_forwarded_body(command.body, source.body_text),
+        )
+        forwarded.validate()
+        # Re-resolve authority immediately before the outgoing submission effect.
+        access = self._open(account, purpose="outgoing")
+        _validate_recipient_policy(forwarded, access.account)
         try:
-            sent_copy = await _bounded_provider_effect(
-                sent_access.provider.save_sent_copy(delivery.sent_message, command.bcc)
-            )
-        except MutationProviderError:
-            # Typed APPEND-boundary cancellation is returned by the provider;
-            # escaped setup/cancellation happened before APPEND started.
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
-                )
+            delivery = _validate_delivery_result(
+                await _bounded_provider_effect(access.provider.forward(forwarded, source, access.account))
             )
         except TimeoutError:
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("unknown", detail="provider-timeout"),
-                    reconciliation_needed=True,
-                )
-            )
-        except asyncio.CancelledError:
-            # Provider adapters use typed unknown outcomes once APPEND may have
-            # started; an escaped cancellation is therefore pre-effect setup.
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
-                )
-            )
-        except Exception:
-            # Treat an untyped provider escape conservatively rather than claim
-            # that an APPEND definitely did not happen.
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("unknown", detail="sent-copy"),
-                )
-            )
-        sent_copy = _validate_sent_copy_result(sent_copy)
-        reconciliation_needed = False
-        if sent_copy.status in ("succeeded", "unknown") and sent_copy.mailbox is not None:
-            invalidated = await self._invalidate(sent_access.account, (sent_copy.mailbox,))
-            reconciliation_needed = not invalidated
-        return _validate_send_result(SendMutationOutcome(delivery.outcomes, sent_copy, reconciliation_needed))
+            return self._delivery_timeout(forwarded)
+        return await self._complete_send(account, delivery, forwarded.bcc)
 
 
 @dataclass(frozen=True)
@@ -894,6 +1038,7 @@ class MutationServices:
     move: MoveService
     archive: ArchiveService
     send: SendService
+    forward: ForwardService
 
     @classmethod
     def compose(
@@ -912,4 +1057,5 @@ class MutationServices:
             move=MoveService(*arguments),
             archive=ArchiveService(*arguments),
             send=SendService(*arguments),
+            forward=ForwardService(*arguments),
         )
