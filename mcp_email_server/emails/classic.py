@@ -7,10 +7,12 @@ import re
 import ssl
 import time
 import unicodedata
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from email.header import Header
+from email.headerregistry import Address, AddressHeader
+from email.message import EmailMessage, Message
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -163,8 +165,57 @@ def _format_sender_mailbox(name: str, address: str | None, fallback: str) -> str
     return email.utils.formataddr((str(Header(name, "utf-8")), address))
 
 
-# RFC 3501 system flags (except \Recent which is read-only) + custom keyword atoms
-_VALID_IMAP_FLAG = re.compile(r"^\\[A-Za-z]+$|^[A-Za-z][A-Za-z0-9_-]*$")
+# RFC 3501 atoms exclude controls and these protocol-special characters.
+_IMAP_ATOM_SPECIALS = frozenset('(){%*]\\"')
+# IMAP ``date-text`` month names are protocol constants, so they must not come
+# from ``strftime("%b")``, which is locale-dependent.
+_IMAP_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+# aioimaplib hands back a literal-form mailbox name as two entries: the line
+# ending in ``{n}`` and the raw octets that follow it.
+_IMAP_LITERAL_MARKER = re.compile(rb"(?P<prefix>.*?)(?:~)?\{(?P<size>[0-9]+)\}$")
+
+
+def _is_imap_atom(value: str) -> bool:
+    """Return whether ``value`` is one non-empty RFC 3501 atom."""
+    return bool(value) and all(0x21 <= ord(char) <= 0x7E and char not in _IMAP_ATOM_SPECIALS for char in value)
+
+
+def _is_valid_imap_flag(flag: str) -> bool:
+    """Accept RFC 3501 flag-keyword and flag-extension atoms.
+
+    System flags (``\\Seen``) and IANA keywords alike are atoms, so keywords such
+    as ``$Forwarded``, ``$Junk`` or ``project.name`` are legal and must not be
+    rejected by a narrower ``[A-Za-z]`` spelling.
+    """
+    atom = flag[1:] if flag.startswith("\\") else flag
+    return _is_imap_atom(atom)
+
+
+def _is_imap_astring(value: str) -> bool:
+    """Return whether ASCII text can use the unquoted ``astring`` form."""
+    return bool(value) and all(
+        0x21 <= ord(char) <= 0x7E and (char not in _IMAP_ATOM_SPECIALS or char == "]") for char in value
+    )
+
+
+def _decoded_payload(message: Message) -> bytes | None:
+    """Return a decoded MIME payload when the email API produced bytes."""
+    payload = message.get_payload(decode=True)
+    return payload if isinstance(payload, bytes) else None
+
+
+def _addresses_for_header(message: Message, field_name: str) -> list[Address]:
+    """Parse every instance of one RFC 5322 address field structurally."""
+    addresses: list[Address] = []
+    for raw_header in message.get_all(field_name, []):
+        header = raw_header
+        if not isinstance(header, AddressHeader):
+            parsed = EmailMessage(policy=default)
+            parsed[field_name] = str(raw_header)
+            header = parsed[field_name]
+        if isinstance(header, AddressHeader):
+            addresses.extend(header.addresses)
+    return addresses
 
 
 def _validate_flags(flags: list[str]) -> str:
@@ -175,7 +226,7 @@ def _validate_flags(flags: list[str]) -> str:
     characters.
     """
     for flag in flags:
-        if not _VALID_IMAP_FLAG.match(flag):
+        if not _is_valid_imap_flag(flag):
             msg = f"Invalid IMAP flag: {flag!r}"
             raise ValueError(msg)
     return "(" + " ".join(flags) + ")"
@@ -307,17 +358,18 @@ def _read_imap_list_token(value: str, start: int) -> tuple[str | None, int]:
 
 
 def _parse_list_response(item: bytes | str) -> MailboxInfo | None:
-    """Parse one IMAP LIST response into a MailboxInfo object."""
+    """Parse one complete IMAP LIST data record into a MailboxInfo object."""
     item_str = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item)
     item_str = item_str.strip()
-    if not item_str:
+    # Every LIST data response starts with the mandatory parenthesized attribute
+    # list. Requiring it excludes aioimaplib's trailing tagged completion text
+    # (e.g. Dovecot's ``List completed (0.001 + 0.000 secs).``), which would
+    # otherwise parse into a phantom mailbox.
+    if not item_str.startswith("("):
         return None
 
-    flags: list[str] = []
-    position = 0
-    if item_str.startswith("("):
-        flags_token, position = _read_imap_list_token(item_str, position)
-        flags = [flag.strip() for flag in (flags_token or "").split() if flag.strip()]
+    flags_token, position = _read_imap_list_token(item_str, 0)
+    flags = [flag.strip() for flag in (flags_token or "").split() if flag.strip()]
 
     delimiter_token, position = _read_imap_list_token(item_str, position)
     mailbox_token, _position = _read_imap_list_token(item_str, position)
@@ -326,6 +378,38 @@ def _parse_list_response(item: bytes | str) -> MailboxInfo | None:
 
     delimiter = "" if delimiter_token.upper() == "NIL" else delimiter_token
     return MailboxInfo(name=decode_mailbox_name(mailbox_token), delimiter=delimiter, flags=flags)
+
+
+def _parse_list_responses(items: Sequence[Any]) -> list[MailboxInfo]:
+    """Reassemble aioimaplib LIST lines into mailbox records.
+
+    A mailbox name sent in literal form (``... {7}`` followed by the raw octets)
+    arrives as two separate entries. Splicing the literal back into the line it
+    belongs to keeps the real name instead of parsing ``{7}`` as the mailbox.
+    """
+    mailboxes: list[MailboxInfo] = []
+    index = 0
+    while index < len(items):
+        item = items[index]
+        raw = bytes(item) if isinstance(item, (bytes, bytearray)) else str(item).encode("utf-8")
+        marker = _IMAP_LITERAL_MARKER.fullmatch(raw.strip())
+        if marker is not None:
+            if index + 1 >= len(items) or not isinstance(items[index + 1], (bytes, bytearray)):
+                raise ValueError("Provider returned an incomplete LIST literal")
+            literal = bytes(items[index + 1])
+            expected_size = int(marker.group("size"))
+            if len(literal) != expected_size:
+                raise ValueError("Provider returned an invalid LIST literal size")
+            literal_text = literal.decode("utf-8", errors="replace")
+            escaped = literal_text.replace("\\", "\\\\").replace('"', r"\"")
+            raw = marker.group("prefix").rstrip() + b" " + f'"{escaped}"'.encode()
+            index += 2
+        else:
+            index += 1
+        mailbox = _parse_list_response(raw)
+        if mailbox is not None:
+            mailboxes.append(mailbox)
+    return mailboxes
 
 
 def _quote_mailbox(mailbox: str) -> str:
@@ -814,16 +898,17 @@ class EmailClient:
         return _create_ssl_context(self.smtp_verify_ssl)
 
     @staticmethod
-    def _parse_recipients(email_message) -> list[str]:
-        """Extract recipient addresses from To and Cc headers."""
-        recipients = []
-        to_header = email_message.get("To", "")
-        if to_header:
-            recipients = [addr.strip() for addr in to_header.split(",")]
-        cc_header = email_message.get("Cc", "")
-        if cc_header:
-            recipients.extend([addr.strip() for addr in cc_header.split(",")])
-        return recipients
+    def _parse_recipients(email_message: Message) -> list[str]:
+        """Extract one canonical mailbox per To/Cc address.
+
+        Address headers are structured RFC 5322 fields: commas can occur inside
+        quoted display names (``"Doe, John" <john@example.com>``) and a group can
+        hold several mailboxes. Reading the header registry's ``Address`` objects
+        avoids treating either form as a raw comma-separated string.
+        """
+        return [
+            str(address) for field_name in ("To", "Cc") for address in _addresses_for_header(email_message, field_name)
+        ]
 
     @staticmethod
     def _parse_date(date_str: str) -> datetime:
@@ -854,19 +939,59 @@ class EmailClient:
 
         Treat a part as an attachment when:
           - the disposition explicitly says ``attachment``, OR
-          - the part carries a filename (works for ``inline`` or no disposition).
+          - the part carries a filename (works for ``inline`` or no disposition), OR
+          - the part encapsulates another message as ``message/rfc822``.
+
+        Encapsulated messages are isolated even without a filename so their child
+        text cannot be spliced into the outer message body.
 
         Multipart container parts and bodyless text parts have no filename and an
         empty disposition, so they are correctly excluded.
         """
         content_disposition = str(part.get("Content-Disposition", "")).lower()
-        if "attachment" in content_disposition:
+        if "attachment" in content_disposition or part.get_content_type() == "message/rfc822":
             return True
         filename = part.get_filename()
         # Be defensive: only trust real string filenames. (Unconfigured MagicMock
         # instances in older tests return truthy MagicMock objects from
         # ``get_filename`` and would otherwise misclassify text parts.)
         return isinstance(filename, str) and bool(filename)
+
+    def _iter_content_parts(self, part: Message) -> Iterator[tuple[Message, bool]]:
+        """Yield body leaves and attachment roots without entering attachments.
+
+        Unlike ``Message.walk()`` this never descends into an attachment, so the
+        body of a ``message/rfc822`` attachment stays inside that attachment
+        instead of being spliced into the enclosing message's body.
+        """
+        if self._is_attachment_part(part):
+            yield part, True
+            return
+        if part.is_multipart():
+            payload = part.get_payload()
+            if isinstance(payload, list):
+                for child in payload:
+                    if isinstance(child, Message):
+                        yield from self._iter_content_parts(child)
+            return
+        yield part, False
+
+    @staticmethod
+    def _decode_text_part(part: Message) -> str:
+        """Decode a MIME text part without losing the message on a bad charset.
+
+        ``bytes.decode`` raises ``LookupError`` — not ``UnicodeDecodeError`` — for
+        an unknown codec such as ``unknown-8bit`` or ``x-unknown``, so both have to
+        be caught or the whole email disappears behind the caller's broad except.
+        """
+        payload = _decoded_payload(part)
+        if not payload:
+            return ""
+        charset = part.get_content_charset("utf-8")
+        try:
+            return payload.decode(charset)
+        except (LookupError, UnicodeDecodeError):
+            return payload.decode("utf-8", errors="replace")
 
     def _parse_email_data(  # noqa: C901
         self,
@@ -896,52 +1021,32 @@ class EmailClient:
         html_body = ""
         attachments = []
 
-        if email_message.is_multipart():
-            html_body = ""
-            for part in email_message.walk():
-                content_type = part.get_content_type()
+        is_multipart = email_message.is_multipart()
+        for part, is_attachment in self._iter_content_parts(email_message):
+            content_type = part.get_content_type()
 
-                # Handle attachments — including inline-disposition parts with a
-                # filename (Apple Mail commonly sends photos this way).
-                if self._is_attachment_part(part):
-                    filename = part.get_filename()
-                    if filename:
-                        attachments.append(filename)
-                # Handle text parts - prefer text/plain
-                elif content_type == "text/plain":
-                    body_part = part.get_payload(decode=True)
-                    if body_part:
-                        charset = part.get_content_charset("utf-8")
-                        try:
-                            body += body_part.decode(charset)
-                        except UnicodeDecodeError:
-                            body += body_part.decode("utf-8", errors="replace")
-                elif content_type == "text/html":
-                    html_part = part.get_payload(decode=True)
-                    if html_part:
-                        charset = part.get_content_charset("utf-8")
-                        try:
-                            html_body += html_part.decode(charset)
-                        except UnicodeDecodeError:
-                            html_body += html_part.decode("utf-8", errors="replace")
-            # Fall back to converted HTML if no plain text was found
-            if not body and html_body:
-                body = html_to_text(html_body)
-        else:
-            # Handle single-part emails
-            content_type = email_message.get_content_type()
-            payload = email_message.get_payload(decode=True)
-            if payload:
-                charset = email_message.get_content_charset("utf-8")
-                try:
-                    raw_body = payload.decode(charset)
-                except UnicodeDecodeError:
-                    raw_body = payload.decode("utf-8", errors="replace")
-                if content_type == "text/html":
-                    html_body = raw_body
-                    body = html_to_text(raw_body)
-                else:
-                    body = raw_body
+            # Handle attachments — including inline-disposition parts with a
+            # filename (Apple Mail commonly sends photos this way).
+            if is_attachment:
+                filename = part.get_filename()
+                if isinstance(filename, str) and filename:
+                    attachments.append(filename)
+            # Handle text parts - prefer text/plain
+            elif content_type == "text/plain":
+                body += self._decode_text_part(part)
+            elif content_type == "text/html":
+                # Collected unconditionally, even when a text/plain alternative
+                # already supplied the body: ``quote_reply`` and ``forward_email``
+                # consume ``html_body``.
+                html_body += self._decode_text_part(part)
+            elif not is_multipart:
+                # Lone non-text body (e.g. text/calendar) — keep it rather than
+                # dropping the message's only content.
+                body += self._decode_text_part(part)
+
+        # Fall back to converted HTML if no plain text was found
+        if not body and html_body:
+            body = html_to_text(html_body)
         if body_offset < 0:
             raise ValueError("body_offset must be >= 0")
 
@@ -971,15 +1076,22 @@ class EmailClient:
 
     @staticmethod
     def _sanitize_imap_value(value: str) -> str:
-        """Sanitize a string value for IMAP search criteria.
+        """Encode user text as an RFC 3501 ``astring``.
 
-        For multi-word values, strips embedded double quotes (invalid per RFC 3501
-        Section 4.3) and wraps in double quotes. Single-word values pass through unchanged.
+        A bare word only stays unquoted when every character is a legal astring
+        character; anything carrying a quoted-special or list-wildcard is wrapped
+        in a quoted string with ``\\`` and ``"`` escaped rather than stripped, so
+        the user's own quotes survive the round trip and cannot break framing.
+
+        Non-ASCII text is returned as a quoted string; the caller declares
+        ``CHARSET utf-8`` for those searches.
         """
-        if " " not in value:
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+            raise ValueError("IMAP search values must not contain control characters")
+        if _is_imap_astring(value):
             return value
-        sanitized = value.replace('"', "")
-        return f'"{sanitized}"'
+        escaped = value.replace("\\", "\\\\").replace('"', r"\"")
+        return f'"{escaped}"'
 
     @staticmethod
     def _build_search_criteria(
@@ -996,10 +1108,13 @@ class EmailClient:
         has_attachment: bool | None = None,
     ) -> list[str]:
         search_criteria = []
+        # IMAP ``date-text`` uses fixed English month abbreviations. ``strftime``
+        # is locale-dependent (``05-MÄRZ-2026`` under de_DE), which the server
+        # rejects, so index the protocol constants directly.
         if before:
-            search_criteria.extend(["BEFORE", before.strftime("%d-%b-%Y").upper()])
+            search_criteria.extend(["BEFORE", f"{before.day:02d}-{_IMAP_MONTHS[before.month - 1]}-{before.year:04d}"])
         if since:
-            search_criteria.extend(["SINCE", since.strftime("%d-%b-%Y").upper()])
+            search_criteria.extend(["SINCE", f"{since.day:02d}-{_IMAP_MONTHS[since.month - 1]}-{since.year:04d}"])
         # Substring-match fields (IMAP keyword, value)
         text_criteria = [
             ("SUBJECT", subject),
@@ -1774,10 +1889,11 @@ class EmailClient:
             # List all folders - aioimaplib requires reference_name and mailbox_pattern
             _, folders = await imap.list('""', "*")
 
-            # Search for folder with \Sent flag
-            for folder in folders:
-                mailbox = _parse_list_response(folder)
-                if mailbox and r"\Sent" in mailbox.flags:
+            # Search for folder with \Sent flag. RFC 6154 special-use attributes
+            # are case-insensitive, and the comparison is exact so a hypothetical
+            # \NoSent attribute cannot match.
+            for mailbox in _parse_list_responses(folders):
+                if any(flag.casefold() == r"\sent" for flag in mailbox.flags):
                     logger.info(f"Found Sent folder by \\Sent flag: '{mailbox.name}'")
                     return mailbox.name
         except Exception as e:
@@ -2213,10 +2329,7 @@ class EmailClient:
             _raise_for_imap_error(response, f"LIST mailboxes with pattern {pattern}")
             _, data = response
 
-            for item in data:
-                mailbox = _parse_list_response(item)
-                if mailbox:
-                    mailboxes.append(mailbox)
+            mailboxes.extend(_parse_list_responses(data))
 
         return mailboxes
 
@@ -2529,9 +2642,11 @@ class ClassicEmailHandler(EmailHandler):
 
         try:
             folders = await self.incoming_client.list_mailboxes()
-            # Check for RFC 6154 flag first
+            # Check for RFC 6154 flag first. Special-use attributes are
+            # case-insensitive; the comparison is exact so an unrelated
+            # attribute that merely contains the name cannot match.
             for folder in folders:
-                if any(flag.lower() in f.lower() for f in folder.flags):
+                if any(f.casefold() == flag.casefold() for f in folder.flags):
                     setattr(self, cache_key, folder.name)
                     return folder.name
             # Fall back to common names
