@@ -13,7 +13,16 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import tomli_w
-from pydantic import BaseModel, Field, PrivateAttr, SecretStr, SerializationInfo, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    SerializationInfo,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -31,6 +40,12 @@ else:
 
 DEFAULT_CONFIG_PATH = "~/.config/zerolib/mcp_email_server/config.toml"
 _VALID_CREDENTIAL_STORAGE_MODES = ("auto", "keyring", "plaintext")
+
+# Provider-compatibility identification headers (RFC 5322 optional fields). Some
+# providers (web.de, 1&1, GMX) reject messages that carry no sender-software
+# identification with a 5xx. Defaults contain no account-specific information.
+DEFAULT_SMTP_USER_AGENT = "mcp-email-server"
+DEFAULT_SMTP_X_MAILER = "mcp-email-server"
 
 # Set by Settings.load_for_migration() around construction so __init__ can skip
 # env-composited state (override pickup, env-account injection, allowlist/bool env
@@ -109,6 +124,19 @@ class EmailServer(BaseModel):
     use_ssl: bool = True  # Usually port 465
     start_ssl: bool = False  # Usually port 587
     verify_ssl: bool = True  # Set to False for self-signed certificates (e.g., ProtonMail Bridge)
+    # Sender-software identification added to composed messages. Empty string omits
+    # the header. Defaults are safe; they leak nothing about the account.
+    smtp_user_agent: str = DEFAULT_SMTP_USER_AGENT
+    smtp_x_mailer: str = DEFAULT_SMTP_X_MAILER
+
+    @field_validator("smtp_user_agent", "smtp_x_mailer")
+    @classmethod
+    def validate_identification_header(cls, v: str) -> str:
+        """Reject control characters so a configured value cannot inject headers."""
+        stripped = v.strip()
+        if any(ord(c) < 32 or ord(c) == 127 for c in stripped):
+            raise ValueError("identification header value must not contain control characters")
+        return stripped
 
     @field_serializer("password")
     def serialize_password(self, v: SecretStr, info: SerializationInfo) -> str:
@@ -187,6 +215,8 @@ class EmailSettings(AccountAttributes):
         save_to_sent: bool = True,
         sent_folder_name: str | None = None,
         email_service: str | None = None,
+        smtp_user_agent: str = DEFAULT_SMTP_USER_AGENT,
+        smtp_x_mailer: str = DEFAULT_SMTP_X_MAILER,
     ) -> EmailSettings:
         for candidate in (password, imap_password, smtp_password):
             if candidate == keyring_store.SENTINEL:
@@ -206,6 +236,10 @@ class EmailSettings(AccountAttributes):
                 use_ssl=imap_ssl,
                 start_ssl=imap_start_ssl,
                 verify_ssl=imap_verify_ssl,
+                # Drafts composed via save_to_mailbox go through the incoming client,
+                # so it carries the same identification headers as outgoing mail.
+                smtp_user_agent=smtp_user_agent,
+                smtp_x_mailer=smtp_x_mailer,
             ),
             outgoing=(
                 EmailServer(
@@ -216,6 +250,8 @@ class EmailSettings(AccountAttributes):
                     use_ssl=smtp_ssl,
                     start_ssl=smtp_start_ssl,
                     verify_ssl=smtp_verify_ssl,
+                    smtp_user_agent=smtp_user_agent,
+                    smtp_x_mailer=smtp_x_mailer,
                 )
                 if smtp_host
                 else None
@@ -248,6 +284,8 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_SAVE_TO_SENT (default: true)
         - MCP_EMAIL_SERVER_SENT_FOLDER_NAME (default: auto-detect)
         - MCP_EMAIL_SERVER_EMAIL_SERVICE (default: auto-detect from IMAP host)
+        - MCP_EMAIL_SERVER_SMTP_USER_AGENT (default: "mcp-email-server"; empty omits the header)
+        - MCP_EMAIL_SERVER_SMTP_X_MAILER (default: "mcp-email-server"; empty omits the header)
         """
         # Check if minimum required environment variables are set
         email_address = os.getenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS")
@@ -292,6 +330,8 @@ class EmailSettings(AccountAttributes):
                 save_to_sent=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SAVE_TO_SENT"), True),
                 sent_folder_name=os.getenv("MCP_EMAIL_SERVER_SENT_FOLDER_NAME"),
                 email_service=os.getenv("MCP_EMAIL_SERVER_EMAIL_SERVICE"),
+                smtp_user_agent=os.getenv("MCP_EMAIL_SERVER_SMTP_USER_AGENT", DEFAULT_SMTP_USER_AGENT),
+                smtp_x_mailer=os.getenv("MCP_EMAIL_SERVER_SMTP_X_MAILER", DEFAULT_SMTP_X_MAILER),
             )
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to create email settings from environment variables: {e}")

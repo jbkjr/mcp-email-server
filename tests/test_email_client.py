@@ -2,10 +2,12 @@ import asyncio
 import email
 import ssl
 from datetime import datetime, timezone
+from email.header import decode_header, make_header
 from email.mime.text import MIMEText
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiosmtplib.email import extract_sender
 
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails.classic import (
@@ -33,6 +35,28 @@ def email_server():
 @pytest.fixture
 def email_client(email_server):
     return EmailClient(email_server, sender="Test User <test@example.com>")
+
+
+@pytest.fixture
+def email_settings_factory(email_server):
+    """Build EmailSettings with an arbitrary sender identity."""
+
+    def _factory(*, full_name: str, email_address: str) -> EmailSettings:
+        return EmailSettings(
+            account_name="test_account",
+            full_name=full_name,
+            email_address=email_address,
+            incoming=email_server,
+            outgoing=EmailServer(
+                user_name="test_user",
+                password="test_password",
+                host="smtp.example.com",
+                port=465,
+                use_ssl=True,
+            ),
+        )
+
+    return _factory
 
 
 class TestImapLogin:
@@ -615,6 +639,101 @@ class TestSendEmailMessageIdAndDate:
             sent_msg = mock_smtp.send_message.call_args[0][0]
             assert sent_msg["Message-Id"] == returned_msg["Message-Id"]
             assert sent_msg["Date"] == returned_msg["Date"]
+
+
+class TestEnvelopeSender:
+    """Regression coverage for upstream #229 / issue #228.
+
+    Before the fix, ``ClassicEmailHandler`` interpolated ``full_name`` into
+    ``"name <addr>"``. A ``full_name`` that is itself an email address made that
+    string unparseable, so the From header went out malformed and aiosmtplib
+    derived an empty ``MAIL FROM:<>`` reverse-path from it.
+    """
+
+    def test_full_name_that_is_an_email_address_yields_valid_sender(self, email_settings_factory):
+        address = "jack@example.com"
+        handler = ClassicEmailHandler(email_settings_factory(full_name=address, email_address=address))
+
+        for client in (handler.incoming_client, handler.outgoing_client):
+            assert client.sender == '"jack@example.com" <jack@example.com>'
+            assert client.sender_name == address
+            assert client.sender_address == address
+            assert client.envelope_sender == address
+
+    def test_malformed_sender_no_longer_reaches_the_from_header(self, email_settings_factory):
+        """The pre-fix interpolation produced this exact string; assert it is gone."""
+        address = "jack@example.com"
+        handler = ClassicEmailHandler(email_settings_factory(full_name=address, email_address=address))
+
+        msg = handler.outgoing_client.compose_message(["r@example.com"], "Sub", "Body")
+
+        assert msg["From"] != f"{address} <{address}>"
+        assert extract_sender(msg) == address
+
+    def test_non_ascii_display_name_encodes_only_the_display_name(self, email_settings_factory):
+        handler = ClassicEmailHandler(
+            email_settings_factory(full_name="Jörg Müller", email_address="jorg@example.com")
+        )
+        client = handler.outgoing_client
+
+        msg = client.compose_message(["r@example.com"], "Sub", "Body")
+        from_header = msg["From"]
+
+        # The addr-spec must stay outside the RFC 2047 encoded-word.
+        assert from_header.endswith(" <jorg@example.com>")
+        assert from_header.startswith("=?utf-8?")
+        assert str(make_header(decode_header(from_header))) == "Jörg Müller <jorg@example.com>"
+        # The envelope sender is pure ASCII addr-spec regardless of the display name.
+        assert client.envelope_sender == "jorg@example.com"
+        assert extract_sender(msg) == "jorg@example.com"
+
+    def test_envelope_sender_raises_when_no_address_is_available(self, email_server):
+        client = EmailClient(email_server, sender="")
+        client.sender_address = None
+
+        with pytest.raises(ValueError, match="does not contain a usable email address"):
+            _ = client.envelope_sender
+
+    @pytest.mark.asyncio
+    async def test_send_email_passes_addr_spec_as_envelope_sender(self, email_settings_factory):
+        address = "jack@example.com"
+        handler = ClassicEmailHandler(email_settings_factory(full_name=address, email_address=address))
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await handler.outgoing_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test",
+                body="Body",
+            )
+
+        assert mock_smtp.send_message.call_args[1]["sender"] == address
+
+    @pytest.mark.asyncio
+    async def test_send_email_envelope_sender_ignores_display_name(self, email_settings_factory):
+        handler = ClassicEmailHandler(
+            email_settings_factory(full_name="Jörg Müller", email_address="jorg@example.com")
+        )
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await handler.outgoing_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="Test",
+                body="Body",
+            )
+
+        sender = mock_smtp.send_message.call_args[1]["sender"]
+        assert sender == "jorg@example.com"
+        sender.encode("ascii")  # RFC 5321 reverse-path must be ASCII
 
 
 class TestParseEmailData:

@@ -166,6 +166,26 @@ You can also configure the email server using environment variables, which is pa
 | `MCP_EMAIL_SERVER_ALLOWED_SENDERS`            | Sender allowlist (comma-separated globs); empty = all        | -             | No       |
 | `MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS`   | Report blocked mutations as failures (default: silent no-op) | `false`       | No       |
 | `MCP_EMAIL_SERVER_CREDENTIAL_STORAGE`         | Credential storage mode: `auto`, `keyring`, or `plaintext`   | `auto`        | No       |
+| `MCP_EMAIL_SERVER_SMTP_USER_AGENT`            | `User-Agent` header on outgoing mail; empty omits it         | `mcp-email-server` | No  |
+| `MCP_EMAIL_SERVER_SMTP_X_MAILER`              | `X-Mailer` header on outgoing mail; empty omits it           | `mcp-email-server` | No  |
+
+### Outgoing message headers
+
+Every composed message carries a single top-level `MIME-Version: 1.0` (RFC 2045),
+supplied by the MIME constructors. The server also adds `User-Agent` and `X-Mailer`
+identification headers (RFC 5322 optional fields), because some providers — web.de,
+1&1, GMX — answer `554` to messages that carry no sender-software identification.
+
+The defaults (`mcp-email-server`) contain no account-specific information. They can be
+overridden per account via the `smtp_user_agent` / `smtp_x_mailer` fields on an
+`EmailServer` config block, or via the environment variables above; setting either to an
+empty string omits that header entirely. Control characters are rejected at validation
+time so a configured value cannot inject additional headers.
+
+The `From` header is an RFC 5322 name-addr built from `full_name` and `email_address`,
+formatted so that a display name containing specials (including a `full_name` that is
+itself an email address) is quoted rather than left ambiguous. The SMTP envelope sender
+(`MAIL FROM`) always uses the RFC 5321 addr-spec — `email_address` alone.
 
 ### IMAP-only mode (no SMTP)
 

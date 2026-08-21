@@ -80,6 +80,26 @@ def test_from_env_success_with_all_defaults(monkeypatch):
     assert result.incoming.port == 993
     assert result.outgoing is not None
     assert result.outgoing.port == 465
+    assert result.outgoing.smtp_user_agent == "mcp-email-server"
+    assert result.outgoing.smtp_x_mailer == "mcp-email-server"
+
+
+def test_from_env_identification_headers_override_defaults(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS", "user@example.com")
+    monkeypatch.setenv("MCP_EMAIL_SERVER_PASSWORD", "pass")
+    monkeypatch.setenv("MCP_EMAIL_SERVER_IMAP_HOST", "imap.example.com")
+    monkeypatch.setenv("MCP_EMAIL_SERVER_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("MCP_EMAIL_SERVER_SMTP_USER_AGENT", "Acme Mailer/2.1")
+    monkeypatch.setenv("MCP_EMAIL_SERVER_SMTP_X_MAILER", "")
+
+    result = EmailSettings.from_env()
+
+    assert result is not None
+    assert result.outgoing.smtp_user_agent == "Acme Mailer/2.1"
+    assert result.outgoing.smtp_x_mailer == ""
+    # Drafts compose through the incoming client, so it mirrors the same values.
+    assert result.incoming.smtp_user_agent == "Acme Mailer/2.1"
+    assert result.incoming.smtp_x_mailer == ""
 
 
 def test_from_env_with_all_vars_set(monkeypatch):

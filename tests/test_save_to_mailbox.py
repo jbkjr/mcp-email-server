@@ -1,7 +1,10 @@
 """Tests for the save_to_mailbox feature — IMAP APPEND to arbitrary folders."""
 
 import asyncio
+from email.mime.application import MIMEApplication
 from email.mime.text import MIMEText
+from email.policy import SMTP
+from email.utils import parseaddr
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -191,6 +194,110 @@ class TestComposeMessage:
             attachments=[str(test_file)],
         )
         assert msg.get_content_type() == "multipart/mixed"
+
+
+class TestProviderCompatibilityHeaders:
+    """Ported from upstream #219 — web.de / 1&1 / GMX answer 554 without these."""
+
+    @pytest.mark.parametrize(
+        ("html", "with_attachment"),
+        [(False, False), (True, False), (False, True)],
+        ids=["plain", "html", "attachment"],
+    )
+    def test_headers_serialize_exactly_once(self, email_client, tmp_path, *, html, with_attachment):
+        attachments = None
+        if with_attachment:
+            attachment = tmp_path / "document.txt"
+            attachment.write_text("attachment content")
+            attachments = [str(attachment)]
+
+        msg = email_client.compose_message(
+            recipients=["recipient@example.com"],
+            subject="Compatibility",
+            body="message body",
+            html=html,
+            attachments=attachments,
+        )
+        serialized_headers = msg.as_bytes(policy=SMTP).partition(b"\r\n\r\n")[0].split(b"\r\n")
+
+        assert msg.get_all("MIME-Version") == ["1.0"]
+        assert msg["User-Agent"] == "mcp-email-server"
+        assert msg["X-Mailer"] == "mcp-email-server"
+        assert serialized_headers.count(b"MIME-Version: 1.0") == 1
+        assert serialized_headers.count(b"User-Agent: mcp-email-server") == 1
+        assert serialized_headers.count(b"X-Mailer: mcp-email-server") == 1
+
+    def test_headers_present_on_forwarded_message_with_extra_parts(self, email_client):
+        """The fork's forward_email path attaches re-materialized MIME parts."""
+        part = MIMEApplication(b"\x89PNG\r\n\x1a\n", _subtype="png")
+        part.add_header("Content-Disposition", "attachment", filename="pixel.png")
+
+        msg = email_client.compose_message(
+            recipients=["recipient@example.com"],
+            subject="Fwd: original",
+            body="<p>see below</p>",
+            html=True,
+            extra_parts=[part],
+        )
+
+        assert msg.get_content_type() == "multipart/mixed"
+        assert msg.get_all("MIME-Version") == ["1.0"]
+        assert msg["User-Agent"] == "mcp-email-server"
+        assert msg["X-Mailer"] == "mcp-email-server"
+
+    def test_configured_overrides_replace_defaults(self, outgoing_server):
+        server = outgoing_server.model_copy(update={"smtp_user_agent": "Acme Mailer/2.1", "smtp_x_mailer": "Acme-X"})
+        client = EmailClient(server, sender="Test User <test@example.com>")
+
+        msg = client.compose_message(["r@example.com"], "Sub", "Body")
+
+        assert msg["User-Agent"] == "Acme Mailer/2.1"
+        assert msg["X-Mailer"] == "Acme-X"
+
+    def test_empty_configured_value_omits_header(self, outgoing_server):
+        server = outgoing_server.model_copy(update={"smtp_user_agent": "", "smtp_x_mailer": ""})
+        client = EmailClient(server, sender="Test User <test@example.com>")
+
+        msg = client.compose_message(["r@example.com"], "Sub", "Body")
+
+        assert msg["User-Agent"] is None
+        assert msg["X-Mailer"] is None
+        # MIME-Version comes from the MIME constructor and is unaffected.
+        assert msg.get_all("MIME-Version") == ["1.0"]
+
+    def test_drafts_saved_via_incoming_client_carry_headers(self, email_settings):
+        """save_to_mailbox composes through the incoming client, not the outgoing one."""
+        client = ClassicEmailHandler(email_settings).incoming_client
+
+        msg = client.compose_message(["r@example.com"], "Draft", "body", include_bcc_header=True)
+
+        assert msg["User-Agent"] == "mcp-email-server"
+        assert msg["X-Mailer"] == "mcp-email-server"
+
+
+class TestComposeMessageSenderIdentity:
+    """Ported from upstream #229 — header sender and envelope sender are distinct."""
+
+    def test_display_name_that_is_an_email_address_is_quoted(self, email_settings):
+        address = "test@example.com"
+        settings = email_settings.model_copy(update={"full_name": address, "email_address": address})
+        client = ClassicEmailHandler(settings).incoming_client
+
+        msg = client.compose_message(["recipient@example.com"], "Draft", "body", include_bcc_header=True)
+
+        assert msg["From"] == '"test@example.com" <test@example.com>'
+        assert b'From: "test@example.com" <test@example.com>' in msg.as_bytes(policy=SMTP)
+        # And the header still parses back to the same address it was built from.
+        assert parseaddr(msg["From"]) == (address, address)
+
+    def test_message_id_domain_comes_from_envelope_address(self, email_settings):
+        address = "test@example.com"
+        settings = email_settings.model_copy(update={"full_name": address, "email_address": address})
+        client = ClassicEmailHandler(settings).incoming_client
+
+        msg = client.compose_message(["recipient@example.com"], "Draft", "body")
+
+        assert msg["Message-Id"].endswith("@example.com>")
 
 
 class TestComposeMessageBccHeader:

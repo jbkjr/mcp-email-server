@@ -140,6 +140,29 @@ def _is_ok(result: Any) -> bool:
     return str(status).upper() == "OK"
 
 
+def _format_sender_mailbox(name: str, address: str | None, fallback: str) -> str:
+    """Format an RFC 5322 name-addr from a structured display name and addr-spec.
+
+    ``formataddr`` quotes display names containing specials (``@`` among them), so a
+    ``full_name`` that is itself an email address round-trips instead of producing a
+    header that ``parseaddr`` reads back as empty. Only the display name is RFC 2047
+    encoded — encoded-words must never cover the addr-spec.
+
+    *fallback* is returned unchanged when no address could be determined (e.g. an
+    ``EmailServer.user_name`` that is not address-shaped).
+    """
+    if address is None:
+        return fallback
+    try:
+        address.encode("ascii")
+    except UnicodeEncodeError:
+        # ``formataddr`` requires an ASCII addr-spec. RFC 6532 permits this UTF-8
+        # mailbox where the submission path negotiates SMTPUTF8.
+        quoted_name = email.utils.quote(name)
+        return f'"{quoted_name}" <{address}>' if quoted_name else address
+    return email.utils.formataddr((str(Header(name, "utf-8")), address))
+
+
 # RFC 3501 system flags (except \Recent which is read-only) + custom keyword atoms
 _VALID_IMAP_FLAG = re.compile(r"^\\[A-Za-z]+$|^[A-Za-z][A-Za-z0-9_-]*$")
 
@@ -691,15 +714,48 @@ _create_smtp_ssl_context = _create_ssl_context
 
 
 class EmailClient:
-    def __init__(self, email_server: EmailServer, sender: str | None = None):
+    def __init__(
+        self,
+        email_server: EmailServer,
+        sender: str | None = None,
+        *,
+        sender_name: str | None = None,
+        sender_address: str | None = None,
+    ):
+        """Create a client.
+
+        The sender identity is kept structured: ``sender_name`` is the RFC 5322
+        display name and ``sender_address`` the RFC 5321 addr-spec. Passing them
+        separately (rather than a pre-formatted ``sender`` string) is what keeps a
+        display name that happens to look like an email address from corrupting the
+        SMTP envelope. ``sender`` remains supported for callers that already hold a
+        formatted mailbox; it is parsed once here and never re-parsed afterwards.
+        """
         self.email_server = email_server
-        self.sender = sender or email_server.user_name
+        raw_sender = sender or email_server.user_name
+
+        if sender_name is not None and sender_address is not None:
+            self.sender_name = sender_name
+            self.sender_address: str | None = sender_address
+        else:
+            parsed_name, parsed_address = email.utils.parseaddr(raw_sender)
+            self.sender_name = sender_name if sender_name is not None else parsed_name
+            self.sender_address = sender_address or parsed_address or None
+
+        self.sender = _format_sender_mailbox(self.sender_name, self.sender_address, raw_sender)
 
         self.imap_class = aioimaplib.IMAP4_SSL if self.email_server.use_ssl else aioimaplib.IMAP4
 
         self.smtp_use_tls = self.email_server.use_ssl
         self.smtp_start_tls = self.email_server.start_ssl
         self.smtp_verify_ssl = self.email_server.verify_ssl
+
+    @property
+    def envelope_sender(self) -> str:
+        """The RFC 5321 reverse-path (addr-spec only) used for ``MAIL FROM``."""
+        if self.sender_address is None:
+            raise ValueError(f"sender {self.sender!r} does not contain a usable email address")
+        return self.sender_address
 
     def _imap_connect(self, server: "EmailServer | None" = None) -> aioimaplib.IMAP4_SSL | aioimaplib.IMAP4:
         """Create a new IMAP connection with the configured SSL context."""
@@ -1581,14 +1637,20 @@ class EmailClient:
         """Compose an email message without sending it.
 
         Builds MIME structure, sets headers (Subject, From, To, Cc, Date,
-        Message-Id, threading headers). Synchronous — no I/O.
+        Message-Id, User-Agent, X-Mailer, threading headers). Synchronous — no I/O.
 
         When ``include_bcc_header`` is True (used for local IMAP storage such
         as Drafts or Sent copies), the Bcc header is included so mail clients
         can display the BCC recipients.  When False (default, used for SMTP
         sending), the Bcc header is omitted — BCC recipients are delivered
         via the SMTP envelope only.
+
+        Raises:
+            ValueError: If the configured sender has no usable email address.
         """
+        # Fail before building anything if this client has no deliverable identity.
+        envelope_sender = self.envelope_sender
+
         # Convert body to HTML unless it's already raw HTML
         if not html:
             body = markdown_to_email_html(body, wrap_in_html=True)
@@ -1610,17 +1672,9 @@ class EmailClient:
         else:
             msg["Subject"] = subject
 
-        sender_name, sender_address = email.utils.parseaddr(self.sender)
-
-        # Encode only the display name. RFC 2047 encoded-words must not cover the
-        # addr-spec, otherwise strict clients may show the raw encoded blob.
-        if sender_address:
-            msg["From"] = email.utils.formataddr((str(Header(sender_name, "utf-8")), sender_address))
-        elif any(ord(c) > 127 for c in self.sender):
-            msg["From"] = Header(self.sender, "utf-8")
-        else:
-            msg["From"] = self.sender
-
+        # The sender mailbox was formatted from structured identity fields at
+        # construction time; never parse the RFC 5322 header back to recover them.
+        msg["From"] = self.sender
         msg["To"] = ", ".join(recipients)
 
         # Add CC header if provided (visible to recipients)
@@ -1639,11 +1693,19 @@ class EmailClient:
         if reply_to:
             msg["Reply-To"] = reply_to
 
-        # Set Date and Message-Id headers
+        # Set Date and Message-Id headers. The domain comes from the structured
+        # sender address, never from the formatted RFC 5322 From header.
         msg["Date"] = email.utils.formatdate(localtime=True)
-        sender_for_domain = sender_address or self.sender
-        sender_domain = sender_for_domain.rsplit("@", 1)[-1].rstrip(">")
+        sender_domain = envelope_sender.rsplit("@", 1)[-1]
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
+
+        # RFC 5322 optional identification fields. Some providers (web.de, 1&1, GMX)
+        # answer 554 to messages carrying no sender-software identification. The
+        # MIME constructors already supply the single RFC 2045 MIME-Version header.
+        if self.email_server.smtp_user_agent:
+            msg["User-Agent"] = self.email_server.smtp_user_agent
+        if self.email_server.smtp_x_mailer:
+            msg["X-Mailer"] = self.email_server.smtp_x_mailer
 
         return msg
 
@@ -1691,7 +1753,10 @@ class EmailClient:
             if bcc:
                 all_recipients.extend(bcc)
 
-            await smtp.send_message(msg, recipients=all_recipients)
+            # RFC 5321 reverse-path is an addr-spec, not an RFC 5322 name-addr.
+            # Passing it explicitly stops aiosmtplib from re-deriving MAIL FROM by
+            # parsing the From header.
+            await smtp.send_message(msg, sender=self.envelope_sender, recipients=all_recipients)
 
         # Return the message for potential saving to Sent folder
         return msg
@@ -2159,9 +2224,23 @@ class EmailClient:
 class ClassicEmailHandler(EmailHandler):
     def __init__(self, email_settings: EmailSettings):
         self.email_settings = email_settings
-        sender = f"{email_settings.full_name} <{email_settings.email_address}>"
-        self.incoming_client = EmailClient(email_settings.incoming, sender=sender)
-        self.outgoing_client = EmailClient(email_settings.outgoing, sender=sender) if email_settings.outgoing else None
+        # Keep display name and envelope address structured. Interpolating them into
+        # "name <addr>" corrupts both when full_name contains RFC 5322 specials such
+        # as "@" — the formatter quotes the display name, string interpolation can't.
+        self.incoming_client = EmailClient(
+            email_settings.incoming,
+            sender_name=email_settings.full_name,
+            sender_address=email_settings.email_address,
+        )
+        self.outgoing_client = (
+            EmailClient(
+                email_settings.outgoing,
+                sender_name=email_settings.full_name,
+                sender_address=email_settings.email_address,
+            )
+            if email_settings.outgoing
+            else None
+        )
         self.save_to_sent = email_settings.save_to_sent
         self.sent_folder_name = email_settings.sent_folder_name
         self.email_service = _detect_email_service(email_settings)

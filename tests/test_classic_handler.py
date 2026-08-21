@@ -46,6 +46,40 @@ def classic_handler(email_settings):
     return ClassicEmailHandler(email_settings)
 
 
+def test_sender_identity_is_kept_structured(email_settings):
+    """Ported from upstream #229 — display name and envelope address stay separate."""
+    handler = ClassicEmailHandler(email_settings)
+
+    for client in (handler.incoming_client, handler.outgoing_client):
+        assert client.sender_name == "Test User"
+        assert client.sender_address == "test@example.com"
+        assert client.sender == "Test User <test@example.com>"
+        assert client.envelope_sender == "test@example.com"
+
+
+def test_sender_identity_quotes_display_name_containing_at_sign(email_settings):
+    address = "test@example.com"
+    settings = email_settings.model_copy(update={"full_name": address, "email_address": address})
+
+    handler = ClassicEmailHandler(settings)
+
+    assert handler.incoming_client.sender == '"test@example.com" <test@example.com>'
+    assert handler.incoming_client.sender_address == address
+    assert handler.outgoing_client is not None
+    assert handler.outgoing_client.sender == '"test@example.com" <test@example.com>'
+    assert handler.outgoing_client.envelope_sender == address
+
+
+def test_sender_identity_survives_missing_outgoing_server(email_settings):
+    """IMAP-only accounts still compose (save_to_mailbox) via the incoming client."""
+    settings = email_settings.model_copy(update={"outgoing": None})
+
+    handler = ClassicEmailHandler(settings)
+
+    assert handler.outgoing_client is None
+    assert handler.incoming_client.envelope_sender == "test@example.com"
+
+
 class TestClassicEmailHandler:
     def test_init(self, email_settings):
         """Test initialization of ClassicEmailHandler."""
