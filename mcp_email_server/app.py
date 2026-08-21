@@ -574,7 +574,7 @@ async def list_mailboxes(
 
 
 @mcp.tool(
-    description="Download an email attachment and save it to the specified path. This feature must be explicitly enabled in settings (enable_attachment_download=true) due to security considerations.",
+    description="Download an email attachment. By default it is saved with a safe randomized name under the current user's Downloads/mcp-email-server directory; an explicit destination path remains supported. This feature must be explicitly enabled in settings (enable_attachment_download=true) due to security considerations.",
 )
 async def download_attachment(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -584,7 +584,17 @@ async def download_attachment(
     attachment_name: Annotated[
         str, Field(description="The name of the attachment to download (as shown in the attachments list).")
     ],
-    save_path: Annotated[str, Field(description="The absolute path where the attachment should be saved.")],
+    save_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional exact destination path. Omit it to save the attachment under the current user's "
+                "Downloads/mcp-email-server directory with a sanitized randomized filename. When supplied, "
+                "an absolute path is recommended; a relative path is resolved against the server process "
+                "working directory. The returned saved_path reports the resolved absolute destination."
+            )
+        ),
+    ] = None,
     mailbox: Annotated[str, Field(default="INBOX", description="IMAP folder path. Standard: INBOX, Sent, Drafts, Trash. Provider-specific: Gmail uses '[Gmail]/...' prefix; ProtonMail Bridge uses 'Folders/<name>' and 'Labels/<name>'.")] = "INBOX",
 ) -> AttachmentDownloadResponse:
     settings = get_settings()

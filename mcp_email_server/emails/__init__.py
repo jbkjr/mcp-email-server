@@ -207,16 +207,18 @@ class EmailHandler(abc.ABC):
         self,
         email_id: str,
         attachment_name: str,
-        save_path: str,
+        save_path: str | None = None,
         mailbox: str = "INBOX",
     ) -> "AttachmentDownloadResponse":
         """
-        Download an email attachment and save it to the specified path.
+        Download an email attachment and save it to disk.
 
         Args:
             email_id: The UID of the email containing the attachment.
             attachment_name: The filename of the attachment to download.
-            save_path: The local path where the attachment will be saved.
+            save_path: Explicit destination path. When omitted, the attachment is
+                saved with a sanitized randomized name under the current user's
+                ``Downloads/mcp-email-server`` directory.
             mailbox: The mailbox to search in (default: "INBOX").
 
         Returns:

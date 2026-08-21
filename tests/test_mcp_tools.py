@@ -739,6 +739,50 @@ class TestMcpTools:
                 )
 
     @pytest.mark.asyncio
+    async def test_download_attachment_allows_default_destination(self):
+        """save_path is optional; omitting it forwards None to the handler."""
+        attachment_response = AttachmentDownloadResponse(
+            email_id="12345",
+            attachment_name="document.pdf",
+            mime_type="application/pdf",
+            size=1024,
+            saved_path="/home/user/Downloads/mcp-email-server/document-abcd.pdf",
+        )
+
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+
+        mock_handler = AsyncMock()
+        mock_handler.download_attachment.return_value = attachment_response
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+                result = await download_attachment(
+                    account_name="test_account",
+                    email_id="12345",
+                    attachment_name="document.pdf",
+                )
+
+        assert result == attachment_response
+        mock_handler.download_attachment.assert_called_once_with("12345", "document.pdf", None, "INBOX")
+
+    @pytest.mark.asyncio
+    async def test_download_attachment_disabled_without_save_path(self):
+        """The enable_attachment_download gate still fires when save_path is omitted."""
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = False
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with pytest.raises(PermissionError) as exc_info:
+                await download_attachment(
+                    account_name="test_account",
+                    email_id="12345",
+                    attachment_name="document.pdf",
+                )
+
+            assert "Attachment download is disabled" in str(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_send_email_with_reply_headers(self):
         """Test send_email MCP tool with reply headers."""
         mock_response = EmailSendResponse(
