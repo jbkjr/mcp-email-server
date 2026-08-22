@@ -75,6 +75,19 @@ class MailboxInfo(BaseModel):
     flags: list[str]
 
 
+class LabelInfo(BaseModel):
+    """One ProtonMail-style label, derived from a mailbox under the `Labels/` prefix.
+
+    `name` is the label as a user knows it; `full_path` is the mailbox that
+    stores it, so mutation tools never have to re-derive the prefix.
+    """
+
+    name: str
+    full_path: str
+    delimiter: str
+    flags: list[str]
+
+
 class AttachmentDownloadResponse(BaseModel):
     """Attachment download response"""
 

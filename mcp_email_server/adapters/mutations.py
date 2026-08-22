@@ -27,6 +27,7 @@ from mcp_email_server.application.mutations import (
     MutationProviderAccess,
     MutationProviderError,
     MutationProviderPurpose,
+    RemoveLabelCommand,
     SaveToMailboxCommand,
     SendCommand,
     SentCopyMutationOutcome,
@@ -131,6 +132,21 @@ class ClassicMutationProvider:
                 list(command.email_ids),
                 command.source_mailbox,
                 command.destination_mailbox,
+                list(account.allowed_senders),
+                account.report_blocked_mutations,
+            )
+        )
+
+    async def remove_label(
+        self,
+        command: RemoveLabelCommand,
+        account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome:
+        return await _bounded_mutation_call(
+            self._handler.incoming_client.remove_label_with_outcome(
+                list(command.email_ids),
+                command.label_mailbox,
+                command.source_mailbox,
                 list(account.allowed_senders),
                 account.report_blocked_mutations,
             )

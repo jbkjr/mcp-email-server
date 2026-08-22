@@ -70,21 +70,20 @@ for client discovery and configuration migration steps.
 Every tool advertises reviewed MCP `readOnlyHint`, `destructiveHint`,
 `idempotentHint`, and `openWorldHint` values:
 
-| Tools                                                                        | Read-only | Destructive | Idempotent | Open world |
-| ---------------------------------------------------------------------------- | --------- | ----------- | ---------- | ---------- |
-| `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders` | yes       | no          | yes        | no         |
-| `list_emails_metadata`, `list_mailboxes`                                     | yes       | no          | yes        | yes        |
-| `get_emails_content`                                                         | no        | no          | yes        | yes        |
-| `send_email`, `forward_email`, `save_to_mailbox`                             | no        | no          | no         | yes        |
-| `set_email_flags`, `mark_emails_as_read`                                     | no        | no          | yes        | yes        |
-| `delete_emails`, `move_emails`, `archive_emails`, `download_attachment`      | no        | yes         | no         | yes        |
+| Tools                                                                                   | Read-only | Destructive | Idempotent | Open world |
+| --------------------------------------------------------------------------------------- | --------- | ----------- | ---------- | ---------- |
+| `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders`            | yes       | no          | yes        | no         |
+| `list_emails_metadata`, `list_mailboxes`, `list_labels`, `get_email_labels`             | yes       | no          | yes        | yes        |
+| `get_emails_content`                                                                    | no        | no          | yes        | yes        |
+| `send_email`, `forward_email`, `save_to_mailbox`                                        | no        | no          | no         | yes        |
+| `set_email_flags`, `mark_emails_as_read`                                                | no        | no          | yes        | yes        |
+| `delete_emails`, `move_emails`, `archive_emails`, `remove_label`, `download_attachment` | no        | yes         | no         | yes        |
 
 <!-- Port slots. Tools are being ported onto this architecture in parallel; each cluster
      adds its tool names to the matching existing row above rather than appending a new
      row, so the table stays grouped by annotation set. Slot order everywhere: A, B1, C, B2.
      port-slot A: copy_emails and create_folder are non-destructive; delete_folder and
      rename_folder are destructive.
-     port-slot B1: list_labels and get_email_labels are read-only; remove_label is destructive.
      port-slot B2: create_label is non-destructive; delete_label is destructive; apply_label
      is non-destructive. -->
 
@@ -477,8 +476,77 @@ blocked IDs.
      ABOVE its own marker so parallel ports produce non-overlapping hunks, and the
      final section order matches the fixed slot order A, B1, C, B2.
      port-slot A: `copy_emails`, `create_folder`, `delete_folder`, `rename_folder`
-     port-slot B1: `list_labels`, `get_email_labels`, `remove_label`
-     port-slot B2: `create_label`, `delete_label`, `apply_label` -->
+     port-slot B2: `create_label`, `delete_label`, `apply_label` — these belong in the
+     "Label tools" section below rather than here, alongside the B1 label tools that
+     already share its `Labels/` preamble. -->
+
+## Label tools
+
+A label is an ordinary IMAP mailbox whose name begins with the literal prefix
+`Labels/`, which is how ProtonMail and ProtonMail Bridge expose labels over
+IMAP. The prefix is part of the mailbox name rather than a server hierarchy
+path, so it always uses `/` regardless of the delimiter the server advertises,
+and an account that does not follow the convention simply has no labels. A
+message carries a label because a copy of it lives in that label's mailbox;
+the copy and the original share one `Message-ID`, which is how the label tools
+link them.
+
+Label names are limited to 1,017 UTF-8 bytes so that `Labels/<label_name>`
+still fits inside the 1,024-byte mailbox bound, reject control characters, and
+may not repeat the `Labels/` prefix themselves.
+
+### `list_labels`
+
+Lists the account's labels. Each entry reports the label `name` with the prefix
+stripped, the `full_path` mailbox that stores it, the server's hierarchy
+`delimiter`, and the mailbox `flags`. The bare `Labels/` container is a grouping
+mailbox, not a label, and is never returned. The listing is bounded by the same
+1,000-mailbox and result-size ceilings as `list_mailboxes`.
+
+### `get_email_labels`
+
+Reports which labels hold a copy of one message, as a list of label names.
+
+The message's `Message-ID` is read once from `mailbox`, then every label mailbox
+is probed for that identifier inside a single IMAP session, and the whole
+workflow shares one provider deadline so fanning out across labels cannot extend
+the budget one folder at a time. The `Message-ID` is sent as a quoted IMAP
+search value with quoted-specials escaped; a `Message-ID` that is not printable
+ASCII cannot be searched and fails the request instead of being interpolated raw.
+
+The result is empty when the message cannot be read, carries no `Message-ID`, or
+has no labels — a message hidden by the sender allowlist is indistinguishable
+from a missing one. A label mailbox that cannot be selected or searched is
+skipped, so one stale folder cannot hide the labels that did resolve.
+
+### `remove_label`
+
+Removes one label from one or more messages.
+
+For each `email_id`, the message's `Message-ID` is read from `source_mailbox`,
+its copy is located in `Labels/<label_name>` by a quoted `Message-ID` search, and
+only that copy is marked `\Deleted` and removed with a target-scoped UID
+EXPUNGE. Every effect is scoped to the label mailbox: the message named by the
+caller is never modified, and neither is any other message in the label mailbox.
+Removal requires the IMAP UIDPLUS capability, exactly as `delete_emails` does.
+
+Per-ID results preserve caller order and distinguish success, failure, and
+`unknown`. Unlike the other batch tools, a failure reports a reviewed reason
+alongside the ID, because those reasons are actionable and non-sensitive:
+
+| Detail                   | Meaning                                                                        |
+| ------------------------ | ------------------------------------------------------------------------------ |
+| `message-id-missing`     | The source message has no `Message-ID` to match a copy with.                   |
+| `message-id-unsupported` | Its `Message-ID` is not printable ASCII and cannot be searched.                |
+| `label-not-found`        | The label does not hold a copy of that message.                                |
+| `label-unavailable`      | The label mailbox could not be selected.                                       |
+| `label-search-failed`    | The label mailbox could not be searched.                                       |
+| `uidplus-unavailable`    | The server cannot perform a target-scoped UID EXPUNGE.                         |
+| `sender-policy`          | The sender allowlist blocked the message and `report_blocked_mutations` is on. |
+
+When a sender allowlist is active and `report_blocked_mutations` is off, a
+blocked ID is reported as a successful no-op and nothing is deleted. See
+[Sender allowlist](security.md#sender-allowlist).
 
 ## Attachments
 

@@ -7,6 +7,7 @@ from typing import Protocol, TypeVar
 
 from pydantic import TypeAdapter
 
+from mcp_email_server.application.labels import LABEL_LIST_PATTERN, label_name_from_mailbox
 from mcp_email_server.application.limits import (
     APPLICATION_LIMITS,
     validate_controlled_string,
@@ -21,6 +22,7 @@ from mcp_email_server.application.mutations import (
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailContentBatchResponse,
+    LabelInfo,
     MailboxInfo,
 )
 from mcp_email_server.log import logger
@@ -88,6 +90,26 @@ class ListMailboxesQuery:
 
 
 @dataclass(frozen=True)
+class ListLabelsQuery:
+    account_name: str
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+
+
+@dataclass(frozen=True)
+class GetEmailLabelsQuery:
+    account_name: str
+    email_id: str
+    mailbox: str = "INBOX"
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        validate_imap_uid(self.email_id, field_name="email_id")
+        _validate_mailbox(self.mailbox)
+
+
+@dataclass(frozen=True)
 class GetEmailContentQuery:
     account_name: str
     email_ids: tuple[str, ...]
@@ -142,6 +164,18 @@ class ReadAccountAuthority(Protocol):
 
 class ReadProvider(Protocol):
     async def list_mailboxes(self, query: ListMailboxesQuery) -> list[MailboxInfo]: ...
+
+    async def fetch_message_id(
+        self,
+        query: GetEmailLabelsQuery,
+        account: ReadAccountSnapshot,
+    ) -> str | None: ...
+
+    async def search_message_id_in_mailboxes(
+        self,
+        message_id: str,
+        mailboxes: tuple[str, ...],
+    ) -> tuple[str, ...]: ...
 
     async def get_content(
         self,
@@ -227,6 +261,52 @@ def _validate_mailbox_result(mailboxes: list[MailboxInfo]) -> None:
         raise ReadProviderError("limit_exceeded: serialized mailbox result is too large") from None
 
 
+_LABEL_LIST_ADAPTER = TypeAdapter(list[LabelInfo])
+_LABEL_NAME_LIST_ADAPTER = TypeAdapter(list[str])
+
+
+def _labels_from_mailboxes(mailboxes: list[MailboxInfo]) -> list[LabelInfo]:
+    """Project label mailboxes onto labels, dropping the bare container."""
+    labels: list[LabelInfo] = []
+    for mailbox in mailboxes:
+        name = label_name_from_mailbox(mailbox.name)
+        if name is None:
+            continue
+        labels.append(
+            LabelInfo(
+                name=name,
+                full_path=mailbox.name,
+                delimiter=mailbox.delimiter,
+                flags=mailbox.flags,
+            )
+        )
+    return labels
+
+
+def _validate_label_result(labels: list[LabelInfo]) -> None:
+    """Bound the label projection of an already-bounded mailbox listing.
+
+    Labels are a subset of mailboxes, so their count and name bytes are already
+    inside the mailbox budget. Only the serialized form, which repeats each
+    mailbox name as ``full_path``, needs a ceiling of its own.
+    """
+    if len(labels) > APPLICATION_LIMITS.mailboxes:
+        raise ReadProviderError(f"limit_exceeded: label count exceeds {APPLICATION_LIMITS.mailboxes}")
+    try:
+        validate_serialized_result(_LABEL_LIST_ADAPTER.dump_json(labels))
+    except ValueError:
+        raise ReadProviderError("limit_exceeded: serialized label result is too large") from None
+
+
+def _validate_label_name_result(names: list[str]) -> None:
+    if len(names) > APPLICATION_LIMITS.mailboxes:
+        raise ReadProviderError(f"limit_exceeded: label count exceeds {APPLICATION_LIMITS.mailboxes}")
+    try:
+        validate_serialized_result(_LABEL_NAME_LIST_ADAPTER.dump_json(names))
+    except ValueError:
+        raise ReadProviderError("limit_exceeded: serialized label result is too large") from None
+
+
 def _validate_content_result(response: EmailContentBatchResponse) -> bytes:
     if len(response.failed_ids) > APPLICATION_LIMITS.warning_items:
         raise ReadProviderError(f"limit_exceeded: failed ID count exceeds {APPLICATION_LIMITS.warning_items}")
@@ -282,6 +362,67 @@ class MailboxDiscoveryService:
         mailboxes = await _bounded_provider_call(access.provider.list_mailboxes(query))
         _validate_mailbox_result(mailboxes)
         return mailboxes
+
+
+class LabelDiscoveryService:
+    """List labels as the `Labels/`-prefixed projection of mailbox discovery."""
+
+    def __init__(self, mailboxes: MailboxDiscoveryService) -> None:
+        self._mailboxes = mailboxes
+
+    async def execute(self, query: ListLabelsQuery) -> list[LabelInfo]:
+        query.validate()
+        mailboxes = await self._mailboxes.execute(
+            ListMailboxesQuery(account_name=query.account_name, pattern=LABEL_LIST_PATTERN)
+        )
+        labels = _labels_from_mailboxes(mailboxes)
+        _validate_label_result(labels)
+        return labels
+
+
+class EmailLabelService:
+    """Report which labels hold a copy of one message.
+
+    The message's Message-ID is resolved once from its own mailbox, then every
+    label mailbox is probed for that Message-ID inside a single IMAP session.
+    The whole workflow shares one provider deadline, so fanning out across
+    labels cannot extend the budget one folder at a time.
+    """
+
+    def __init__(self, accounts: ReadAccountAuthority, providers: ReadProviderFactory) -> None:
+        self._accounts = accounts
+        self._providers = providers
+
+    async def execute(self, query: GetEmailLabelsQuery) -> list[str]:
+        query.validate()
+        account = self._accounts.resolve(query.account_name)
+        access = self._providers.open(account.account_name, expected_mode=account.mode)
+        try:
+            async with asyncio.timeout(APPLICATION_LIMITS.provider_timeout_seconds):
+                # A blocked sender and a missing message both resolve to None,
+                # so the allowlist never reveals that a message exists.
+                message_id = await access.provider.fetch_message_id(query, access.account)
+                if message_id is None:
+                    return []
+                mailboxes = await access.provider.list_mailboxes(
+                    ListMailboxesQuery(account_name=account.account_name, pattern=LABEL_LIST_PATTERN)
+                )
+                _validate_mailbox_result(mailboxes)
+                labels = _labels_from_mailboxes(mailboxes)
+                _validate_label_result(labels)
+                if not labels:
+                    return []
+                found = set(
+                    await access.provider.search_message_id_in_mailboxes(
+                        message_id,
+                        tuple(label.full_path for label in labels),
+                    )
+                )
+        except TimeoutError:
+            raise ReadProviderError("provider request timed out") from None
+        applied = [label.name for label in labels if label.full_path in found]
+        _validate_label_name_result(applied)
+        return applied
 
 
 class EmailContentService:
@@ -413,6 +554,8 @@ class AttachmentDownloadService:
 @dataclass(frozen=True)
 class ReadServices:
     mailboxes: MailboxDiscoveryService
+    labels: LabelDiscoveryService
+    email_labels: EmailLabelService
     content: EmailContentService
     attachments: AttachmentDownloadService
 
@@ -425,8 +568,11 @@ class ReadServices:
         artifacts: ArtifactWriter,
         large_results: LargeResultWriter | None = None,
     ) -> ReadServices:
+        mailboxes = MailboxDiscoveryService(accounts, providers)
         return cls(
-            mailboxes=MailboxDiscoveryService(accounts, providers),
+            mailboxes=mailboxes,
+            labels=LabelDiscoveryService(mailboxes),
+            email_labels=EmailLabelService(accounts, providers),
             content=EmailContentService(accounts, providers, mark_read, large_results),
             attachments=AttachmentDownloadService(accounts, providers, artifacts),
         )

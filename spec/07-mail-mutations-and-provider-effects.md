@@ -267,3 +267,10 @@ enter public errors.
     failed, denied, or allowlist-blocked source read aborts before any SMTP
     session opens, that re-attached parts preserve source MIME type and
     parameters, and that an existing `Fwd:` subject prefix is not duplicated.
+13. Label removal locates a message's copy in the label mailbox by `Message-ID`
+    and scopes every flag change and expunge to that mailbox. Tests prove that
+    the caller's own message is never modified, that the `Message-ID` reaches
+    IMAP SEARCH as a quoted value with quoted-specials escaped rather than
+    interpolated raw, that an allowlist-blocked message is indistinguishable
+    from a missing one, that per-target failures carry only reviewed fixed
+    detail tags, and that only the label mailbox is invalidated.

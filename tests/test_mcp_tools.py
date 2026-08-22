@@ -25,6 +25,7 @@ from mcp_email_server.app import (
     set_email_flags,
 )
 from mcp_email_server.application.accounts import AvailableAccount, EffectiveConfiguration
+from mcp_email_server.application.labels import MAXIMUM_LABEL_NAME_BYTES
 from mcp_email_server.application.limits import APPLICATION_LIMITS
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
@@ -434,6 +435,19 @@ class TestMcpTools:
         # extend this assertion block; each adds its limit assertions directly ABOVE its
         # own marker so the hunks stay non-overlapping. Order is fixed: A, B1, C, B2.
         # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+        for tool_name in ("list_labels", "get_email_labels", "remove_label"):
+            assert tools[tool_name]["account_name"]["maxLength"] == APPLICATION_LIMITS.account_name_bytes
+        assert tools["get_email_labels"]["email_id"]["maxLength"] == len(str(APPLICATION_LIMITS.maximum_imap_uid))
+        assert tools["get_email_labels"]["mailbox"]["maxLength"] == APPLICATION_LIMITS.mailbox_bytes
+        remove_label_properties = tools["remove_label"]
+        assert remove_label_properties["email_ids"]["maxItems"] == APPLICATION_LIMITS.mutation_uids
+        assert remove_label_properties["email_ids"]["items"]["maxLength"] == len(
+            str(APPLICATION_LIMITS.maximum_imap_uid)
+        )
+        assert remove_label_properties["source_mailbox"]["maxLength"] == APPLICATION_LIMITS.mailbox_bytes
+        # A label name must still fit inside a mailbox name once `Labels/` is prepended.
+        assert remove_label_properties["label_name"]["maxLength"] == MAXIMUM_LABEL_NAME_BYTES
+        assert APPLICATION_LIMITS.mailbox_bytes > MAXIMUM_LABEL_NAME_BYTES
         # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
         # port-slot C: send path (send_email Markdown and quoted-reply parameters)
         # port-slot B2: label writes (create_label, delete_label, apply_label)
@@ -1271,6 +1285,21 @@ async def test_tool_annotations_expose_agent_safety_and_retry_hints() -> None:
     # Port slots for per-cluster annotation assertions; add each cluster's assertions
     # directly ABOVE its own marker and keep the catch-all below last.
     # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+    for tool_name in ("list_labels", "get_email_labels"):
+        assert tools[tool_name].annotations is not None
+        assert tools[tool_name].annotations.model_dump(exclude_none=True) == {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        }
+    assert tools["remove_label"].annotations is not None
+    assert tools["remove_label"].annotations.model_dump(exclude_none=True) == {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
     # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
     # port-slot C: send path (no new tools)
     # port-slot B2: label writes (create_label, delete_label, apply_label)

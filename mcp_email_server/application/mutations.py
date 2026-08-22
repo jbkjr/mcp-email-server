@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol, TypeVar
 
+from mcp_email_server.application.labels import label_mailbox, validate_label_name
 from mcp_email_server.application.limits import (
     APPLICATION_LIMITS,
     validate_controlled_string,
@@ -309,6 +310,27 @@ class ForwardCommand(ComposeCommand):
         validate_mailbox_name(self.source_mailbox)
 
 
+# Port-slot B1 commands: label reads. New commands from other clusters belong in
+# their own marked block so parallel ports append to distinct anchors.
+@dataclass(frozen=True)
+class RemoveLabelCommand:
+    account_name: str
+    email_ids: tuple[str, ...]
+    label_name: str
+    source_mailbox: str = "INBOX"
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        _validate_email_ids(self.email_ids)
+        validate_label_name(self.label_name)
+        validate_mailbox_name(self.source_mailbox)
+
+    @property
+    def label_mailbox(self) -> str:
+        """The mailbox that stores this label; the only mutation target."""
+        return label_mailbox(self.label_name)
+
+
 class MutationAccountAuthority(Protocol):
     def resolve(
         self,
@@ -376,6 +398,12 @@ class MutationProvider(Protocol):
     # two clusters touching this region produce non-overlapping hunks instead of a
     # conflict. Slot order is fixed everywhere it appears: A, B1, C, B2.
     # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+    async def remove_label(
+        self,
+        command: RemoveLabelCommand,
+        account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome: ...
+
     # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
     # port-slot C: send path (Markdown bodies, quoted replies)
     # port-slot B2: label writes (create_label, delete_label, apply_label)
@@ -1045,6 +1073,34 @@ class ForwardService(_MutationWorkflow):
 # Port slots for new mutation services. See the slot note in the MutationProvider
 # Protocol above; each cluster defines its service classes directly ABOVE its marker.
 # port-slot A: folder ops (CopyService, CreateFolderService, DeleteFolderService, RenameFolderService)
+class RemoveLabelService(_MutationWorkflow):
+    """Remove one label from messages by deleting only the label's own copies.
+
+    The message the caller names is never modified: the provider locates the
+    copy inside the label mailbox by Message-ID and scopes every flag change and
+    expunge to that mailbox, so only the label mailbox needs invalidating.
+    """
+
+    async def execute(self, command: RemoveLabelCommand) -> BatchMutationOutcome:
+        command.validate()
+        account = self._resolve(command.account_name)
+        access = self._open(account)
+        try:
+            outcome = _validate_batch_result(
+                await _bounded_provider_effect(access.provider.remove_label(command, access.account))
+            )
+        except TimeoutError:
+            outcome = _validate_batch_result(_timeout_batch(command.email_ids))
+        if not outcome.effect_may_have_started:
+            return outcome
+        invalidated = await self._invalidate(access.account, (command.label_mailbox,))
+        return _validate_batch_result(
+            BatchMutationOutcome(
+                outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
+            )
+        )
+
+
 # port-slot B1: label reads (RemoveLabelService)
 # port-slot C: send path (Markdown bodies, quoted replies — extends SendService in place)
 # port-slot B2: label writes (CreateLabelService, DeleteLabelService, ApplyLabelService)
@@ -1062,6 +1118,7 @@ class MutationServices:
     forward: ForwardService
     # Port slots for new service fields; add each cluster's fields above its marker.
     # port-slot A: folder ops
+    remove_label: RemoveLabelService
     # port-slot B1: label reads
     # port-slot C: send path
     # port-slot B2: label writes
@@ -1086,6 +1143,7 @@ class MutationServices:
             forward=ForwardService(*arguments),
             # Port slots for new service construction; add each cluster's entries above its marker.
             # port-slot A: folder ops
+            remove_label=RemoveLabelService(*arguments),
             # port-slot B1: label reads
             # port-slot C: send path
             # port-slot B2: label writes
