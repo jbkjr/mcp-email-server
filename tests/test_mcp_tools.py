@@ -466,6 +466,20 @@ class TestMcpTools:
         assert APPLICATION_LIMITS.mailbox_bytes > MAXIMUM_LABEL_NAME_BYTES
         # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
         # port-slot C: send path (send_email Markdown and quoted-reply parameters)
+        for tool_name in ("create_label", "delete_label", "apply_label"):
+            properties = tools[tool_name]
+            assert properties["account_name"]["maxLength"] == APPLICATION_LIMITS.account_name_bytes
+            # Every label tool shares one bound so `Labels/<label_name>` stays a legal mailbox.
+            assert properties["label_name"]["maxLength"] == MAXIMUM_LABEL_NAME_BYTES
+        apply_label_properties = tools["apply_label"]
+        assert apply_label_properties["email_ids"]["maxItems"] == APPLICATION_LIMITS.mutation_uids
+        assert apply_label_properties["email_ids"]["items"]["maxLength"] == len(
+            str(APPLICATION_LIMITS.maximum_imap_uid)
+        )
+        assert apply_label_properties["source_mailbox"]["maxLength"] == APPLICATION_LIMITS.mailbox_bytes
+        # The label mailbox is derived, never supplied: no tool takes a mailbox for it.
+        assert "destination_mailbox" not in apply_label_properties
+        assert not {"folder_name", "mailbox"} & tools["create_label"].keys()
         # port-slot B2: label writes (create_label, delete_label, apply_label)
 
     @pytest.mark.asyncio
@@ -1353,5 +1367,22 @@ async def test_tool_annotations_expose_agent_safety_and_retry_hints() -> None:
     }
     # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
     # port-slot C: send path (no new tools)
+    # Creating a label and applying one are additive; deleting a label discards the
+    # label's own copies of every message it holds.
+    for nondestructive in ("create_label", "apply_label"):
+        assert tools[nondestructive].annotations is not None
+        assert tools[nondestructive].annotations.model_dump(exclude_none=True) == {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        }
+    assert tools["delete_label"].annotations is not None
+    assert tools["delete_label"].annotations.model_dump(exclude_none=True) == {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
     # port-slot B2: label writes (create_label, delete_label, apply_label)
     assert all(tool.annotations is not None for tool in tools.values())
