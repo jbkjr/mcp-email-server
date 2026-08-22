@@ -643,13 +643,18 @@ identifiers are fixed and contain no account-specific information.
 
 ## Global settings
 
-| Setting                      | Default  | Description                                                                |
-| ---------------------------- | -------- | -------------------------------------------------------------------------- |
-| `credential_storage`         | `"auto"` | Select `auto`, `keyring`, or `plaintext` credential storage.               |
-| `enable_attachment_download` | `false`  | Allow `download_attachment` to write files.                                |
-| `allowed_recipients`         | `[]`     | Exact recipients; empty disables sending and recipient-bound saves.        |
-| `allowed_senders`            | `[]`     | Incoming `From` patterns; empty does not restrict reading.                 |
-| `report_blocked_mutations`   | `false`  | Report blocked message IDs instead of returning privacy-preserving no-ops. |
+| Setting                      | Default  | Description                                                                   |
+| ---------------------------- | -------- | ----------------------------------------------------------------------------- |
+| `credential_storage`         | `"auto"` | Select `auto`, `keyring`, or `plaintext` credential storage.                  |
+| `enable_attachment_download` | `false`  | Allow `download_attachment` to write files.                                   |
+| `allowed_recipients`         | `[]`     | Exact recipients; empty disables sending and recipient-bound saves.           |
+| `allowed_senders`            | `[]`     | Incoming `From` patterns; empty does not restrict reading.                    |
+| `report_blocked_mutations`   | `false`  | Report blocked message IDs instead of returning privacy-preserving no-ops.    |
+| `enable_folder_management`   | `false`  | Allow mailbox-shape mutations in legacy mode; always `false` in managed mode. |
+
+`enable_folder_management` is recognized only by legacy TOML and environment
+configuration. Managed configuration has no equivalent policy, so managed mode
+resolves it to `false` and mailbox-shape mutations stay disabled there.
 
 See [Security](security.md) before enabling attachment downloads or applying
 allowlists.
@@ -694,6 +699,7 @@ values are treated as false. Do not add surrounding whitespace to these values.
 | `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS`         | Empty                                    | Comma-separated recipients; empty disables sending.                 |
 | `MCP_EMAIL_SERVER_ALLOWED_SENDERS`            | Empty                                    | Comma-separated sender globs; empty does not restrict reading.      |
 | `MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS`   | `false`                                  | Override blocked mutation reporting.                                |
+| `MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT`   | `false`                                  | Override mailbox-shape mutation access in legacy mode.              |
 | `MCP_EMAIL_SERVER_CREDENTIAL_STORAGE`         | TOML value or `auto`                     | Override credential storage with `auto`, `keyring`, or `plaintext`. |
 | `MCP_EMAIL_SERVER_LOG_LEVEL`                  | `INFO`                                   | Set the Loguru logging level, such as `DEBUG` or `WARNING`.         |
 

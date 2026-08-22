@@ -51,6 +51,9 @@ class MutationAccountSnapshot:
     allowed_senders: tuple[str, ...]
     allowed_recipients: tuple[str, ...]
     report_blocked_mutations: bool
+    # Legacy-mode-only gate for mailbox-shape mutations. Managed mode has no policy
+    # column for it, so the managed authority path always resolves it to False.
+    enable_folder_management: bool = False
 
 
 @dataclass(frozen=True)
