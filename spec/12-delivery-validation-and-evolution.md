@@ -51,6 +51,11 @@ is updated only after the independent review has examined the complete diff.
 | 10.1-10.8      | `mcp_email_server/app.py`, `stdio.py`, `application/limits.py`, `large_results.py`                                            | `tests/fixtures/mcp_catalog.json`, `tests/test_mcp_tools.py`, `test_stdio_protocol.py`, `test_large_results.py`, `e2e/test_stdio_greenmail.py`                                                                                                                                                              | `docs/tools.md`, `transports.md`, `validation.md`                                                                    | Independent review: no unresolved material findings |
 | 11.1-11.8      | `plugins/mcp-email-server/`, `.agents/plugins/marketplace.json`, `.claude-plugin/marketplace.json`, `mcp_email_server/cli.py` | `tests/test_agent_integrations.py`, `test_cli.py`, `test_web_ui_server.py`                                                                                                                                                                                                                                  | `docs/guides.md`, `getting-started.md`, `security.md`                                                                | Independent review: no unresolved material findings |
 
+<!-- Row order is normative: rows stay sorted by their acceptance-ID prefix (01 through
+     11), never appended at the end. Ports adding capabilities extend the references in
+     the existing 07 and 10 rows in place rather than introducing a row, so parallel
+     ports edit different cells of the same rows instead of racing for the table tail. -->
+
 For each normative acceptance item, the implementation review records:
 
 ```text

@@ -370,6 +370,16 @@ class MutationProvider(Protocol):
         account: MutationAccountSnapshot,
     ) -> DeliveryMutationOutcome: ...
 
+    # Port slots. Several fork capabilities are being ported onto this
+    # architecture in parallel, and they all extend the same few regions of this
+    # module. Each cluster inserts its members directly ABOVE its own marker, so
+    # two clusters touching this region produce non-overlapping hunks instead of a
+    # conflict. Slot order is fixed everywhere it appears: A, B1, C, B2.
+    # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+    # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
+    # port-slot C: send path (Markdown bodies, quoted replies)
+    # port-slot B2: label writes (create_label, delete_label, apply_label)
+
 
 @dataclass(frozen=True)
 class MutationProviderAccess:
@@ -1032,6 +1042,14 @@ class ForwardService(_MutationWorkflow):
         return await self._complete_send(account, delivery, forwarded.bcc)
 
 
+# Port slots for new mutation services. See the slot note in the MutationProvider
+# Protocol above; each cluster defines its service classes directly ABOVE its marker.
+# port-slot A: folder ops (CopyService, CreateFolderService, DeleteFolderService, RenameFolderService)
+# port-slot B1: label reads (RemoveLabelService)
+# port-slot C: send path (Markdown bodies, quoted replies — extends SendService in place)
+# port-slot B2: label writes (CreateLabelService, DeleteLabelService, ApplyLabelService)
+
+
 @dataclass(frozen=True)
 class MutationServices:
     set_flags: SetEmailFlagsService
@@ -1042,6 +1060,11 @@ class MutationServices:
     archive: ArchiveService
     send: SendService
     forward: ForwardService
+    # Port slots for new service fields; add each cluster's fields above its marker.
+    # port-slot A: folder ops
+    # port-slot B1: label reads
+    # port-slot C: send path
+    # port-slot B2: label writes
 
     @classmethod
     def compose(
@@ -1061,4 +1084,9 @@ class MutationServices:
             archive=ArchiveService(*arguments),
             send=SendService(*arguments),
             forward=ForwardService(*arguments),
+            # Port slots for new service construction; add each cluster's entries above its marker.
+            # port-slot A: folder ops
+            # port-slot B1: label reads
+            # port-slot C: send path
+            # port-slot B2: label writes
         )
