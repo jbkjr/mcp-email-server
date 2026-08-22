@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 from collections.abc import Awaitable
 from dataclasses import dataclass, replace
@@ -502,9 +503,17 @@ def _forwarded_subject(subject: str) -> str:
 
 
 def _forwarded_body(note: str, block: str) -> str:
-    """Join the caller's note with the provider-composed forwarded block."""
+    """Join the caller's note with the provider-composed forwarded block.
 
-    return f"{note}\n\n{block}" if note else block
+    The note is caller-authored and is rendered as Markdown by the provider. The
+    block is quoted evidence read off another message, so its markup characters are
+    escaped here: a forwarded plain-text body that happens to contain ``<b>`` or a
+    ``<script>`` element must reach the recipient as the literal text it was, never
+    as live markup the account owner did not write.
+    """
+
+    quoted = html.escape(block)
+    return f"{note}\n\n{quoted}" if note else quoted
 
 
 def _validate_forward_source(source: ForwardSource) -> ForwardSource:

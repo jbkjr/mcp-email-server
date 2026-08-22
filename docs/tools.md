@@ -250,7 +250,7 @@ does not continue after ambiguous state.
 Sends a message through the selected account's SMTP server. It supports:
 
 - To, CC, and BCC recipients.
-- Plain-text or HTML bodies.
+- Markdown bodies rendered to email-safe HTML, or pre-formatted raw HTML bodies.
 - Attachments from file paths available to the server process. Relative paths use the process working directory; absolute paths are recommended.
 - `Reply-To`, `In-Reply-To`, and `References` headers.
 
@@ -337,10 +337,16 @@ The subject is derived from the source message as `Fwd: <original subject>`. A
 source subject that already begins with `Fwd:` in any letter case is not
 prefixed a second time.
 
-The forwarded content is appended below the caller's note as a plain-text
+The forwarded content is appended below the caller's note as a
 `Forwarded message` block reporting the original's From, Recipients, Date, and
 Subject. That block reports `Recipients:` rather than `To:` because the parsed
 recipient list folds in Cc entries.
+
+The note is caller-authored and is rendered as Markdown like any other body. The
+forwarded block is quoted evidence read off another message, so its markup
+characters are escaped before rendering: a source body containing `<b>` or a
+`<script>` element reaches the recipient as the literal text it was, never as
+live markup the account owner did not write.
 
 The block is re-composed from the parsed plain-text body, so the original's HTML
 formatting is not preserved in the quoted text. The forwarded content is never
@@ -375,6 +381,24 @@ as it does for `send_email`.
 
 For a worked example, see
 [Forward a message with its attachments](guides.md#forward-a-message-with-its-attachments).
+
+### Markdown message bodies
+
+Every composed message body — `send_email`, `forward_email`, and
+`save_to_mailbox` alike — is written in Markdown and rendered to email-safe HTML
+before the MIME container is built. Headings, bold and italic text, links,
+bullet and numbered lists, tables, and fenced code blocks are all supported, and
+single newlines become line breaks so ordinary prose keeps the shape you wrote
+it in. The rendered document carries minimal inline styles rather than CSS
+classes, because mail clients cannot be relied on to keep a stylesheet.
+
+Set `html=true` on `send_email` or `save_to_mailbox` when the body is already
+pre-formatted raw HTML. That suppresses rendering and sends the body exactly as
+supplied; it is not a way to ask for a plain-text message. `forward_email` has
+no `html` parameter: its note is always Markdown.
+
+Rendering changes only the body part's subtype, never an address or threading
+header, so it has no effect on whether a message requires SMTPUTF8.
 
 <!-- port-slot C: send-path documentation goes here, above this marker — Markdown message
      bodies and quoted replies extend `send_email` rather than adding tools. -->

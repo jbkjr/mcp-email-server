@@ -736,7 +736,7 @@
         },
         {
             "name": "send_email",
-            "description": "Send one email using the specified account. Supports reply threading. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically.",
+            "description": "Send one email using the specified account. Supports reply threading. The body is written in Markdown and is rendered to email-safe HTML automatically; set html=true only when the body is already pre-formatted raw HTML. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -763,7 +763,7 @@
                         "type": "string"
                     },
                     "body": {
-                        "description": "The body of the email.",
+                        "description": "The body of the email, written in Markdown. It is rendered to email-safe HTML automatically.",
                         "maxLength": 1048576,
                         "title": "Body",
                         "type": "string"
@@ -806,7 +806,7 @@
                     },
                     "html": {
                         "default": false,
-                        "description": "Whether to send the email as HTML (True) or plain text (False).",
+                        "description": "Set True only when body is already pre-formatted raw HTML, which suppresses Markdown rendering.",
                         "title": "Html",
                         "type": "boolean"
                     },
@@ -895,7 +895,7 @@
         },
         {
             "name": "forward_email",
-            "description": "Forward an existing message to new recipients using the specified account. The source message is read over IMAP first: if it cannot be read, the call fails before any SMTP session is opened, so a forward is never delivered without the content it was supposed to carry. The subject is derived from the source as 'Fwd: <original subject>' without stacking a second prefix, the caller's note is placed above a plain-text forwarded block re-composed from the source's parsed text body, and the source's attachments are re-attached with their original MIME types unless include_attachments is false. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically.",
+            "description": "Forward an existing message to new recipients using the specified account. The source message is read over IMAP first: if it cannot be read, the call fails before any SMTP session is opened, so a forward is never delivered without the content it was supposed to carry. The subject is derived from the source as 'Fwd: <original subject>' without stacking a second prefix, the caller's Markdown note is placed above a forwarded block re-composed from the source's parsed text body and escaped so quoted content is delivered literally, and the source's attachments are re-attached with their original MIME types unless include_attachments is false. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -931,7 +931,7 @@
                     },
                     "body": {
                         "default": "",
-                        "description": "An optional note placed above the forwarded content.",
+                        "description": "An optional Markdown note placed above the forwarded content.",
                         "maxLength": 1048576,
                         "title": "Body",
                         "type": "string"

@@ -202,7 +202,13 @@ async def _application_lifespan(_server: FastMCP) -> AsyncIterator[dict[str, obj
             await close_application_runtime()
 
 
-mcp = FastMCP("email", lifespan=_application_lifespan)
+MCP_SERVER_INSTRUCTIONS = (
+    "When sending emails, the body supports Markdown formatting (bold, lists, headers, links, etc.) "
+    "which is automatically converted to email-safe HTML. Use Markdown freely for well-formatted emails. "
+    "Set html=True only if providing pre-formatted raw HTML."
+)
+
+mcp = FastMCP("email", instructions=MCP_SERVER_INSTRUCTIONS, lifespan=_application_lifespan)
 # FastMCP 1.x does not expose its low-level server version in the constructor.
 mcp._mcp_server.version = version("mcp-email-server")  # pyright: ignore[reportPrivateUsage]
 
@@ -479,7 +485,9 @@ async def list_allowed_senders() -> PolicyDiscoveryResult:
 
 @mcp.tool(
     description=(
-        "Send one email using the specified account. Supports reply threading. Partial or ambiguous SMTP "
+        "Send one email using the specified account. Supports reply threading. The body is written in Markdown "
+        "and is rendered to email-safe HTML automatically; set html=true only when the body is already "
+        "pre-formatted raw HTML. Partial or ambiguous SMTP "
         "delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy "
         "outcome separately; ambiguous effects are not retried automatically."
     ),
@@ -505,7 +513,10 @@ async def send_email(
     ],
     body: Annotated[
         str,
-        Field(max_length=APPLICATION_LIMITS.body_bytes, description="The body of the email."),
+        Field(
+            max_length=APPLICATION_LIMITS.body_bytes,
+            description="The body of the email, written in Markdown. It is rendered to email-safe HTML automatically.",
+        ),
     ],
     cc: Annotated[
         list[AddressInput] | None,
@@ -517,7 +528,10 @@ async def send_email(
     ] = None,
     html: Annotated[
         bool,
-        Field(default=False, description="Whether to send the email as HTML (True) or plain text (False)."),
+        Field(
+            default=False,
+            description="Set True only when body is already pre-formatted raw HTML, which suppresses Markdown rendering.",
+        ),
     ] = False,
     attachments: Annotated[
         list[AttachmentPathInput] | None,
@@ -586,8 +600,9 @@ async def send_email(
         "Forward an existing message to new recipients using the specified account. The source message is read "
         "over IMAP first: if it cannot be read, the call fails before any SMTP session is opened, so a forward is "
         "never delivered without the content it was supposed to carry. The subject is derived from the source as "
-        "'Fwd: <original subject>' without stacking a second prefix, the caller's note is placed above a "
-        "plain-text forwarded block re-composed from the source's parsed text body, and the source's attachments "
+        "'Fwd: <original subject>' without stacking a second prefix, the caller's Markdown note is placed above a "
+        "forwarded block re-composed from the source's parsed text body and escaped so quoted content is delivered "
+        "literally, and the source's attachments "
         "are re-attached with their original MIME types unless include_attachments is false. Partial or ambiguous "
         "SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent "
         "Sent-copy outcome separately; ambiguous effects are not retried automatically."
@@ -624,7 +639,7 @@ async def forward_email(
         Field(
             default="",
             max_length=APPLICATION_LIMITS.body_bytes,
-            description="An optional note placed above the forwarded content.",
+            description="An optional Markdown note placed above the forwarded content.",
         ),
     ] = "",
     cc: Annotated[

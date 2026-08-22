@@ -267,3 +267,9 @@ enter public errors.
     failed, denied, or allowlist-blocked source read aborts before any SMTP
     session opens, that re-attached parts preserve source MIME type and
     parameters, and that an existing `Fwd:` subject prefix is not duplicated.
+13. Composition renders a caller-authored body from Markdown to email-safe HTML in
+    one shared place, so every submission path inherits it, and an explicit raw-HTML
+    body suppresses rendering. Quoted evidence carried from another message is
+    escaped before rendering. Tests prove that rendering changes only the body
+    part's subtype and never turns an ASCII-header message into one that requires
+    SMTPUTF8, and that forwarded source markup is delivered literally.

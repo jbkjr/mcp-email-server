@@ -59,6 +59,7 @@ from mcp_email_server.application.mutations import (
 )
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
 from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails.markdown_utils import markdown_to_email_html
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -2328,8 +2329,20 @@ class EmailClient:
         ``extra_parts`` carries already-built MIME parts (a forward's re-attached
         source parts) into the same multipart container as file attachments. It is
         keyword-only so existing positional call sites keep their meaning.
+
+        A body that is not already raw HTML is treated as Markdown and rendered to
+        an email-safe HTML document before the MIME container is built, so callers
+        get predictable formatting without having to write HTML. ``html=True`` means
+        "this body is already HTML" and suppresses the conversion; the resulting
+        part is UTF-8 ``text/html`` either way, which is the same shape the plain
+        branch produced, so RFC 6532 detection is unaffected (it inspects headers,
+        never the body).
         """
         envelope_sender = self.envelope_sender
+
+        if not html:
+            body = markdown_to_email_html(body, wrap_in_html=True)
+            html = True
 
         if attachments or extra_parts:
             msg = self._create_message_with_attachments(body, html, attachments, extra_parts)

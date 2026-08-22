@@ -900,7 +900,8 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             assert send_result["result"] == f"Email sent successfully to {BOB[0]} with 1 attachment(s)"
 
             delivered = _wait_for_message(BOB, "INBOX", sent_subject)
-            assert sent_body in (delivered.message.get_body(preferencelist=("plain",)).get_content())
+            # Bodies arrive as text/html: composition renders the caller's Markdown.
+            assert sent_body in (delivered.message.get_body(preferencelist=("html",)).get_content())
             delivered_from = delivered.message["From"]
             assert delivered_from is not None
             assert [(address.display_name, address.addr_spec) for address in delivered_from.addresses] == [
@@ -914,7 +915,7 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             assert delivered_attachments[0].get_payload(decode=True) == attachment_bytes
 
             sent_copy = _wait_for_message(ALICE, "Sent", sent_subject)
-            assert sent_body in sent_copy.message.get_body(preferencelist=("plain",)).get_content()
+            assert sent_body in sent_copy.message.get_body(preferencelist=("html",)).get_content()
             sent_copy_from = sent_copy.message["From"]
             assert sent_copy_from is not None
             assert [(address.display_name, address.addr_spec) for address in sent_copy_from.addresses] == [
@@ -982,7 +983,7 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             # the server's own report of what it claims to have sent.
             forwarded_subject = f"Fwd: {forward_source_subject}"
             forwarded = _wait_for_message(BOB, "INBOX", forwarded_subject)
-            forwarded_text = forwarded.message.get_body(preferencelist=("plain",)).get_content()
+            forwarded_text = forwarded.message.get_body(preferencelist=("html",)).get_content()
             assert forward_note in forwarded_text
             assert "---------- Forwarded message ----------" in forwarded_text
             assert f"From: {BOB[0]}" in forwarded_text
@@ -996,7 +997,7 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             assert forwarded_parts[0].get_payload(decode=True) == forwarded_attachment_bytes
 
             forwarded_sent_copy = _wait_for_message(ALICE, "Sent", forwarded_subject)
-            forwarded_sent_text = forwarded_sent_copy.message.get_body(preferencelist=("plain",)).get_content()
+            forwarded_sent_text = forwarded_sent_copy.message.get_body(preferencelist=("html",)).get_content()
             assert forward_note in forwarded_sent_text
             assert forward_source_body in forwarded_sent_text
             assert [part.get_filename() for part in forwarded_sent_copy.message.iter_attachments()] == [
@@ -1106,7 +1107,7 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             )
             assert "Email saved to 'Drafts' successfully" in save_result["result"]
             draft = _wait_for_message(ALICE, "Drafts", draft_subject)
-            assert draft_body in draft.message.get_body(preferencelist=("plain",)).get_content()
+            assert draft_body in draft.message.get_body(preferencelist=("html",)).get_content()
             assert {r"\Draft", r"\Seen"} <= draft.flags
 
             draft_metadata = await _metadata_for_subject_in_mailbox(session, "alice", "Drafts", draft_subject)
