@@ -55,6 +55,18 @@ def _batch(*outcomes: TargetMutationOutcome) -> BatchMutationOutcome:
     return BatchMutationOutcome(outcomes)
 
 
+def _without_trash(provider: MagicMock) -> MagicMock:
+    """Pin a provider to the permanent delete branch.
+
+    Deleting is trash-first, so every delete starts with a discovery call. These
+    tests are about the delete effect itself rather than about placement, and the
+    permanent branch is the one that exercises `provider.delete`, so they answer
+    the discovery with "this account has no Trash mailbox".
+    """
+    provider.find_trash_mailbox = AsyncMock(return_value=None)
+    return provider
+
+
 def _services(
     *,
     account: MutationAccountSnapshot | None = None,
@@ -168,7 +180,7 @@ async def test_mark_read_unknown_is_not_replayed_and_invalidates_projection() ->
 
 @pytest.mark.asyncio
 async def test_known_provider_success_survives_projection_failure_with_warning() -> None:
-    provider = MagicMock()
+    provider = _without_trash(MagicMock())
     provider.delete = AsyncMock(return_value=_batch(TargetMutationOutcome("7", "succeeded")))
     projection = MagicMock()
     projection.invalidate = AsyncMock(side_effect=MutationProjectionError("unavailable"))
@@ -176,13 +188,13 @@ async def test_known_provider_success_survives_projection_failure_with_warning()
 
     result = await services.delete.execute(DeleteCommand("primary", ("7",)))
 
-    assert result.targets("succeeded") == ["7"]
-    assert result.reconciliation_needed is True
+    assert result.batch.targets("succeeded") == ["7"]
+    assert result.batch.reconciliation_needed is True
 
 
 @pytest.mark.asyncio
 async def test_projection_cancellation_does_not_erase_known_provider_success() -> None:
-    provider = MagicMock()
+    provider = _without_trash(MagicMock())
     provider.delete = AsyncMock(return_value=_batch(TargetMutationOutcome("7", "succeeded")))
     projection = MagicMock()
     projection.invalidate = AsyncMock(side_effect=asyncio.CancelledError())
@@ -190,19 +202,19 @@ async def test_projection_cancellation_does_not_erase_known_provider_success() -
 
     result = await services.delete.execute(DeleteCommand("primary", ("7",)))
 
-    assert result.targets("succeeded") == ["7"]
-    assert result.reconciliation_needed is True
+    assert result.batch.targets("succeeded") == ["7"]
+    assert result.batch.reconciliation_needed is True
 
 
 @pytest.mark.asyncio
 async def test_known_failure_does_not_invalidate_projection() -> None:
-    provider = MagicMock()
+    provider = _without_trash(MagicMock())
     provider.delete = AsyncMock(return_value=_batch(TargetMutationOutcome("7", "failed", "uidplus-unavailable")))
     services, _, _, projection = _services(provider=provider)
 
     result = await services.delete.execute(DeleteCommand("primary", ("7",)))
 
-    assert result.targets("failed") == ["7"]
+    assert result.batch.targets("failed") == ["7"]
     projection.invalidate.assert_not_awaited()
 
 
@@ -566,12 +578,12 @@ async def test_mutation_error_detail_limit_uses_utf8_bytes_at_boundaries(
         "APPLICATION_LIMITS",
         replace(APPLICATION_LIMITS, error_detail_bytes=4),
     )
-    provider = MagicMock()
+    provider = _without_trash(MagicMock())
     provider.delete = AsyncMock(return_value=_batch(TargetMutationOutcome("1", "failed", detail)))
     services, _, _, _ = _services(provider=provider)
 
     if valid:
-        assert (await services.delete.execute(DeleteCommand("primary", ("1",)))).outcomes[0].detail == detail
+        assert (await services.delete.execute(DeleteCommand("primary", ("1",)))).batch.outcomes[0].detail == detail
     else:
         with pytest.raises(MutationProviderError, match="limit_exceeded"):
             await services.delete.execute(DeleteCommand("primary", ("1",)))
@@ -589,14 +601,14 @@ async def test_mutation_warning_item_limit_boundaries(
         "APPLICATION_LIMITS",
         replace(APPLICATION_LIMITS, warning_items=2),
     )
-    provider = MagicMock()
+    provider = _without_trash(MagicMock())
     provider.delete = AsyncMock(
         return_value=_batch(*(TargetMutationOutcome(str(uid), "failed") for uid in range(1, outcome_count + 1)))
     )
     services, _, _, _ = _services(provider=provider)
 
     if valid:
-        assert len((await services.delete.execute(DeleteCommand("primary", ("1",)))).outcomes) == outcome_count
+        assert len((await services.delete.execute(DeleteCommand("primary", ("1",)))).batch.outcomes) == outcome_count
     else:
         with pytest.raises(MutationProviderError, match="limit_exceeded"):
             await services.delete.execute(DeleteCommand("primary", ("1",)))

@@ -224,6 +224,21 @@ class ClassicMutationProvider:
             )
         return archive_mailbox
 
+    async def find_trash_mailbox(self, source_mailbox: str) -> str | None:
+        """Resolve the Trash mailbox, or ``None`` when permanent removal is the only option.
+
+        Unlike archiving, the absence of a Trash mailbox is a legitimate answer
+        rather than an error: it selects the permanent branch. Deleting from
+        inside Trash resolves to ``None`` for the same reason — there is nowhere
+        further to move to, and emptying the trash must actually empty it. That
+        comparison is case-insensitive so a server that resolves mailbox names
+        that way cannot turn the request into a copy back into Trash.
+        """
+        trash_mailbox = await _bounded_mutation_call(self._handler._find_trash_folder())
+        if trash_mailbox is None or trash_mailbox.casefold() == source_mailbox.casefold():
+            return None
+        return trash_mailbox
+
     async def send(
         self,
         command: SendCommand,

@@ -31,6 +31,7 @@ from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
     ArchiveMutationOutcome,
     BatchMutationOutcome,
+    DeleteMutationOutcome,
     RecipientPolicyDeniedError,
     SendMutationOutcome,
     SentCopyMutationOutcome,
@@ -512,26 +513,43 @@ class TestMcpTools:
 
     @pytest.mark.asyncio
     async def test_delete_emails(self):
-        command_handler = AsyncMock(return_value=_batch_outcome(succeeded=("12345", "12346")))
+        command_handler = AsyncMock(
+            return_value=DeleteMutationOutcome(_batch_outcome(succeeded=("12345", "12346")), "Trash")
+        )
         with patch("mcp_email_server.app.delete_emails_command", command_handler):
             result = await delete_emails("test_account", ["12345", "12346"])
-        assert result == "Successfully deleted 2 email(s)"
+        assert result == "Successfully deleted 2 email(s) by moving them to Trash"
         assert command_handler.await_args.args[0].mailbox == "INBOX"
 
     @pytest.mark.asyncio
     async def test_delete_emails_with_failures(self):
-        command_handler = AsyncMock(return_value=_batch_outcome(succeeded=("12345",), failed=("12346", "12347")))
+        command_handler = AsyncMock(
+            return_value=DeleteMutationOutcome(
+                _batch_outcome(succeeded=("12345",), failed=("12346", "12347")),
+                "[Gmail]/Trash",
+            )
+        )
         with patch("mcp_email_server.app.delete_emails_command", command_handler):
             result = await delete_emails("test_account", ["12345", "12346", "12347"])
-        assert result == "Delete result [succeeded: 12345; failed: 12346, 12347]"
+        assert result == "Delete result [succeeded: 12345; failed: 12346, 12347; mailbox: [Gmail]/Trash]"
 
     @pytest.mark.asyncio
-    async def test_delete_emails_with_mailbox(self):
-        command_handler = AsyncMock(return_value=_batch_outcome(succeeded=("12345",)))
+    async def test_delete_emails_from_trash_reports_a_permanent_delete(self):
+        """The caller is told the messages are gone, not merely moved somewhere."""
+        command_handler = AsyncMock(return_value=DeleteMutationOutcome(_batch_outcome(succeeded=("12345",)), None))
         with patch("mcp_email_server.app.delete_emails_command", command_handler):
             result = await delete_emails("test_account", ["12345"], "Trash")
-        assert result == "Successfully deleted 1 email(s)"
+        assert result == "Successfully deleted 1 email(s) permanently"
         assert command_handler.await_args.args[0].mailbox == "Trash"
+
+    @pytest.mark.asyncio
+    async def test_permanent_delete_with_failures_stays_distinguishable_from_a_move(self):
+        command_handler = AsyncMock(
+            return_value=DeleteMutationOutcome(_batch_outcome(succeeded=("12345",), failed=("12346",)), None)
+        )
+        with patch("mcp_email_server.app.delete_emails_command", command_handler):
+            result = await delete_emails("test_account", ["12345", "12346"], "Trash")
+        assert result == "Delete result [succeeded: 12345; failed: 12346; permanent]"
 
     @pytest.mark.asyncio
     async def test_mark_emails_as_read(self):

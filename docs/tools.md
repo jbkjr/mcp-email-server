@@ -515,10 +515,26 @@ rules as `move_emails`.
 
 ### `delete_emails`
 
-Deletes one or more messages from the selected mailbox. The provider must
-advertise `UIDPLUS`: the server flags and expunges only the requested UIDs with
-`UID EXPUNGE` and never sends mailbox-wide `EXPUNGE`. Without `UIDPLUS`, the
-operation fails before adding the `\Deleted` flag.
+Deletes one or more messages from the selected mailbox, recoverably wherever the
+account allows it. The server first resolves the account's trash mailbox using
+the RFC 6154 `\Trash` mailbox flag and then falls back to the common names
+`Trash`, `Deleted Items`, `Deleted Messages`, `[Gmail]/Trash`, and
+`INBOX.Trash`. When a trash mailbox distinct from the selected one exists, the
+messages are moved into it under the same native-MOVE or safe UIDPLUS fallback
+rules as `move_emails`, and the result names the mailbox they went to.
+
+Deletion is permanent in exactly two cases: the account has no trash mailbox, or
+the selected mailbox is the trash mailbox itself, because emptying the trash has
+nowhere further to move to. A permanent delete requires `UIDPLUS`: the server
+flags and expunges only the requested UIDs with `UID EXPUNGE` and never sends
+mailbox-wide `EXPUNGE`. Without `UIDPLUS`, it fails before adding the `\Deleted`
+flag. The result says explicitly that the messages were deleted permanently, so
+the two outcomes are never confused for each other.
+
+Resolving the trash mailbox is a lookup, not an effect, but it decides between a
+recoverable move and an irreversible expunge. An ambiguous lookup is therefore
+never resolved in favour of permanent deletion: a lookup that fails or times out
+aborts the request before any message is touched.
 
 An all-known-success mutation keeps the existing success sentence. Partial or
 ambiguous results use tagged `succeeded`, `failed`, and `unknown` sections in

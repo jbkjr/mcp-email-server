@@ -519,6 +519,8 @@ class MutationProvider(Protocol):
 
     async def find_archive_mailbox(self, source_mailbox: str) -> str: ...
 
+    async def find_trash_mailbox(self, source_mailbox: str) -> str | None: ...
+
     async def send(
         self,
         command: SendCommand,
@@ -1144,25 +1146,81 @@ class SaveToMailboxService(_MutationWorkflow):
         )
 
 
+@dataclass(frozen=True)
+class DeleteMutationOutcome:
+    """Evidence for one delete, plus where the messages ended up.
+
+    ``trash_mailbox`` names the mailbox the messages were moved into. ``None``
+    means the account offers nowhere to move them and they were removed
+    permanently, so the caller can tell a recoverable delete from an
+    irreversible one instead of inferring it from the mailbox they passed in.
+    """
+
+    batch: BatchMutationOutcome
+    trash_mailbox: str | None
+
+
 class DeleteService(_MutationWorkflow):
-    async def execute(self, command: DeleteCommand) -> BatchMutationOutcome:
+    """Delete into Trash when the account has one, permanently when it does not.
+
+    Discovery is a read rather than an effect, but it chooses between a
+    recoverable move and an irreversible expunge, so an ambiguous answer must
+    never be resolved in favour of the destructive branch: a lookup that times
+    out or fails aborts before anything is touched, and only an authoritative
+    "this account has no distinct Trash mailbox" answer reaches the permanent
+    path. Deleting from inside Trash is that same authoritative answer — there
+    is nowhere further to move to — and is therefore permanent by design.
+    """
+
+    async def execute(self, command: DeleteCommand) -> DeleteMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
-        access = self._open(account)
+        discovery = self._open(account)
         try:
-            outcome = _validate_batch_result(
-                await _bounded_provider_effect(access.provider.delete(command, access.account))
+            trash_mailbox = await _bounded_provider_effect(discovery.provider.find_trash_mailbox(command.mailbox))
+        except TimeoutError:
+            raise MutationProviderError("trash mailbox discovery timed out") from None
+        move: MoveCommand | None = None
+        if trash_mailbox is not None:
+            move = MoveCommand(
+                account_name=command.account_name,
+                email_ids=command.email_ids,
+                source_mailbox=command.mailbox,
+                destination_mailbox=trash_mailbox,
             )
+            move.validate()
+        # Re-resolve selected-mode authority immediately before the delete effect.
+        access = self._providers.open(
+            command.account_name,
+            expected_mode=account.mode,
+            purpose="incoming",
+        )
+        effect = (
+            access.provider.delete(command, access.account)
+            if move is None
+            else access.provider.move(move, access.account)
+        )
+        try:
+            outcome = _validate_batch_result(await _bounded_provider_effect(effect))
         except TimeoutError:
             outcome = _validate_batch_result(_timeout_batch(command.email_ids))
-        if not outcome.effect_may_have_started:
-            return outcome
-        invalidated = await self._invalidate(access.account, (command.mailbox,))
-        return _validate_batch_result(
-            BatchMutationOutcome(
-                outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
+        if outcome.effect_may_have_started:
+            # A move touches both ends; a permanent delete only empties the source.
+            mailboxes = (command.mailbox,) if trash_mailbox is None else (command.mailbox, trash_mailbox)
+            invalidated = await self._invalidate(access.account, mailboxes)
+            outcome = _validate_batch_result(
+                BatchMutationOutcome(
+                    outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
+                )
             )
-        )
+        _validate_result_payload({
+            "batch": {
+                "outcomes": [_outcome_payload(item) for item in outcome.outcomes],
+                "reconciliation_needed": outcome.reconciliation_needed,
+            },
+            "trash_mailbox": trash_mailbox,
+        })
+        return DeleteMutationOutcome(outcome, trash_mailbox)
 
 
 class MoveService(_MutationWorkflow):
