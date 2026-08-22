@@ -2540,6 +2540,18 @@ class EmailClient:
 
         return msg
 
+    def _apply_identification_headers(self, msg: Message) -> None:
+        """Add the configured de-facto sender-software identification headers.
+
+        Some providers reject a message that carries no identification at all, so
+        these default to the project name. Configuring either to an empty string
+        omits that header entirely, for a deployment that would rather send none.
+        """
+        if self.email_server.smtp_user_agent:
+            msg["User-Agent"] = self.email_server.smtp_user_agent
+        if self.email_server.smtp_x_mailer:
+            msg["X-Mailer"] = self.email_server.smtp_x_mailer
+
     def compose_message(
         self,
         recipients: list[str],
@@ -2559,7 +2571,8 @@ class EmailClient:
         """Compose an email message without sending it.
 
         Builds MIME structure, sets headers (Subject, From, To, Cc, Date,
-        Message-Id, User-Agent, X-Mailer, and threading headers). Synchronous — no I/O.
+        Message-Id, the configured identification headers, and threading headers).
+        Synchronous — no I/O.
 
         When ``include_bcc_header`` is True (used for local IMAP storage such
         as Drafts or Sent copies), the Bcc header is included so mail clients
@@ -2624,10 +2637,7 @@ class EmailClient:
         sender_domain = envelope_sender.rsplit("@", 1)[-1]
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
 
-        # De-facto sender identification headers improve compatibility with
-        # providers that inspect sender-software identification.
-        msg["User-Agent"] = "mcp-email-server"
-        msg["X-Mailer"] = "mcp-email-server"
+        self._apply_identification_headers(msg)
 
         # Policy must follow every address-bearing and threading header, not
         # only the SMTP envelope sender. This also keeps later Sent/Draft

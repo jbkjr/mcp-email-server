@@ -512,7 +512,9 @@ verify_ssl = true
 ```
 
 `description`, `save_to_sent`, `sent_folder_name`, and `email_service` are
-optional. Remove the entire `[emails.outgoing]` table for an IMAP-only account.
+optional, as are the `smtp_user_agent` and `smtp_x_mailer` identification fields
+on each server table. Remove the entire `[emails.outgoing]` table for an
+IMAP-only account.
 
 When credentials are stored in the operating system keyring, password values in
 this file are replaced by the reserved `__KEYRING__` marker. Do not enter that
@@ -659,10 +661,24 @@ delivery and RFC 6855 UTF8 support for Draft or Sent-copy APPEND. Drafts and Sen
 copies use the same correctly formatted `From` header and fail before APPEND when
 the provider cannot negotiate the required UTF8 mode.
 
-The server also adds `User-Agent: mcp-email-server` and
-`X-Mailer: mcp-email-server` as de-facto application identifiers for
-compatibility with providers that inspect sender-software identification. These
-identifiers are fixed and contain no account-specific information.
+The server also adds `User-Agent` and `X-Mailer` as de-facto application
+identifiers, for compatibility with providers that reject a message carrying no
+sender-software identification at all. Both default to `mcp-email-server`, which
+contains no account-specific information.
+
+Override either per account, or set it to an empty string to omit that header
+entirely:
+
+```toml
+[emails.outgoing]
+smtp_user_agent = "Acme Mail Bridge 3.1"
+smtp_x_mailer = ""
+```
+
+The environment equivalents are `MCP_EMAIL_SERVER_SMTP_USER_AGENT` and
+`MCP_EMAIL_SERVER_SMTP_X_MAILER`. A value containing control characters is
+rejected when the configuration loads, so a configured identifier cannot smuggle
+an extra header into outgoing mail.
 
 ## Global settings
 
@@ -686,30 +702,32 @@ allowlists.
 
 ### Account variables
 
-| Variable                            | Default          | Required | Description                                               |
-| ----------------------------------- | ---------------- | -------- | --------------------------------------------------------- |
-| `MCP_EMAIL_SERVER_ACCOUNT_NAME`     | `default`        | No       | Account identifier used by MCP tools.                     |
-| `MCP_EMAIL_SERVER_FULL_NAME`        | Email local part | No       | Display name used in outgoing messages.                   |
-| `MCP_EMAIL_SERVER_EMAIL_ADDRESS`    | None             | Yes      | Account email address.                                    |
-| `MCP_EMAIL_SERVER_USER_NAME`        | Email address    | No       | Shared IMAP and SMTP username.                            |
-| `MCP_EMAIL_SERVER_PASSWORD`         | None             | Yes      | Shared password and required environment-account trigger. |
-| `MCP_EMAIL_SERVER_IMAP_HOST`        | None             | Yes      | IMAP server host.                                         |
-| `MCP_EMAIL_SERVER_IMAP_PORT`        | `993`            | No       | IMAP server port.                                         |
-| `MCP_EMAIL_SERVER_IMAP_SSL`         | `true`           | No       | Use implicit TLS for IMAP.                                |
-| `MCP_EMAIL_SERVER_IMAP_START_SSL`   | `false`          | No       | Upgrade the IMAP connection with STARTTLS.                |
-| `MCP_EMAIL_SERVER_IMAP_VERIFY_SSL`  | `true`           | No       | Verify the IMAP TLS certificate.                          |
-| `MCP_EMAIL_SERVER_IMAP_USER_NAME`   | Shared username  | No       | IMAP-specific username.                                   |
-| `MCP_EMAIL_SERVER_IMAP_PASSWORD`    | Shared password  | No       | Non-empty IMAP-specific password; empty uses shared.      |
-| `MCP_EMAIL_SERVER_SMTP_HOST`        | None             | No       | SMTP server host; enables sending when present.           |
-| `MCP_EMAIL_SERVER_SMTP_PORT`        | `465`            | No       | SMTP server port.                                         |
-| `MCP_EMAIL_SERVER_SMTP_SSL`         | `true`           | No       | Use implicit TLS for SMTP.                                |
-| `MCP_EMAIL_SERVER_SMTP_START_SSL`   | `false`          | No       | Upgrade the SMTP connection with STARTTLS.                |
-| `MCP_EMAIL_SERVER_SMTP_VERIFY_SSL`  | `true`           | No       | Verify the SMTP TLS certificate.                          |
-| `MCP_EMAIL_SERVER_SMTP_USER_NAME`   | Shared username  | No       | SMTP-specific username.                                   |
-| `MCP_EMAIL_SERVER_SMTP_PASSWORD`    | Shared password  | No       | Non-empty SMTP-specific password; empty uses shared.      |
-| `MCP_EMAIL_SERVER_SAVE_TO_SENT`     | `true`           | No       | Append sent messages to an IMAP Sent folder.              |
-| `MCP_EMAIL_SERVER_SENT_FOLDER_NAME` | Auto-detected    | No       | Override the Sent folder name.                            |
-| `MCP_EMAIL_SERVER_EMAIL_SERVICE`    | Auto-detected    | No       | Quoted-reply markup: `protonmail`, `gmail`, or `generic`. |
+| Variable                            | Default            | Required | Description                                               |
+| ----------------------------------- | ------------------ | -------- | --------------------------------------------------------- |
+| `MCP_EMAIL_SERVER_ACCOUNT_NAME`     | `default`          | No       | Account identifier used by MCP tools.                     |
+| `MCP_EMAIL_SERVER_FULL_NAME`        | Email local part   | No       | Display name used in outgoing messages.                   |
+| `MCP_EMAIL_SERVER_EMAIL_ADDRESS`    | None               | Yes      | Account email address.                                    |
+| `MCP_EMAIL_SERVER_USER_NAME`        | Email address      | No       | Shared IMAP and SMTP username.                            |
+| `MCP_EMAIL_SERVER_PASSWORD`         | None               | Yes      | Shared password and required environment-account trigger. |
+| `MCP_EMAIL_SERVER_IMAP_HOST`        | None               | Yes      | IMAP server host.                                         |
+| `MCP_EMAIL_SERVER_IMAP_PORT`        | `993`              | No       | IMAP server port.                                         |
+| `MCP_EMAIL_SERVER_IMAP_SSL`         | `true`             | No       | Use implicit TLS for IMAP.                                |
+| `MCP_EMAIL_SERVER_IMAP_START_SSL`   | `false`            | No       | Upgrade the IMAP connection with STARTTLS.                |
+| `MCP_EMAIL_SERVER_IMAP_VERIFY_SSL`  | `true`             | No       | Verify the IMAP TLS certificate.                          |
+| `MCP_EMAIL_SERVER_IMAP_USER_NAME`   | Shared username    | No       | IMAP-specific username.                                   |
+| `MCP_EMAIL_SERVER_IMAP_PASSWORD`    | Shared password    | No       | Non-empty IMAP-specific password; empty uses shared.      |
+| `MCP_EMAIL_SERVER_SMTP_HOST`        | None               | No       | SMTP server host; enables sending when present.           |
+| `MCP_EMAIL_SERVER_SMTP_PORT`        | `465`              | No       | SMTP server port.                                         |
+| `MCP_EMAIL_SERVER_SMTP_SSL`         | `true`             | No       | Use implicit TLS for SMTP.                                |
+| `MCP_EMAIL_SERVER_SMTP_START_SSL`   | `false`            | No       | Upgrade the SMTP connection with STARTTLS.                |
+| `MCP_EMAIL_SERVER_SMTP_VERIFY_SSL`  | `true`             | No       | Verify the SMTP TLS certificate.                          |
+| `MCP_EMAIL_SERVER_SMTP_USER_NAME`   | Shared username    | No       | SMTP-specific username.                                   |
+| `MCP_EMAIL_SERVER_SMTP_PASSWORD`    | Shared password    | No       | Non-empty SMTP-specific password; empty uses shared.      |
+| `MCP_EMAIL_SERVER_SAVE_TO_SENT`     | `true`             | No       | Append sent messages to an IMAP Sent folder.              |
+| `MCP_EMAIL_SERVER_SENT_FOLDER_NAME` | Auto-detected      | No       | Override the Sent folder name.                            |
+| `MCP_EMAIL_SERVER_EMAIL_SERVICE`    | Auto-detected      | No       | Quoted-reply markup: `protonmail`, `gmail`, or `generic`. |
+| `MCP_EMAIL_SERVER_SMTP_USER_AGENT`  | `mcp-email-server` | No       | Outgoing `User-Agent`; empty omits the header.            |
+| `MCP_EMAIL_SERVER_SMTP_X_MAILER`    | `mcp-email-server` | No       | Outgoing `X-Mailer`; empty omits the header.              |
 
 Boolean values accept `true`, `1`, `yes`, or `on` as true, ignoring case. Other
 values are treated as false. Do not add surrounding whitespace to these values.

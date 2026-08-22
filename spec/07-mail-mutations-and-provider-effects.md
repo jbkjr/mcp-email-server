@@ -280,3 +280,9 @@ enter public errors.
     aborts before any SMTP session opens rather than sending unquoted, that an
     allowlist-blocked source is indistinguishable from an absent one, and that the
     body carrying the appended quote is revalidated against the body bound.
+15. Outgoing sender-software identification is configuration, not a constant: each
+    identification header is separately configurable, an empty value omits that
+    header, and the defaults carry no account-specific information. A value
+    containing control characters is rejected when configuration loads, so a
+    configured identifier cannot inject an additional header. Tests cover defaults,
+    per-header override, omission, rejection, and TOML round-trip.
