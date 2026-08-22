@@ -70,14 +70,14 @@ for client discovery and configuration migration steps.
 Every tool advertises reviewed MCP `readOnlyHint`, `destructiveHint`,
 `idempotentHint`, and `openWorldHint` values:
 
-| Tools                                                                                                                     | Read-only | Destructive | Idempotent | Open world |
-| ------------------------------------------------------------------------------------------------------------------------- | --------- | ----------- | ---------- | ---------- |
-| `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders`                                              | yes       | no          | yes        | no         |
-| `list_emails_metadata`, `list_mailboxes`, `list_labels`, `get_email_labels`                                               | yes       | no          | yes        | yes        |
-| `get_emails_content`                                                                                                      | no        | no          | yes        | yes        |
-| `send_email`, `forward_email`, `save_to_mailbox`, `copy_emails`, `create_folder`                                          | no        | no          | no         | yes        |
-| `set_email_flags`, `mark_emails_as_read`                                                                                  | no        | no          | yes        | yes        |
-| `delete_emails`, `move_emails`, `archive_emails`, `remove_label`, `download_attachment`, `delete_folder`, `rename_folder` | no        | yes         | no         | yes        |
+| Tools                                                                                                                                     | Read-only | Destructive | Idempotent | Open world |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | --------- | ----------- | ---------- | ---------- |
+| `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders`                                                              | yes       | no          | yes        | no         |
+| `list_emails_metadata`, `list_mailboxes`, `list_labels`, `get_email_labels`                                                               | yes       | no          | yes        | yes        |
+| `get_emails_content`                                                                                                                      | no        | no          | yes        | yes        |
+| `send_email`, `forward_email`, `save_to_mailbox`, `copy_emails`, `create_folder`, `create_label`, `apply_label`                           | no        | no          | no         | yes        |
+| `set_email_flags`, `mark_emails_as_read`                                                                                                  | no        | no          | yes        | yes        |
+| `delete_emails`, `move_emails`, `archive_emails`, `remove_label`, `delete_label`, `download_attachment`, `delete_folder`, `rename_folder` | no        | yes         | no         | yes        |
 
 <!-- Port slots. Tools are being ported onto this architecture in parallel; each cluster
      adds its tool names to the matching existing row above rather than appending a new
@@ -90,9 +90,10 @@ Every tool advertises reviewed MCP `readOnlyHint`, `destructiveHint`,
 caller-selected destination may be replaced. Send, forward, and append create
 externally meaningful effects but do not delete or replace an existing mailbox
 item, so their destructive hint is false while their read-only and idempotent
-hints are also false. `copy_emails` and `create_folder` are additive for the
-same reason, while `delete_folder` and `rename_folder` are destructive because
-they remove or replace an existing mailbox together with everything it holds.
+hints are also false. `copy_emails`, `create_folder`, `create_label`, and
+`apply_label` are additive for the same reason, while `delete_folder`,
+`rename_folder`, and `delete_label` are destructive because they remove or
+replace an existing mailbox together with everything it holds.
 
 Annotations are advisory host/agent planning hints, not authorization or a
 safe-retry guarantee. Tool descriptions, current policy, typed outcomes, and the
@@ -606,6 +607,53 @@ alongside the ID, because those reasons are actionable and non-sensitive:
 When a sender allowlist is active and `report_blocked_mutations` is off, a
 blocked ID is reported as a successful no-op and nothing is deleted. See
 [Sender allowlist](security.md#sender-allowlist).
+
+### `create_label`
+
+Creates one label by creating the mailbox that stores it. Pass `label_name`
+without the `Labels/` prefix; the tool adds it.
+
+Creating a label adds a mailbox to the account, so it requires
+`enable_folder_management=true` exactly as `create_folder` does. See
+[Folder management access](security.md#folder-management-access). The tool stays
+visible when the policy is off and refuses at call time.
+
+### `delete_label`
+
+Deletes one label by deleting the mailbox that stores it, discarding the label's
+own copy of every message it holds. The messages themselves are unaffected: a
+label copy is a separate message from the one in its own mailbox, so deleting a
+label removes the labelling, not the mail. Most servers require the mailbox to
+be empty first — remove the label from its messages, or expect a `failed`
+result.
+
+Deleting a label removes a mailbox, so it requires
+`enable_folder_management=true` exactly as `delete_folder` does.
+
+### `apply_label`
+
+Applies one label to one or more messages by copying each message from
+`source_mailbox` into `Labels/<label_name>`. The message in `source_mailbox` is
+never moved or modified; labelling is purely additive, which is why this tool is
+not gated by `enable_folder_management`.
+
+The label mailbox must already exist — use `list_labels` to find one or
+`create_label` to make one. Applying a label to a message that already carries
+it adds a second copy rather than failing, because IMAP COPY is additive.
+
+Per-ID results preserve caller order and distinguish success, failure, and
+`unknown`, and the sender allowlist applies exactly as it does to `copy_emails`:
+when the allowlist is active and `report_blocked_mutations` is off, a blocked ID
+is reported as a successful no-op and nothing is copied.
+
+`create_label`, `delete_label`, and `apply_label` name the label in their
+results, never the `Labels/` mailbox they derive from it, so a caller works in
+label names throughout.
+
+A label name may itself contain `/`. `list_labels` reports `Labels/Work/2026` as
+the label `Work/2026`, so the write tools accept the same spelling; on a
+`/`-delimited server this nests the mailbox, and elsewhere it is a flat name
+containing a slash.
 
 ## Attachments
 

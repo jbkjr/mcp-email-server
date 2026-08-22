@@ -515,6 +515,7 @@ The allowlist protects:
 - Attachment download.
 - Deletion and approved flag/read-state mutations.
 - Move and archive operations.
+- Copy operations, including applying a label.
 - Label membership lookup and label removal.
 
 A blocked message's body and attachments are not fetched or marked as read. By
@@ -564,7 +565,10 @@ by the account operator through TOML or
 `MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT`. Managed configuration carries no
 equivalent policy, so managed mode always resolves the flag to `false`.
 
-`create_folder`, `delete_folder`, and `rename_folder` are the gated tools. The
+`create_folder`, `delete_folder`, `rename_folder`, `create_label`, and
+`delete_label` are the gated tools. A label is an ordinary mailbox named
+`Labels/<label_name>`, so creating or deleting one is a mailbox-shape mutation
+and carries the same gate as the folder tool it delegates to. The
 flag is checked twice per call — once on the resolved account before any
 provider is constructed, and again on the opened account immediately before the
 effect — so a policy that changes between resolution and provider construction
@@ -576,7 +580,9 @@ is a runtime policy decision rather than a change of surface.
 mailboxes without changing the folder layout, and it enforces the sender
 allowlist exactly as `move_emails` does. A blocked sender's UID is never copied;
 by default it is reported as a no-op success indistinguishable from a
-nonexistent UID.
+nonexistent UID. `apply_label` is ungated for the same reason and inherits that
+allowlist behavior unchanged, because it is a copy into the label's mailbox
+rather than a second implementation of one.
 
 ## Attachment access
 

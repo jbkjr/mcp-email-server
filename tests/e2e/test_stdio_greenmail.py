@@ -1609,5 +1609,230 @@ async def test_label_reads_and_removal_against_greenmail(tmp_path: Path) -> None
 
 
 # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
-# port-slot C: send path (Markdown rendering, quoted replies)
+# port-slot C: send path (Markdown rendering, quoted replies)@pytest.mark.asyncio
+async def test_label_lifecycle_through_the_tools_against_greenmail(tmp_path: Path) -> None:
+    """The whole label lifecycle driven through the MCP tools, not raw IMAP.
+
+    This is the first coverage proving the label writes and the label reads agree
+    on the `Labels/<name>` convention end to end. GreenMail's hierarchy delimiter
+    is `.`, and the prefix stays a literal `/` inside the mailbox *name*, which is
+    exactly what the ProtonMail convention requires.
+
+    Two labels are used rather than one, because of a GreenMail defect that no
+    ordering of a single label can dodge. GreenMail permanently breaks DELETE for
+    any mailbox that some session ever SELECTed without CLOSE: the DELETE
+    connection is dropped (EOF), a later SELECT+CLOSE does not repair it, and the
+    damage outlives the session that caused it. `get_email_labels` SELECTs every
+    label mailbox to search it and `remove_label` SELECTs the one it expunges
+    from, neither of which issues CLOSE — CLOSE would expunge `\\Deleted` messages,
+    which the scoped-expunge contract forbids. So a label those tools have touched
+    can never be deleted here, and `delete_label` is exercised on a second label
+    created after the last `get_email_labels` call and never selected by anything.
+    A real IMAP server has no such restriction; SELECT+CLOSE and deleting a
+    non-empty mailbox are both fine even in GreenMail.
+    """
+    _wait_until_ready()
+    _ensure_empty_mailboxes(BOB, ["INBOX"])
+
+    run_id = uuid.uuid4().hex[:8]
+    # Read/remove half: the tools SELECT this one, so GreenMail will not delete it.
+    flow_label = f"E2E-flow-{run_id}"
+    flow_mailbox = f"Labels/{flow_label}"
+    # Delete half: created last and never selected, so DELETE still works.
+    shape_label = f"E2E-shape-{run_id}"
+    shape_mailbox = f"Labels/{shape_label}"
+    denied_label = f"E2E-denied-{run_id}"
+    labelled_subject = f"mcp-e2e-apply-{run_id}"
+    plain_subject = f"mcp-e2e-plain-{run_id}"
+
+    def _label_subjects(mailbox: str) -> set[str]:
+        """Read a label mailbox's subjects, always releasing it with CLOSE.
+
+        Only the subjects are read: cluster C made message bodies HTML, and
+        nothing here depends on the body.
+        """
+        with _imap_session(BOB) as client:
+            status, _ = client.select(f'"{mailbox}"', readonly=True)
+            assert status == "OK", f"SELECT {mailbox} failed: {status}"
+            try:
+                status, rows = client.uid("search", None, "ALL")
+                assert status == "OK", f"UID SEARCH in {mailbox} failed: {status}"
+                subjects: set[str] = set()
+                for uid in (rows[0] or b"").split():
+                    status, fetched = client.uid("fetch", uid, "(BODY.PEEK[HEADER])")
+                    assert status == "OK", f"UID FETCH {uid!r} failed: {status}"
+                    response = next((item for item in fetched if isinstance(item, tuple)), None)
+                    assert response is not None
+                    message = BytesParser(policy=policy.default).parsebytes(response[1])
+                    subjects.add(str(message.get("Subject", "")))
+                return subjects
+            finally:
+                client.close()
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f"enable_folder_management = true\n{CONFIG_TEMPLATE}")
+    config_path.chmod(0o600)
+    base_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env = {
+        **base_env,
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_CREDENTIAL_STORAGE": "plaintext",
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+    }
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    assert console_script.is_file(), f"Installed console script not found: {console_script}"
+
+    def _server(env: dict[str, str]) -> StdioServerParameters:
+        return StdioServerParameters(command=str(console_script), args=["stdio"], env=env, cwd=Path.cwd())
+
+    try:
+        _seed_message(labelled_subject, "This message gets a label")
+        _seed_message(plain_subject, "This message stays unlabelled")
+        _wait_for_message(BOB, "INBOX", labelled_subject)
+        _wait_for_message(BOB, "INBOX", plain_subject)
+
+        async with stdio_client(_server(server_env)) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream, read_timeout_seconds=timedelta(seconds=15)) as session:
+                await session.initialize()
+                tool_names = {tool.name for tool in (await session.list_tools()).tools}
+                assert {"create_label", "delete_label", "apply_label"} <= tool_names
+
+                created = await _call_tool(session, "create_label", {"account_name": "bob", "label_name": flow_label})
+                # The caller named a label, so the result names a label.
+                assert created["result"] == f"Label '{flow_label}' created"
+                assert "Labels/" not in created["result"]
+                assert _mailbox_exists(BOB, flow_mailbox)
+
+                # The read side recognizes the write side's mailbox as a label.
+                labels = await _call_tool(session, "list_labels", {"account_name": "bob"})
+                listed = [label for label in labels["result"] if label["name"] == flow_label]
+                assert len(listed) == 1, labels
+                assert listed[0]["full_path"] == flow_mailbox
+
+                labelled_metadata = await _metadata_for_subject(session, "bob", labelled_subject)
+                plain_metadata = await _metadata_for_subject(session, "bob", plain_subject)
+
+                applied = await _call_tool(
+                    session,
+                    "apply_label",
+                    {
+                        "account_name": "bob",
+                        "email_ids": [labelled_metadata["email_id"]],
+                        "label_name": flow_label,
+                        "source_mailbox": "INBOX",
+                    },
+                )
+                assert applied["result"] == f"Successfully applied label '{flow_label}' to 1 email(s)"
+                assert _label_subjects(flow_mailbox) == {labelled_subject}
+                # Applying a label is additive: the original never moves.
+                assert _find_message(BOB, "INBOX", labelled_subject) is not None
+
+                confirmed = await _call_tool(
+                    session,
+                    "get_email_labels",
+                    {"account_name": "bob", "email_id": labelled_metadata["email_id"], "mailbox": "INBOX"},
+                )
+                assert confirmed["result"] == [flow_label]
+
+                untouched = await _call_tool(
+                    session,
+                    "get_email_labels",
+                    {"account_name": "bob", "email_id": plain_metadata["email_id"], "mailbox": "INBOX"},
+                )
+                assert untouched["result"] == []
+
+                removed = await _call_tool(
+                    session,
+                    "remove_label",
+                    {
+                        "account_name": "bob",
+                        "email_ids": [labelled_metadata["email_id"]],
+                        "label_name": flow_label,
+                        "source_mailbox": "INBOX",
+                    },
+                )
+                assert removed["result"] == f"Successfully removed label '{flow_label}' from 1 email(s)"
+                assert _label_subjects(flow_mailbox) == set()
+                assert _find_message(BOB, "INBOX", labelled_subject) is not None
+
+                after_removal = await _call_tool(
+                    session,
+                    "get_email_labels",
+                    {"account_name": "bob", "email_id": labelled_metadata["email_id"], "mailbox": "INBOX"},
+                )
+                assert after_removal["result"] == []
+
+                # No `get_email_labels` call past this point: the delete target must
+                # never be SELECTed. `list_labels` uses LIST and stays safe.
+                shaped = await _call_tool(session, "create_label", {"account_name": "bob", "label_name": shape_label})
+                assert shaped["result"] == f"Label '{shape_label}' created"
+                assert _mailbox_exists(BOB, shape_mailbox)
+
+                relabelled = await _call_tool(
+                    session,
+                    "apply_label",
+                    {
+                        "account_name": "bob",
+                        "email_ids": [labelled_metadata["email_id"]],
+                        "label_name": shape_label,
+                    },
+                )
+                # source_mailbox defaults to INBOX.
+                assert relabelled["result"] == f"Successfully applied label '{shape_label}' to 1 email(s)"
+                assert _label_subjects(shape_mailbox) == {labelled_subject}
+
+                dropped = await _call_tool(session, "delete_label", {"account_name": "bob", "label_name": shape_label})
+                assert dropped["result"] == f"Label '{shape_label}' deleted"
+                assert "Labels/" not in dropped["result"]
+                assert not _mailbox_exists(BOB, shape_mailbox)
+
+                # The label is gone from the read side too, and deleting a label
+                # that held a copy never touched the messages themselves.
+                remaining = await _call_tool(session, "list_labels", {"account_name": "bob"})
+                assert not any(label["name"] == shape_label for label in remaining["result"])
+                assert _find_message(BOB, "INBOX", labelled_subject) is not None
+                assert _find_message(BOB, "INBOX", plain_subject) is not None
+
+        # With the policy off the two shape tools refuse, while apply_label — which
+        # only copies messages into an existing mailbox — keeps working.
+        gated_off_env = {**server_env, "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT": "false"}
+        async with stdio_client(_server(gated_off_env)) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream, read_timeout_seconds=timedelta(seconds=15)) as session:
+                await session.initialize()
+                tool_names = {tool.name for tool in (await session.list_tools()).tools}
+                # The tools stay visible; the denial is a runtime policy decision.
+                assert {"create_label", "delete_label", "apply_label"} <= tool_names
+
+                for tool_name in ("create_label", "delete_label"):
+                    denied = await session.call_tool(
+                        tool_name,
+                        arguments={"account_name": "bob", "label_name": denied_label},
+                    )
+                    assert denied.isError is True
+                    assert "Folder management is disabled" in _text_content(denied)
+                assert not _mailbox_exists(BOB, f"Labels/{denied_label}")
+
+                still_labelled = await _metadata_for_subject(session, "bob", plain_subject)
+                ungated = await _call_tool(
+                    session,
+                    "apply_label",
+                    {
+                        "account_name": "bob",
+                        "email_ids": [still_labelled["email_id"]],
+                        "label_name": flow_label,
+                    },
+                )
+                assert ungated["result"] == f"Successfully applied label '{flow_label}' to 1 email(s)"
+                assert _label_subjects(flow_mailbox) == {plain_subject}
+    finally:
+        for mailbox in (flow_mailbox, shape_mailbox, f"Labels/{denied_label}"):
+            with contextlib.suppress(Exception), _imap_session(BOB) as client:
+                # Release the mailbox before removing it. `flow_mailbox` was SELECTed
+                # without CLOSE by the server's own read tools, so GreenMail may
+                # refuse it outright; a leftover run-scoped label is harmless.
+                if client.select(f'"{mailbox}"')[0] == "OK":
+                    client.close()
+                client.delete(f'"{mailbox}"')
+
+
 # port-slot B2: label writes (create_label, delete_label, apply_label)

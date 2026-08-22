@@ -126,6 +126,20 @@ mailbox projection is invalidated — both the old and the new name for a rename
 — and any cached special-use folder resolution is dropped on every attempt,
 because a shape change can move which mailbox the RFC 6154 discovery resolves.
 
+## Label Writes
+
+A label is an ordinary mailbox named `Labels/<label_name>`, so label writes add
+no effect class of their own. Creating and deleting a label are the mailbox-shape
+create and delete applied to that derived name and therefore carry the same
+operator-owned policy gate; applying a label is the copy effect with that name as
+its destination and is therefore ungated and subject to the same sender
+allowlist. The label name is the caller-facing identifier: it is validated and
+bounded before authority is resolved so the derived mailbox stays inside the
+mailbox bound, and results name the label rather than the mailbox derived from
+it. Reusing the existing effects is normative rather than incidental — a second
+implementation could drift from the gate, the allowlist, or the invalidation
+rules those effects already carry.
+
 ## Delete and Scoped Expunge
 
 Delete marks only selected UIDs and removes only those targets with a scoped
@@ -307,3 +321,13 @@ enter public errors.
     interpolated raw, that an allowlist-blocked message is indistinguishable
     from a missing one, that per-target failures carry only reviewed fixed
     detail tags, and that only the label mailbox is invalidated.
+15. Label writes own no provider primitive: creating and deleting a label are the
+    mailbox-shape create and delete applied to `Labels/<label_name>`, and applying
+    a label is the copy effect with that mailbox as its destination. Tests prove
+    the label name is validated before authority is resolved and bounded so the
+    derived mailbox stays inside the mailbox bound, that creating and deleting a
+    label are gated by `enable_folder_management` on the resolved account and again
+    on the opened account while applying one is not, that applying a label enforces
+    the sender allowlist and never modifies or removes the source message, that
+    only the label mailbox is invalidated, and that results name the label rather
+    than the mailbox derived from it.

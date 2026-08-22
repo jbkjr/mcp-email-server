@@ -713,7 +713,7 @@
         },
         {
             "name": "list_allowed_senders",
-            "description": "List the configured inbound sender allowlist — the address patterns whose mail the server will read or act on. When configured, only these senders' mail is visible to the read tools (list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, copy_emails, remove_label). Returns an empty list when unrestricted.",
+            "description": "List the configured inbound sender allowlist — the address patterns whose mail the server will read or act on. When configured, only these senders' mail is visible to the read tools (list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, copy_emails, apply_label, remove_label). Returns an empty list when unrestricted.",
             "inputSchema": {
                 "properties": {},
                 "title": "list_allowed_sendersArguments",
@@ -2002,6 +2002,145 @@
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "create_label",
+            "description": "Create a new label. A label is an IMAP mailbox named 'Labels/<label_name>', so this creates that mailbox; pass the label name without the 'Labels/' prefix. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "label_name": {
+                        "description": "The label to create, without the 'Labels/' prefix.",
+                        "maxLength": 1017,
+                        "title": "Label Name",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "label_name"],
+                "title": "create_labelArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "create_labelOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "delete_label",
+            "description": "Delete a label and the label's own copies of every message it holds; the messages in their own mailboxes are not affected. Pass the label name without the 'Labels/' prefix. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "label_name": {
+                        "description": "The label to delete, without the 'Labels/' prefix (obtained from list_labels).",
+                        "maxLength": 1017,
+                        "title": "Label Name",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "label_name"],
+                "title": "delete_labelArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "delete_labelOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "apply_label",
+            "description": "Apply one label to one or more emails by copying each message into the 'Labels/<label_name>' mailbox; the message in source_mailbox stays exactly where it is. The label mailbox must already exist — use list_labels or create_label first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "email_ids": {
+                        "description": "List of email_id to apply the label to (obtained from list_emails_metadata).",
+                        "items": {
+                            "maxLength": 10,
+                            "pattern": "^[1-9][0-9]*$",
+                            "type": "string"
+                        },
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Email Ids",
+                        "type": "array"
+                    },
+                    "label_name": {
+                        "description": "The label to apply, without the 'Labels/' prefix (obtained from list_labels).",
+                        "maxLength": 1017,
+                        "title": "Label Name",
+                        "type": "string"
+                    },
+                    "source_mailbox": {
+                        "default": "INBOX",
+                        "description": "The mailbox that contains the emails.",
+                        "maxLength": 1024,
+                        "title": "Source Mailbox",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "email_ids", "label_name"],
+                "title": "apply_labelArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "apply_labelOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
                 "idempotentHint": false,
                 "openWorldHint": true
             }

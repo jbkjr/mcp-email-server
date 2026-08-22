@@ -16,13 +16,16 @@ from mcp_email_server.application.metadata import ListEmailMetadataQuery
 from mcp_email_server.application.mutations import (
     MUTABLE_EMAIL_FLAGS,
     AppendMutationOutcome,
+    ApplyLabelCommand,
     ArchiveCommand,
     ArchiveMutationOutcome,
     BatchMutationOutcome,
     CopyCommand,
     CreateFolderCommand,
+    CreateLabelCommand,
     DeleteCommand,
     DeleteFolderCommand,
+    DeleteLabelCommand,
     FlagOperation,
     FolderMutationOutcome,
     ForwardCommand,
@@ -481,7 +484,7 @@ async def list_allowed_recipients() -> PolicyDiscoveryResult:
         "will read or act on. When configured, only these senders' mail is visible to the read tools "
         "(list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation "
         "tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, "
-        "copy_emails, remove_label). Returns an "
+        "copy_emails, apply_label, remove_label). Returns an "
         "empty list "
         "when unrestricted."
     ),
@@ -1376,4 +1379,105 @@ async def remove_label(
 
 # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
 # port-slot C: send path (no new tools; send_email gains Markdown and quoted replies)
+async def create_label_command(command: CreateLabelCommand) -> FolderMutationOutcome:
+    return await get_application_runtime().mutations.create_label.execute(command)
+
+
+async def delete_label_command(command: DeleteLabelCommand) -> FolderMutationOutcome:
+    return await get_application_runtime().mutations.delete_label.execute(command)
+
+
+async def apply_label_command(command: ApplyLabelCommand) -> BatchMutationOutcome:
+    return await get_application_runtime().mutations.apply_label.execute(command)
+
+
+@mcp.tool(
+    description=(
+        "Create a new label. A label is an IMAP mailbox named 'Labels/<label_name>', so this creates "
+        "that mailbox; pass the label name without the 'Labels/' prefix. Requires "
+        "enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; "
+        "managed-mode accounts never allow it."
+    ),
+    annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
+)
+async def create_label(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    label_name: Annotated[
+        LabelNameInput,
+        Field(description="The label to create, without the 'Labels/' prefix."),
+    ],
+) -> str:
+    outcome = await create_label_command(CreateLabelCommand(account_name, label_name))
+    if outcome.status == "succeeded" and not outcome.reconciliation_needed:
+        return f"Label '{label_name}' created"
+    return f"Create-label result [{_tagged_folder_result(outcome)}]"
+
+
+@mcp.tool(
+    description=(
+        "Delete a label and the label's own copies of every message it holds; the messages in their "
+        "own mailboxes are not affected. Pass the label name without the 'Labels/' prefix. Requires "
+        "enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; "
+        "managed-mode accounts never allow it."
+    ),
+    annotations=_DESTRUCTIVE_REMOTE_MUTATION,
+)
+async def delete_label(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    label_name: Annotated[
+        LabelNameInput,
+        Field(description="The label to delete, without the 'Labels/' prefix (obtained from list_labels)."),
+    ],
+) -> str:
+    outcome = await delete_label_command(DeleteLabelCommand(account_name, label_name))
+    if outcome.status == "succeeded" and not outcome.reconciliation_needed:
+        return f"Label '{label_name}' deleted"
+    return f"Delete-label result [{_tagged_folder_result(outcome)}]"
+
+
+@mcp.tool(
+    description=(
+        "Apply one label to one or more emails by copying each message into the 'Labels/<label_name>' "
+        "mailbox; the message in source_mailbox stays exactly where it is. The label mailbox must "
+        "already exist — use list_labels or create_label first. Partial or ambiguous effects report "
+        "per-ID succeeded/failed/unknown status and are not retried automatically."
+    ),
+    annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
+)
+async def apply_label(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    email_ids: Annotated[
+        list[UidInput],
+        Field(
+            min_length=1,
+            max_length=APPLICATION_LIMITS.mutation_uids,
+            description="List of email_id to apply the label to (obtained from list_emails_metadata).",
+        ),
+    ],
+    label_name: Annotated[
+        LabelNameInput,
+        Field(description="The label to apply, without the 'Labels/' prefix (obtained from list_labels)."),
+    ],
+    source_mailbox: Annotated[
+        str,
+        Field(
+            default="INBOX",
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The mailbox that contains the emails.",
+        ),
+    ] = "INBOX",
+) -> str:
+    outcome = await apply_label_command(ApplyLabelCommand(account_name, tuple(email_ids), label_name, source_mailbox))
+    succeeded = outcome.targets("succeeded")
+    if len(succeeded) == len(email_ids) and not outcome.reconciliation_needed:
+        return f"Successfully applied label '{label_name}' to {len(succeeded)} email(s)"
+    return f"Apply-label result [{_tagged_batch_result(outcome)}]"
+
+
 # port-slot B2: label writes (create_label, delete_label, apply_label)

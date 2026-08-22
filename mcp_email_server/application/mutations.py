@@ -16,6 +16,7 @@ from mcp_email_server.application.limits import (
     validate_serialized_result,
 )
 from mcp_email_server.application.metadata import RuntimeMode
+from mcp_email_server.log import logger
 
 MutationStatus = Literal["succeeded", "failed", "unknown"]
 MutationProviderPurpose = Literal["incoming", "outgoing", "sent-copy"]
@@ -410,6 +411,58 @@ class RemoveLabelCommand:
         return label_mailbox(self.label_name)
 
 
+# Port-slot B2 commands: label writes. Each carries a `label_mailbox` property so
+# the label name stays the caller-facing identifier while the mailbox is the only
+# thing handed to the folder/copy command it delegates to.
+@dataclass(frozen=True)
+class CreateLabelCommand:
+    account_name: str
+    label_name: str
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        validate_label_name(self.label_name)
+
+    @property
+    def label_mailbox(self) -> str:
+        """The mailbox whose creation makes this label exist."""
+        return label_mailbox(self.label_name)
+
+
+@dataclass(frozen=True)
+class DeleteLabelCommand:
+    account_name: str
+    label_name: str
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        validate_label_name(self.label_name)
+
+    @property
+    def label_mailbox(self) -> str:
+        """The mailbox whose removal deletes this label and every copy in it."""
+        return label_mailbox(self.label_name)
+
+
+@dataclass(frozen=True)
+class ApplyLabelCommand:
+    account_name: str
+    email_ids: tuple[str, ...]
+    label_name: str
+    source_mailbox: str = "INBOX"
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        _validate_email_ids(self.email_ids)
+        validate_label_name(self.label_name)
+        validate_mailbox_name(self.source_mailbox)
+
+    @property
+    def label_mailbox(self) -> str:
+        """The mailbox each labelled copy is written into."""
+        return label_mailbox(self.label_name)
+
+
 class MutationAccountAuthority(Protocol):
     def resolve(
         self,
@@ -509,7 +562,9 @@ class MutationProvider(Protocol):
 
     # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
     # port-slot C: send path (Markdown bodies, quoted replies)
-    # port-slot B2: label writes (create_label, delete_label, apply_label)
+    # port-slot B2: label writes (create_label, delete_label, apply_label) — no
+    # members: a label write is a mailbox name away from `create_folder`,
+    # `delete_folder`, and `copy`, so it reuses those primitives unchanged.
 
 
 @dataclass(frozen=True)
@@ -1329,6 +1384,74 @@ class RemoveLabelService(_MutationWorkflow):
 
 # port-slot B1: label reads (RemoveLabelService)
 # port-slot C: send path (Markdown bodies, quoted replies — extends SendService in place)
+class CreateLabelService:
+    """Create one label by creating the mailbox that stores it.
+
+    A label *is* its mailbox, so this owns no effect of its own: it translates
+    the label name and hands the work to :class:`CreateFolderService`, which
+    carries the ``enable_folder_management`` gate, the pre-open/post-open
+    authority checks, the timeout mapping, and the projection invalidation.
+    """
+
+    def __init__(self, create_folder: CreateFolderService) -> None:
+        self._create_folder = create_folder
+
+    async def execute(self, command: CreateLabelCommand) -> FolderMutationOutcome:
+        command.validate()
+        mailbox = command.label_mailbox
+        logger.debug(f"Creating label mailbox: {mailbox}")
+        return await self._create_folder.execute(
+            CreateFolderCommand(account_name=command.account_name, folder_name=mailbox)
+        )
+
+
+class DeleteLabelService:
+    """Delete one label by deleting the mailbox that stores it.
+
+    Deleting the mailbox discards the label's own copies of every message it
+    holds; the originals in their source mailboxes are untouched because a label
+    copy is a separate message.
+    """
+
+    def __init__(self, delete_folder: DeleteFolderService) -> None:
+        self._delete_folder = delete_folder
+
+    async def execute(self, command: DeleteLabelCommand) -> FolderMutationOutcome:
+        command.validate()
+        mailbox = command.label_mailbox
+        logger.debug(f"Deleting label mailbox: {mailbox}")
+        return await self._delete_folder.execute(
+            DeleteFolderCommand(account_name=command.account_name, folder_name=mailbox)
+        )
+
+
+class ApplyLabelService:
+    """Apply one label by copying each message into the label's mailbox.
+
+    Delegating to :class:`CopyService` is what makes the sender allowlist and
+    ``report_blocked_mutations`` apply to labelling exactly as they apply to
+    ``copy_emails``: there is one COPY implementation, not a parallel one.
+    Applying a label is additive and therefore ungated — it changes which
+    messages a mailbox holds, not the account's folder layout.
+    """
+
+    def __init__(self, copy: CopyService) -> None:
+        self._copy = copy
+
+    async def execute(self, command: ApplyLabelCommand) -> BatchMutationOutcome:
+        command.validate()
+        mailbox = command.label_mailbox
+        logger.debug(f"Applying label by copying into mailbox: {mailbox}")
+        return await self._copy.execute(
+            CopyCommand(
+                account_name=command.account_name,
+                email_ids=command.email_ids,
+                source_mailbox=command.source_mailbox,
+                destination_mailbox=mailbox,
+            )
+        )
+
+
 # port-slot B2: label writes (CreateLabelService, DeleteLabelService, ApplyLabelService)
 
 
@@ -1351,6 +1474,9 @@ class MutationServices:
     remove_label: RemoveLabelService
     # port-slot B1: label reads
     # port-slot C: send path
+    create_label: CreateLabelService
+    delete_label: DeleteLabelService
+    apply_label: ApplyLabelService
     # port-slot B2: label writes
 
     @classmethod
@@ -1362,6 +1488,12 @@ class MutationServices:
     ) -> MutationServices:
         arguments = (accounts, providers, projections)
         set_flags = SetEmailFlagsService(*arguments)
+        # Hoisted because the port-slot B2 label writes delegate to these exact
+        # instances: a label write is then provably the same effect as the folder
+        # or copy tool it wraps, gate and all, rather than a parallel one.
+        copy = CopyService(*arguments)
+        create_folder = CreateFolderService(*arguments)
+        delete_folder = DeleteFolderService(*arguments)
         return cls(
             set_flags=set_flags,
             mark_read=MarkReadService(set_flags),
@@ -1372,13 +1504,16 @@ class MutationServices:
             send=SendService(*arguments),
             forward=ForwardService(*arguments),
             # Port slots for new service construction; add each cluster's entries above its marker.
-            copy=CopyService(*arguments),
-            create_folder=CreateFolderService(*arguments),
-            delete_folder=DeleteFolderService(*arguments),
+            copy=copy,
+            create_folder=create_folder,
+            delete_folder=delete_folder,
             rename_folder=RenameFolderService(*arguments),
             # port-slot A: folder ops
             remove_label=RemoveLabelService(*arguments),
             # port-slot B1: label reads
             # port-slot C: send path
+            create_label=CreateLabelService(create_folder),
+            delete_label=DeleteLabelService(delete_folder),
+            apply_label=ApplyLabelService(copy),
             # port-slot B2: label writes
         )
