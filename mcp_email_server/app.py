@@ -18,13 +18,18 @@ from mcp_email_server.application.mutations import (
     ArchiveCommand,
     ArchiveMutationOutcome,
     BatchMutationOutcome,
+    CopyCommand,
+    CreateFolderCommand,
     DeleteCommand,
+    DeleteFolderCommand,
     FlagOperation,
+    FolderMutationOutcome,
     ForwardCommand,
     MarkReadCommand,
     MoveCommand,
     MutableEmailFlag,
     RecipientPolicyDeniedError,
+    RenameFolderCommand,
     SaveToMailboxCommand,
     SendCommand,
     SendMutationOutcome,
@@ -467,7 +472,8 @@ async def list_allowed_recipients() -> PolicyDiscoveryResult:
         "List the configured inbound sender allowlist — the address patterns whose mail the server "
         "will read or act on. When configured, only these senders' mail is visible to the read tools "
         "(list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation "
-        "tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails). Returns an "
+        "tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, copy_emails). "
+        "Returns an "
         "empty list "
         "when unrestricted."
     ),
@@ -1056,6 +1062,173 @@ async def download_attachment(
 # cluster registers its @mcp.tool functions directly ABOVE its own marker, so two
 # clusters extending this tail produce non-overlapping hunks instead of a
 # conflict. Slot order is fixed everywhere it appears: A, B1, C, B2.
+_PUBLIC_FOLDER_DETAILS = frozenset({
+    "create-rejected",
+    "create-unknown",
+    "delete-rejected",
+    "delete-unknown",
+    "provider-timeout",
+    "rename-rejected",
+    "rename-unknown",
+})
+
+
+async def copy_emails_command(command: CopyCommand) -> BatchMutationOutcome:
+    return await get_application_runtime().mutations.copy.execute(command)
+
+
+async def create_folder_command(command: CreateFolderCommand) -> FolderMutationOutcome:
+    return await get_application_runtime().mutations.create_folder.execute(command)
+
+
+async def delete_folder_command(command: DeleteFolderCommand) -> FolderMutationOutcome:
+    return await get_application_runtime().mutations.delete_folder.execute(command)
+
+
+async def rename_folder_command(command: RenameFolderCommand) -> FolderMutationOutcome:
+    return await get_application_runtime().mutations.rename_folder.execute(command)
+
+
+def _tagged_folder_result(outcome: FolderMutationOutcome) -> str:
+    """Render one mailbox-shape outcome with only reviewed fixed detail tags."""
+    status = outcome.status
+    if outcome.detail in _PUBLIC_FOLDER_DETAILS:
+        status = f"{status} ({outcome.detail})"
+    sections = [status]
+    if outcome.reconciliation_needed:
+        sections.append("warning: reconciliation needed")
+    return "; ".join(sections)
+
+
+@mcp.tool(
+    description=(
+        "Copy one or more emails into another IMAP folder by email_id, leaving the originals in place. "
+        "Use list_emails_metadata and list_mailboxes first. Partial or ambiguous effects report per-ID "
+        "succeeded/failed/unknown status and are not retried automatically."
+    ),
+    annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
+)
+async def copy_emails(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    email_ids: Annotated[
+        list[UidInput],
+        Field(
+            min_length=1,
+            max_length=APPLICATION_LIMITS.mutation_uids,
+            description="List of email_id to copy (obtained from list_emails_metadata).",
+        ),
+    ],
+    destination_mailbox: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The destination mailbox/folder to copy emails into.",
+        ),
+    ],
+    source_mailbox: Annotated[
+        str,
+        Field(
+            default="INBOX",
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The source mailbox containing the emails.",
+        ),
+    ] = "INBOX",
+) -> str:
+    outcome = await copy_emails_command(
+        CopyCommand(account_name, tuple(email_ids), source_mailbox, destination_mailbox)
+    )
+    succeeded = outcome.targets("succeeded")
+    if len(succeeded) == len(email_ids) and not outcome.reconciliation_needed:
+        return f"Successfully copied {len(succeeded)} email(s) to {destination_mailbox}"
+    return f"Copy result [{_tagged_batch_result(outcome)}]"
+
+
+@mcp.tool(
+    description=(
+        "Create a new IMAP folder/mailbox. Requires enable_folder_management=true in settings or "
+        "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it."
+    ),
+    annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
+)
+async def create_folder(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    folder_name: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The name of the folder to create. Use list_mailboxes to learn the hierarchy delimiter.",
+        ),
+    ],
+) -> str:
+    outcome = await create_folder_command(CreateFolderCommand(account_name, folder_name))
+    if outcome.status == "succeeded" and not outcome.reconciliation_needed:
+        return f"Folder '{folder_name}' created"
+    return f"Create-folder result [{_tagged_folder_result(outcome)}]"
+
+
+@mcp.tool(
+    description=(
+        "Delete an IMAP folder/mailbox. Most servers require the folder to be empty and refuse to delete a "
+        "folder that still has children. Requires enable_folder_management=true in settings or "
+        "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it."
+    ),
+    annotations=_DESTRUCTIVE_REMOTE_MUTATION,
+)
+async def delete_folder(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    folder_name: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The name of the folder to delete.",
+        ),
+    ],
+) -> str:
+    outcome = await delete_folder_command(DeleteFolderCommand(account_name, folder_name))
+    if outcome.status == "succeeded" and not outcome.reconciliation_needed:
+        return f"Folder '{folder_name}' deleted"
+    return f"Delete-folder result [{_tagged_folder_result(outcome)}]"
+
+
+@mcp.tool(
+    description=(
+        "Rename an IMAP folder/mailbox, carrying its messages and child folders with it. Requires "
+        "enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; "
+        "managed-mode accounts never allow it."
+    ),
+    annotations=_DESTRUCTIVE_REMOTE_MUTATION,
+)
+async def rename_folder(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    old_name: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The current folder name.",
+        ),
+    ],
+    new_name: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The new folder name. It must differ from the current name.",
+        ),
+    ],
+) -> str:
+    outcome = await rename_folder_command(RenameFolderCommand(account_name, old_name, new_name))
+    if outcome.status == "succeeded" and not outcome.reconciliation_needed:
+        return f"Folder '{old_name}' renamed to '{new_name}'"
+    return f"Rename-folder result [{_tagged_folder_result(outcome)}]"
+
+
 # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
 # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
 # port-slot C: send path (no new tools; send_email gains Markdown and quoted replies)

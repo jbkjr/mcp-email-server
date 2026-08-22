@@ -7,7 +7,7 @@ import re
 import ssl
 import time
 import unicodedata
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -51,6 +51,7 @@ from mcp_email_server.application.mutations import (
     BatchMutationOutcome,
     DeliveryMutationOutcome,
     FlagOperation,
+    FolderMutationOutcome,
     MutableEmailFlag,
     MutationStatus,
     SentCopyMutationOutcome,
@@ -3209,6 +3210,114 @@ class EmailClient:
         finally:
             await _best_effort_imap_logout(imap)
         return BatchMutationOutcome(tuple(outcomes[email_id] for email_id in email_ids))
+
+    async def copy_emails_with_outcome(
+        self,
+        email_ids: list[str],
+        source_mailbox: str,
+        destination_mailbox: str,
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
+    ) -> BatchMutationOutcome:
+        """Copy UIDs into another mailbox with per-UID COPY evidence.
+
+        This is the COPY half of ``move_emails_with_outcome``: the source
+        message is never flagged ``\\Deleted`` or expunged, so no UIDPLUS
+        capability is required. A blocked sender's UID is never copied; by
+        default it reports as a no-op success indistinguishable from a
+        nonexistent UID, and only reports as failed when
+        ``report_blocked_mutations`` is set.
+        """
+        _validate_imap_uids(email_ids)
+        imap = await self._connect_imap()
+        outcomes: dict[str, TargetMutationOutcome] = {}
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(source_mailbox))
+            _raise_for_imap_error(select_response, f"SELECT source mailbox {source_mailbox}")
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            permitted: list[str] = []
+            for email_id in email_ids:
+                if email_id in blocked:
+                    outcomes[email_id] = TargetMutationOutcome(
+                        email_id,
+                        "failed" if report_blocked_mutations else "succeeded",
+                        "sender-policy" if report_blocked_mutations else None,
+                    )
+                else:
+                    permitted.append(email_id)
+            for index, email_id in enumerate(permitted):
+                try:
+                    copy_response = await imap.uid("copy", email_id, _quote_mailbox(destination_mailbox))
+                except asyncio.CancelledError:
+                    outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-unknown")
+                    for remaining_id in permitted[index + 1 :]:
+                        outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                    break
+                except Exception:
+                    outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-unknown")
+                    continue
+                copy_status = _imap_effect_status(copy_response)
+                outcomes[email_id] = TargetMutationOutcome(
+                    email_id,
+                    copy_status,
+                    None
+                    if copy_status == "succeeded"
+                    else "copy-rejected"
+                    if copy_status == "failed"
+                    else "copy-unknown",
+                )
+        finally:
+            await _best_effort_imap_logout(imap)
+        return BatchMutationOutcome(tuple(outcomes[email_id] for email_id in email_ids))
+
+    async def _mailbox_shape_outcome(
+        self,
+        operation: str,
+        run: Callable[[Any], Awaitable[Any]],
+    ) -> FolderMutationOutcome:
+        """Run one mailbox-shape command and report authoritative evidence.
+
+        The mailbox hierarchy is provider state just like message state, so the
+        result keeps the same boundary the UID mutations keep: an explicit
+        ``NO``/``BAD`` rejection is ``failed`` (nothing changed), while a lost,
+        cancelled, or otherwise unclassifiable response is ``unknown`` because
+        the command may already have taken effect.
+        """
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            try:
+                response = await run(imap)
+            except (asyncio.CancelledError, Exception):
+                logger.warning(f"IMAP {operation.upper()} mailbox outcome is unknown")
+                return FolderMutationOutcome("unknown", f"{operation}-unknown")
+            status = _imap_effect_status(response)
+            if status == "succeeded":
+                return FolderMutationOutcome("succeeded")
+            return FolderMutationOutcome(
+                status,
+                f"{operation}-rejected" if status == "failed" else f"{operation}-unknown",
+            )
+        finally:
+            await _best_effort_imap_logout(imap)
+
+    async def create_mailbox_with_outcome(self, mailbox: str) -> FolderMutationOutcome:
+        """Create one mailbox by its RFC 3501 name."""
+        return await self._mailbox_shape_outcome("create", lambda imap: imap.create(_quote_mailbox(mailbox)))
+
+    async def delete_mailbox_with_outcome(self, mailbox: str) -> FolderMutationOutcome:
+        """Delete one mailbox by its RFC 3501 name."""
+        return await self._mailbox_shape_outcome("delete", lambda imap: imap.delete(_quote_mailbox(mailbox)))
+
+    async def rename_mailbox_with_outcome(self, old_mailbox: str, new_mailbox: str) -> FolderMutationOutcome:
+        """Rename one mailbox, carrying its messages and children with it."""
+        return await self._mailbox_shape_outcome(
+            "rename",
+            lambda imap: imap.rename(_quote_mailbox(old_mailbox), _quote_mailbox(new_mailbox)),
+        )
 
     async def delete_emails(
         self,

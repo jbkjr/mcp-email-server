@@ -15,8 +15,12 @@ from mcp_email_server.application.metadata import RuntimeMode
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
     BatchMutationOutcome,
+    CopyCommand,
+    CreateFolderCommand,
     DeleteCommand,
+    DeleteFolderCommand,
     DeliveryMutationOutcome,
+    FolderMutationOutcome,
     ForwardCommand,
     ForwardSource,
     ForwardSourcePart,
@@ -27,6 +31,7 @@ from mcp_email_server.application.mutations import (
     MutationProviderAccess,
     MutationProviderError,
     MutationProviderPurpose,
+    RenameFolderCommand,
     SaveToMailboxCommand,
     SendCommand,
     SentCopyMutationOutcome,
@@ -134,6 +139,64 @@ class ClassicMutationProvider:
                 list(account.allowed_senders),
                 account.report_blocked_mutations,
             )
+        )
+
+    async def copy(
+        self,
+        command: CopyCommand,
+        account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome:
+        return await _bounded_mutation_call(
+            self._handler.incoming_client.copy_emails_with_outcome(
+                list(command.email_ids),
+                command.source_mailbox,
+                command.destination_mailbox,
+                list(account.allowed_senders),
+                account.report_blocked_mutations,
+            )
+        )
+
+    async def _mailbox_shape_effect(self, operation: Awaitable[FolderMutationOutcome]) -> FolderMutationOutcome:
+        """Run one mailbox-shape effect and drop stale special-use resolutions.
+
+        Creating, deleting, or renaming a mailbox can change which folder the
+        RFC 6154 special-use discovery resolves for this handler, and an
+        ``unknown`` outcome means the change may have happened anyway, so any
+        attempt invalidates the cache rather than only a confirmed success.
+        """
+        try:
+            return await _bounded_mutation_call(operation)
+        finally:
+            self._handler._invalidate_special_folder_cache()
+
+    async def create_folder(
+        self,
+        command: CreateFolderCommand,
+        account: MutationAccountSnapshot,
+    ) -> FolderMutationOutcome:
+        del account
+        return await self._mailbox_shape_effect(
+            self._handler.incoming_client.create_mailbox_with_outcome(command.folder_name)
+        )
+
+    async def delete_folder(
+        self,
+        command: DeleteFolderCommand,
+        account: MutationAccountSnapshot,
+    ) -> FolderMutationOutcome:
+        del account
+        return await self._mailbox_shape_effect(
+            self._handler.incoming_client.delete_mailbox_with_outcome(command.folder_name)
+        )
+
+    async def rename_folder(
+        self,
+        command: RenameFolderCommand,
+        account: MutationAccountSnapshot,
+    ) -> FolderMutationOutcome:
+        del account
+        return await self._mailbox_shape_effect(
+            self._handler.incoming_client.rename_mailbox_with_outcome(command.old_name, command.new_name)
         )
 
     async def find_archive_mailbox(self, source_mailbox: str) -> str:

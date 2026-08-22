@@ -70,20 +70,18 @@ for client discovery and configuration migration steps.
 Every tool advertises reviewed MCP `readOnlyHint`, `destructiveHint`,
 `idempotentHint`, and `openWorldHint` values:
 
-| Tools                                                                        | Read-only | Destructive | Idempotent | Open world |
-| ---------------------------------------------------------------------------- | --------- | ----------- | ---------- | ---------- |
-| `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders` | yes       | no          | yes        | no         |
-| `list_emails_metadata`, `list_mailboxes`                                     | yes       | no          | yes        | yes        |
-| `get_emails_content`                                                         | no        | no          | yes        | yes        |
-| `send_email`, `forward_email`, `save_to_mailbox`                             | no        | no          | no         | yes        |
-| `set_email_flags`, `mark_emails_as_read`                                     | no        | no          | yes        | yes        |
-| `delete_emails`, `move_emails`, `archive_emails`, `download_attachment`      | no        | yes         | no         | yes        |
+| Tools                                                                                                     | Read-only | Destructive | Idempotent | Open world |
+| --------------------------------------------------------------------------------------------------------- | --------- | ----------- | ---------- | ---------- |
+| `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders`                              | yes       | no          | yes        | no         |
+| `list_emails_metadata`, `list_mailboxes`                                                                  | yes       | no          | yes        | yes        |
+| `get_emails_content`                                                                                      | no        | no          | yes        | yes        |
+| `send_email`, `forward_email`, `save_to_mailbox`, `copy_emails`, `create_folder`                          | no        | no          | no         | yes        |
+| `set_email_flags`, `mark_emails_as_read`                                                                  | no        | no          | yes        | yes        |
+| `delete_emails`, `move_emails`, `archive_emails`, `download_attachment`, `delete_folder`, `rename_folder` | no        | yes         | no         | yes        |
 
 <!-- Port slots. Tools are being ported onto this architecture in parallel; each cluster
      adds its tool names to the matching existing row above rather than appending a new
      row, so the table stays grouped by annotation set. Slot order everywhere: A, B1, C, B2.
-     port-slot A: copy_emails and create_folder are non-destructive; delete_folder and
-     rename_folder are destructive.
      port-slot B1: list_labels and get_email_labels are read-only; remove_label is destructive.
      port-slot B2: create_label is non-destructive; delete_label is destructive; apply_label
      is non-destructive. -->
@@ -93,7 +91,9 @@ Every tool advertises reviewed MCP `readOnlyHint`, `destructiveHint`,
 caller-selected destination may be replaced. Send, forward, and append create
 externally meaningful effects but do not delete or replace an existing mailbox
 item, so their destructive hint is false while their read-only and idempotent
-hints are also false.
+hints are also false. `copy_emails` and `create_folder` are additive for the
+same reason, while `delete_folder` and `rename_folder` are destructive because
+they remove or replace an existing mailbox together with everything it holds.
 
 Annotations are advisory host/agent planning hints, not authorization or a
 safe-retry guarantee. Tool descriptions, current policy, typed outcomes, and the
@@ -473,10 +473,55 @@ When a sender allowlist is active, blocked messages are never changed. See
 [Sender allowlist](security.md#sender-allowlist) for the privacy behavior of
 blocked IDs.
 
+### `copy_emails`
+
+Copies messages from `source_mailbox`, which defaults to `INBOX`, into a
+required `destination_mailbox`, leaving the originals in place. This is the
+`COPY` half of `move_emails` with no `\Deleted` flag and no expunge, so it needs
+no `UIDPLUS` capability and cannot remove a message. Because a copy is additive
+rather than a relocation, the source and destination may be the same mailbox.
+
+Results use the same tagged per-ID format as the other mutation tools. Only the
+destination mailbox's local metadata projection is invalidated: the source
+mailbox is unchanged by a copy.
+
+`copy_emails` is not gated by `enable_folder_management` — it moves message
+copies between existing mailboxes rather than changing the folder layout.
+
+### `create_folder`
+
+Creates one IMAP mailbox by name. Call `list_mailboxes` first to learn the
+server's hierarchy delimiter: a nested name is built with that delimiter (for
+example `Archive/2026` or `Archive.2026`), and using the wrong one silently
+creates a top-level folder.
+
+### `delete_folder`
+
+Deletes one IMAP mailbox by name. Most servers refuse to delete a mailbox that
+still contains messages or child mailboxes, and report that refusal as a
+`failed` result rather than an error.
+
+### `rename_folder`
+
+Renames one IMAP mailbox, carrying its messages and child mailboxes with it.
+`old_name` and `new_name` must differ. Both spellings' local metadata
+projections are invalidated because a rename changes where every message in the
+mailbox lives.
+
+`create_folder`, `delete_folder`, and `rename_folder` change the account's
+folder layout, so they require `enable_folder_management=true`. See
+[Folder management access](security.md#folder-management-access). The three
+tools stay visible when the policy is off and refuse at call time, so a client
+never has to re-read the catalog after a policy change.
+
+A mailbox-shape result reports a single status rather than a per-ID batch. An
+explicit server rejection is `failed` and means nothing changed; a lost or
+cancelled response is `unknown`, is not retried automatically, and carries a
+`reconciliation needed` warning because the mailbox may already have changed.
+
 <!-- Port slots for new tool sections. Each cluster adds its `###` sections directly
      ABOVE its own marker so parallel ports produce non-overlapping hunks, and the
      final section order matches the fixed slot order A, B1, C, B2.
-     port-slot A: `copy_emails`, `create_folder`, `delete_folder`, `rename_folder`
      port-slot B1: `list_labels`, `get_email_labels`, `remove_label`
      port-slot B2: `create_label`, `delete_label`, `apply_label` -->
 

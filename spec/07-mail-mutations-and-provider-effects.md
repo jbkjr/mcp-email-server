@@ -103,6 +103,29 @@ Archive resolves an explicit destination policy and then follows the same move
 contract. Destination creation, if supported, is a separate effect with its own
 policy and evidence; it is not silently attempted after an unsafe fallback.
 
+## Copy
+
+A copy is the additive half of a move: UID COPY into the destination with no
+`\Deleted` flag and no expunge, so it needs no scoped-expunge capability and
+cannot remove a message. It carries the same sender-allowlist gate as a move —
+a blocked UID is never copied and is reported as a no-op success unless blocked
+mutations are reported. Because nothing leaves the source mailbox, only the
+destination projection is invalidated, and the source and destination are
+allowed to be the same mailbox.
+
+## Mailbox Shape
+
+Creating, deleting, and renaming a mailbox change the account's folder layout
+rather than its messages, so they form a separate effect class. They are gated
+by an operator-owned policy that is re-checked on the opened account
+immediately before the effect, and are refused before any provider session
+opens when the policy is off. Each reports one status rather than a per-target
+batch: an explicit provider rejection is a failure that changed nothing, and a
+lost or cancelled response is ambiguous and is never replayed. Every affected
+mailbox projection is invalidated — both the old and the new name for a rename
+— and any cached special-use folder resolution is dropped on every attempt,
+because a shape change can move which mailbox the RFC 6154 discovery resolves.
+
 ## Delete and Scoped Expunge
 
 Delete marks only selected UIDs and removes only those targets with a scoped
@@ -267,3 +290,13 @@ enter public errors.
     failed, denied, or allowlist-blocked source read aborts before any SMTP
     session opens, that re-attached parts preserve source MIME type and
     parameters, and that an existing `Fwd:` subject prefix is not duplicated.
+13. Mailbox-shape mutations are separated from message mutations. Copy applies the
+    sender allowlist exactly as move does, never flags `\Deleted` or expunges, and
+    invalidates only the destination projection. Create, delete, and rename are
+    gated by `enable_folder_management` on the resolved account and again on the
+    opened account before the effect, report a single `succeeded`/`failed`/`unknown`
+    status rather than a per-target batch, invalidate every affected mailbox
+    projection (both spellings for a rename), and drop cached special-use folder
+    resolutions on every attempt. Tests prove the pre-open and post-open denials,
+    the timeout-to-`unknown` mapping, and that a lost response is never reported as
+    a rejection.
