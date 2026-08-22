@@ -261,10 +261,29 @@ class SaveToMailboxCommand(ComposeCommand):
 @dataclass(frozen=True)
 class SendCommand(ComposeCommand):
     reply_to: str | None = None
+    quote_reply: bool = True
 
     def validate(self) -> None:
         super().validate()
         _validate_optional_header("reply_to", self.reply_to)
+
+    @property
+    def quotes_original(self) -> bool:
+        """Whether this send should quote the message it is replying to."""
+        return self.quote_reply and bool(self.in_reply_to)
+
+
+@dataclass(frozen=True)
+class QuoteSource:
+    """Provider evidence about the message a reply quotes.
+
+    ``quote_html`` is the provider-composed quote block: attribution line plus the
+    styled blockquote, in whichever markup shape the account's service collapses
+    correctly. The application only joins it below the caller's body and never
+    formats it, exactly as it does for a forward's composed block.
+    """
+
+    quote_html: str
 
 
 @dataclass(frozen=True)
@@ -378,6 +397,12 @@ class MutationProvider(Protocol):
     # conflict. Slot order is fixed everywhere it appears: A, B1, C, B2.
     # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
     # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
+    async def fetch_quote_source(
+        self,
+        command: SendCommand,
+        account: MutationAccountSnapshot,
+    ) -> QuoteSource | None: ...
+
     # port-slot C: send path (Markdown bodies, quoted replies)
     # port-slot B2: label writes (create_label, delete_label, apply_label)
 
@@ -514,6 +539,18 @@ def _forwarded_body(note: str, block: str) -> str:
 
     quoted = html.escape(block)
     return f"{note}\n\n{quoted}" if note else quoted
+
+
+def _quoted_body(body: str, quote_html: str) -> str:
+    """Join the caller's body with the provider-composed quote block.
+
+    The block is inserted verbatim as an HTML element. A Markdown body carries it
+    through rendering untouched, because block-level HTML is passed through rather
+    than escaped; a raw-HTML body simply has it appended. Either way the merged
+    result is revalidated against the body bound before anything is sent.
+    """
+
+    return f"{body}\n\n{quote_html}" if body else quote_html
 
 
 def _validate_forward_source(source: ForwardSource) -> ForwardSource:
@@ -1008,15 +1045,46 @@ class SendService(_MutationWorkflow):
         command.validate()
         account = self._resolve(command.account_name)
         _validate_recipient_policy(command, account)
+        submission = await self._quote_original(command, account)
         access = self._open(account, purpose="outgoing")
-        _validate_recipient_policy(command, access.account)
+        _validate_recipient_policy(submission, access.account)
         try:
             delivery = _validate_delivery_result(
-                await _bounded_provider_effect(access.provider.send(command, access.account))
+                await _bounded_provider_effect(access.provider.send(submission, access.account))
             )
         except TimeoutError:
-            return self._delivery_timeout(command)
-        return await self._complete_send(account, delivery, command.bcc)
+            return self._delivery_timeout(submission)
+        return await self._complete_send(account, delivery, submission.bcc)
+
+    async def _quote_original(
+        self,
+        command: SendCommand,
+        account: MutationAccountSnapshot,
+    ) -> SendCommand:
+        """Return the command to submit, with the quoted original appended when asked.
+
+        The read runs before the outgoing provider is opened, so a reply that cannot
+        read what it is quoting fails before any SMTP session exists. Reading is not
+        an effect, and a caller who asked for a quoted reply must not silently get an
+        unquoted one, so a failed or timed-out read aborts the send. A message that
+        simply is not in any searched mailbox is a different answer: nothing is wrong,
+        there is just nothing to quote, so the reply goes out unquoted.
+        """
+        if not command.quotes_original:
+            return command
+
+        # The source read is its own effect and gets its own authority resolution.
+        incoming = self._open(account, purpose="incoming")
+        try:
+            source = await _bounded_provider_effect(incoming.provider.fetch_quote_source(command, incoming.account))
+        except TimeoutError:
+            raise MutationProviderError("quote source retrieval timed out") from None
+        if source is None:
+            return command
+
+        quoted = replace(command, body=_quoted_body(command.body, source.quote_html))
+        quoted.validate()
+        return quoted
 
 
 class ForwardService(_MutationWorkflow):

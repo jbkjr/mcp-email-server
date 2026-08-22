@@ -27,6 +27,7 @@ from mcp_email_server.application.mutations import (
     MutationProviderAccess,
     MutationProviderError,
     MutationProviderPurpose,
+    QuoteSource,
     SaveToMailboxCommand,
     SendCommand,
     SentCopyMutationOutcome,
@@ -167,6 +168,29 @@ class ClassicMutationProvider:
                 command.reply_to,
             )
         )
+
+    async def _read_quote_source(
+        self,
+        command: SendCommand,
+        account: MutationAccountSnapshot,
+    ) -> QuoteSource | None:
+        if command.in_reply_to is None:
+            return None
+        quote_html = await self._handler.fetch_quote_source(
+            command.in_reply_to,
+            list(account.allowed_senders),
+        )
+        return None if quote_html is None else QuoteSource(quote_html=quote_html)
+
+    async def fetch_quote_source(
+        self,
+        command: SendCommand,
+        account: MutationAccountSnapshot,
+    ) -> QuoteSource | None:
+        # None means "no mailbox holds the original", which the workflow degrades to
+        # an unquoted reply. Every other failure is sanitized into a provider error
+        # so the workflow aborts instead of sending without the quote it was asked for.
+        return await _bounded_mutation_call(self._read_quote_source(command, account))
 
     async def _read_forward_source(
         self,

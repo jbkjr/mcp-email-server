@@ -400,6 +400,44 @@ no `html` parameter: its note is always Markdown.
 Rendering changes only the body part's subtype, never an address or threading
 header, so it has no effect on whether a message requires SMTPUTF8.
 
+### Quoted replies
+
+When `send_email` is given `in_reply_to`, the server reads the message being
+replied to over IMAP and appends it below your body as a collapsible quote
+block, the way a mail client would. Set `quote_reply=false` to reply without
+quoting.
+
+The original is looked up by its Message-ID in INBOX first, then in the account's
+Sent folder, so replying to your own message quotes it too. Both mailboxes are
+searched inside a single IMAP session. If the original has an HTML body it is
+quoted as markup with its document wrappers stripped; otherwise its text is
+escaped, line-broken, and truncated at 5000 characters with an explicit
+`[...quoted text truncated]` marker.
+
+Reading the original is a read, not an effect, and it happens before any SMTP
+session is opened. The two outcomes are deliberately different:
+
+- The original is not in any searched mailbox. Nothing is wrong and there is
+  nothing to quote, so the reply is sent unquoted.
+- The original is there but cannot be read — a transport fault, an unparseable
+  message, one that exceeds the raw message size limit. The call fails before
+  SMTP, because a caller who asked for a quoted reply must never silently get an
+  unquoted one.
+
+When a sender allowlist is configured, a blocked sender's message is treated as
+absent, so the allowlist cannot be used to probe which messages exist.
+
+The merged body is revalidated against the 1 MiB body bound after the quote is
+appended, so a large quote is rejected rather than silently truncated.
+
+The quote's markup follows the account's mail service, because clients only
+collapse a quote block they recognize. The service is detected from the IMAP
+host: `imap.gmail.com` is Gmail, a loopback host with certificate verification
+disabled is a ProtonMail Bridge, and anything else uses a generic blockquote.
+Set `email_service` on the account (or `MCP_EMAIL_SERVER_EMAIL_SERVICE`) to
+`protonmail`, `gmail`, or `generic` when detection guesses wrong — see
+[Configuration](configuration.md).
+
 <!-- port-slot C: send-path documentation goes here, above this marker — Markdown message
      bodies and quoted replies extend `send_email` rather than adding tools. -->
 

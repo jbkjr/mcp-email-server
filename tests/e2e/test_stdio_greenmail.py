@@ -1187,5 +1187,121 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
 # trash-first delete change. Slot order is fixed everywhere: A, B1, C, B2.
 # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
 # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
+@pytest.mark.asyncio
+async def test_markdown_rendering_and_quoted_reply_against_greenmail(tmp_path: Path) -> None:
+    """A reply carries the original inside a real quote block, read back off the wire."""
+    _wait_until_ready()
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Sent", "Drafts", "Archive"])
+    _ensure_empty_mailboxes(BOB, ["INBOX", "Sent", "Drafts", "Archive"])
+
+    run_id = uuid.uuid4().hex
+    original_subject = f"mcp-e2e-quote-source-{run_id}"
+    original_body = f"Original text that must appear inside the quote {run_id}"
+    reply_subject = f"Re: {original_subject}"
+    reply_note = f"My **reply** note {run_id}"
+
+    _seed_message_as(BOB, ALICE[0], original_subject, original_body)
+    original = _wait_for_message(ALICE, "INBOX", original_subject)
+    original_message_id = str(original.message["Message-ID"])
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(CONFIG_TEMPLATE)
+    config_path.chmod(0o600)
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_CREDENTIAL_STORAGE": "plaintext",
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+    })
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    assert console_script.is_file(), f"Installed console script not found: {console_script}"
+    server = StdioServerParameters(
+        command=str(console_script),
+        args=["stdio"],
+        env=server_env,
+        cwd=Path.cwd(),
+    )
+
+    async with stdio_client(server) as (read_stream, write_stream):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+            read_timeout_seconds=timedelta(seconds=15),
+        ) as session:
+            await session.initialize()
+
+            quoted = await _call_tool(
+                session,
+                "send_email",
+                {
+                    "account_name": "alice",
+                    "recipients": [BOB[0]],
+                    "subject": reply_subject,
+                    "body": reply_note,
+                    "in_reply_to": original_message_id,
+                },
+            )
+            assert quoted["result"] == f"Email sent successfully to {BOB[0]}"
+
+            delivered = _wait_for_message(BOB, "INBOX", reply_subject)
+            html = delivered.message.get_body(preferencelist=("html",)).get_content()
+
+            # The note is rendered from Markdown rather than delivered literally.
+            assert f"My <strong>reply</strong> note {run_id}" in html
+            assert "**reply**" not in html
+
+            # GreenMail is a plain IMAP server, so the account resolves to the
+            # generic shape: attribution inside the blockquote, quoted text after it.
+            assert '<blockquote type="cite"' in html
+            assert 'class="protonmail_quote"' not in html
+            assert 'class="gmail_quote"' not in html
+            assert "wrote:" in html
+            assert original_body in html
+            quote_start = html.index("<blockquote")
+            assert html.index("wrote:") > quote_start
+            assert html.index(original_body) > quote_start
+            assert str(delivered.message["In-Reply-To"]) == original_message_id
+
+            # An unquoted reply is available on request and carries no quote block.
+            unquoted_subject = f"Re: {original_subject} unquoted"
+            unquoted = await _call_tool(
+                session,
+                "send_email",
+                {
+                    "account_name": "alice",
+                    "recipients": [BOB[0]],
+                    "subject": unquoted_subject,
+                    "body": "No quote please",
+                    "in_reply_to": original_message_id,
+                    "quote_reply": False,
+                },
+            )
+            assert unquoted["result"] == f"Email sent successfully to {BOB[0]}"
+            plain_reply = _wait_for_message(BOB, "INBOX", unquoted_subject)
+            plain_html = plain_reply.message.get_body(preferencelist=("html",)).get_content()
+            assert "No quote please" in plain_html
+            assert "<blockquote" not in plain_html
+            assert original_body not in plain_html
+
+            # A reply to a message no mailbox holds still goes out, just unquoted.
+            missing_subject = f"Re: {original_subject} missing"
+            missing = await _call_tool(
+                session,
+                "send_email",
+                {
+                    "account_name": "alice",
+                    "recipients": [BOB[0]],
+                    "subject": missing_subject,
+                    "body": "Original is gone",
+                    "in_reply_to": f"<absent-{run_id}@example.test>",
+                },
+            )
+            assert missing["result"] == f"Email sent successfully to {BOB[0]}"
+            missing_reply = _wait_for_message(BOB, "INBOX", missing_subject)
+            missing_html = missing_reply.message.get_body(preferencelist=("html",)).get_content()
+            assert "Original is gone" in missing_html
+            assert "<blockquote" not in missing_html
+
+
 # port-slot C: send path (Markdown rendering, quoted replies)
 # port-slot B2: label writes (create_label, delete_label, apply_label)

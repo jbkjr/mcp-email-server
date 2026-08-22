@@ -736,7 +736,7 @@
         },
         {
             "name": "send_email",
-            "description": "Send one email using the specified account. Supports reply threading. The body is written in Markdown and is rendered to email-safe HTML automatically; set html=true only when the body is already pre-formatted raw HTML. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically.",
+            "description": "Send one email using the specified account. Supports reply threading. The body is written in Markdown and is rendered to email-safe HTML automatically; set html=true only when the body is already pre-formatted raw HTML. When in_reply_to is set, the original message is read over IMAP and appended as a collapsible quote block; if it cannot be read the call fails before any SMTP session is opened rather than sending an unquoted reply. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -869,6 +869,12 @@
                         "default": null,
                         "description": "Email address to set as the Reply-To header. When set, email clients will reply to this address instead of the From address.",
                         "title": "Reply To"
+                    },
+                    "quote_reply": {
+                        "default": true,
+                        "description": "When in_reply_to is set, append the original message as a collapsible quote block. Set False to reply without quoting.",
+                        "title": "Quote Reply",
+                        "type": "boolean"
                     }
                 },
                 "required": ["account_name", "recipients", "subject", "body"],

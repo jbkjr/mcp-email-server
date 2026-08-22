@@ -511,8 +511,8 @@ start_ssl = false
 verify_ssl = true
 ```
 
-`description`, `save_to_sent`, and `sent_folder_name` are optional. Remove the
-entire `[emails.outgoing]` table for an IMAP-only account.
+`description`, `save_to_sent`, `sent_folder_name`, and `email_service` are
+optional. Remove the entire `[emails.outgoing]` table for an IMAP-only account.
 
 When credentials are stored in the operating system keyring, password values in
 this file are replaced by the reserved `__KEYRING__` marker. Do not enter that
@@ -624,6 +624,29 @@ Set `save_to_sent = false` to disable the IMAP append after sending. The
 environment equivalents are `MCP_EMAIL_SERVER_SAVE_TO_SENT` and
 `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`.
 
+## Quoted reply markup
+
+A reply sent with `in_reply_to` carries the original message in a quote block.
+Mail clients only collapse a quote block whose markup they recognize, so the
+server picks the shape from the account's mail service. Detection uses the IMAP
+host: `imap.gmail.com` is Gmail, a `localhost`/`127.0.0.1` host with
+`verify_ssl = false` is a ProtonMail Bridge, and anything else uses a generic
+blockquote.
+
+Override the guess when it is wrong. Another local IMAP server with a
+self-signed certificate would otherwise be treated as a ProtonMail Bridge:
+
+```toml
+[[emails]]
+account_name = "work"
+email_service = "generic"
+```
+
+Supported values are `protonmail`, `gmail`, and `generic`. Omit the field to
+auto-detect. The environment equivalent is `MCP_EMAIL_SERVER_EMAIL_SERVICE`.
+This setting affects only quoted-reply markup; it changes nothing about how the
+account connects. See [Quoted replies](tools.md#quoted-replies).
+
 ## Outgoing message headers
 
 Every outgoing MIME message carries a single top-level `MIME-Version: 1.0`
@@ -686,6 +709,7 @@ allowlists.
 | `MCP_EMAIL_SERVER_SMTP_PASSWORD`    | Shared password  | No       | Non-empty SMTP-specific password; empty uses shared.      |
 | `MCP_EMAIL_SERVER_SAVE_TO_SENT`     | `true`           | No       | Append sent messages to an IMAP Sent folder.              |
 | `MCP_EMAIL_SERVER_SENT_FOLDER_NAME` | Auto-detected    | No       | Override the Sent folder name.                            |
+| `MCP_EMAIL_SERVER_EMAIL_SERVICE`    | Auto-detected    | No       | Quoted-reply markup: `protonmail`, `gmail`, or `generic`. |
 
 Boolean values accept `true`, `1`, `yes`, or `on` as true, ignoring case. Other
 values are treated as false. Do not add surrounding whitespace to these values.

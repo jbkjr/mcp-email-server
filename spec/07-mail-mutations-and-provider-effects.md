@@ -273,3 +273,10 @@ enter public errors.
     escaped before rendering. Tests prove that rendering changes only the body
     part's subtype and never turns an ASCII-header message into one that requires
     SMTPUTF8, and that forwarded source markup is delivered literally.
+14. A reply reads the message it quotes before the outgoing provider is opened, and
+    the read is a distinct effect with its own authority resolution. Tests prove
+    that a source which no searched mailbox holds degrades to an unquoted send,
+    that every other read failure — unreadable, unparseable, oversized, timed out —
+    aborts before any SMTP session opens rather than sending unquoted, that an
+    allowlist-blocked source is indistinguishable from an absent one, and that the
+    body carrying the appended quote is revalidated against the body bound.

@@ -487,7 +487,9 @@ async def list_allowed_senders() -> PolicyDiscoveryResult:
     description=(
         "Send one email using the specified account. Supports reply threading. The body is written in Markdown "
         "and is rendered to email-safe HTML automatically; set html=true only when the body is already "
-        "pre-formatted raw HTML. Partial or ambiguous SMTP "
+        "pre-formatted raw HTML. When in_reply_to is set, the original message is read over IMAP and appended "
+        "as a collapsible quote block; if it cannot be read the call fails before any SMTP session is opened "
+        "rather than sending an unquoted reply. Partial or ambiguous SMTP "
         "delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy "
         "outcome separately; ambiguous effects are not retried automatically."
     ),
@@ -565,6 +567,13 @@ async def send_email(
             description="Email address to set as the Reply-To header. When set, email clients will reply to this address instead of the From address.",
         ),
     ] = None,
+    quote_reply: Annotated[
+        bool,
+        Field(
+            default=True,
+            description="When in_reply_to is set, append the original message as a collapsible quote block. Set False to reply without quoting.",
+        ),
+    ] = True,
 ) -> str:
     try:
         outcome = await send_email_command(
@@ -580,6 +589,7 @@ async def send_email(
                 in_reply_to=in_reply_to,
                 references=references,
                 reply_to=reply_to,
+                quote_reply=quote_reply,
             )
         )
     except RecipientPolicyDeniedError as exc:
