@@ -430,6 +430,13 @@ class TestMcpTools:
         assert mutable_flags["maxItems"] == 4
         assert mutable_flags["items"]["enum"] == [r"\Seen", r"\Flagged", r"\Answered", r"\Draft"]
         assert tools["set_email_flags"]["operation"]["enum"] == ["add", "remove"]
+        # Port slots. Clusters porting fork tools onto this architecture in parallel all
+        # extend this assertion block; each adds its limit assertions directly ABOVE its
+        # own marker so the hunks stay non-overlapping. Order is fixed: A, B1, C, B2.
+        # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+        # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
+        # port-slot C: send path (send_email Markdown and quoted-reply parameters)
+        # port-slot B2: label writes (create_label, delete_label, apply_label)
 
     @pytest.mark.asyncio
     async def test_send_email(self):
@@ -1261,4 +1268,10 @@ async def test_tool_annotations_expose_agent_safety_and_retry_hints() -> None:
         "idempotentHint": False,
         "openWorldHint": True,
     }
+    # Port slots for per-cluster annotation assertions; add each cluster's assertions
+    # directly ABOVE its own marker and keep the catch-all below last.
+    # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+    # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
+    # port-slot C: send path (no new tools)
+    # port-slot B2: label writes (create_label, delete_label, apply_label)
     assert all(tool.annotations is not None for tool in tools.values())

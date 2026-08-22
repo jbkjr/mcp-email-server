@@ -120,12 +120,14 @@ def compose_legacy_policy_environment(
     allowed_recipients: Iterable[str],
     allowed_senders: Iterable[str],
     report_blocked_mutations: bool,
-) -> tuple[bool, list[str], list[str], bool]:
+    enable_folder_management: bool,
+) -> tuple[bool, list[str], list[str], bool, bool]:
     """Apply legacy policy environment precedence without resolving credentials."""
     attachment_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
     report_value = os.getenv("MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS")
     recipients_value = os.getenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS")
     senders_value = os.getenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS")
+    folder_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT")
     return (
         _parse_bool_env(attachment_value, False) if attachment_value is not None else enable_attachment_download,
         normalize_address_list(recipients_value.split(","))
@@ -135,6 +137,7 @@ def compose_legacy_policy_environment(
         if senders_value is not None
         else normalize_pattern_list(allowed_senders),
         _parse_bool_env(report_value, False) if report_value is not None else report_blocked_mutations,
+        _parse_bool_env(folder_value, False) if folder_value is not None else enable_folder_management,
     )
 
 
@@ -472,6 +475,11 @@ class Settings(BaseSettings):
     allowed_recipients: list[str] = []
     allowed_senders: list[str] = []
     report_blocked_mutations: bool = False
+    # Legacy-mode-only policy gate for mailbox-shape mutations (folder and label
+    # create/delete/rename). Managed mode has no equivalent policy column, so the
+    # managed authority path resolves this to a hard False; adding it there would
+    # require managed catalog schema, CLI, and Web UI plumbing that is out of scope.
+    enable_folder_management: bool = False
     credential_storage: CredentialStorage = "auto"
 
     # Env-var override for credential_storage. Kept separate from the loaded field
@@ -538,11 +546,13 @@ class Settings(BaseSettings):
             self.allowed_recipients,
             self.allowed_senders,
             self.report_blocked_mutations,
+            self.enable_folder_management,
         ) = compose_legacy_policy_environment(
             enable_attachment_download=self.enable_attachment_download,
             allowed_recipients=self.allowed_recipients,
             allowed_senders=self.allowed_senders,
             report_blocked_mutations=self.report_blocked_mutations,
+            enable_folder_management=self.enable_folder_management,
         )
         self._inject_env_account()
 

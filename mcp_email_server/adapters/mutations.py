@@ -302,6 +302,12 @@ class LocalMutationBackend:
                 allowed_senders=tuple(resolved.settings.allowed_senders),
                 allowed_recipients=tuple(resolved.settings.allowed_recipients),
                 report_blocked_mutations=resolved.settings.report_blocked_mutations,
+                # Managed configuration carries no folder-management policy, so the
+                # managed path is hard-False rather than inheriting a synthesized
+                # Settings default that could later drift.
+                enable_folder_management=(
+                    resolved.settings.enable_folder_management if resolved.mode == "legacy" else False
+                ),
             ),
         )
 

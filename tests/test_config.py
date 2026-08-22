@@ -979,3 +979,30 @@ def test_report_blocked_mutations_env_overrides_toml(tmp_path, monkeypatch):
         assert config_module.get_settings(reload=True).report_blocked_mutations is True
     finally:
         config_module._settings = None
+
+
+def test_enable_folder_management_defaults_to_false_on_a_new_settings_object():
+    assert Settings().enable_folder_management is False
+
+
+def test_enable_folder_management_round_trips_through_toml(tmp_path, monkeypatch):
+    """The legacy-only folder-management gate survives a store/load cycle."""
+    import tomllib
+
+    import mcp_email_server.config as config_module
+
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
+    monkeypatch.delenv("MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT", raising=False)
+
+    settings = Settings()
+    settings.enable_folder_management = True
+    settings.store()
+
+    assert tomllib.loads(cfg.read_text())["enable_folder_management"] is True
+
+    config_module._settings = None
+    try:
+        assert config_module.get_settings(reload=True).enable_folder_management is True
+    finally:
+        config_module._settings = None

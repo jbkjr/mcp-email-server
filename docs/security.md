@@ -554,6 +554,15 @@ Metadata projection invalidation is rebuildable: if
 it fails after a provider effect, the result keeps the provider evidence and
 adds a reconciliation warning instead of claiming rollback.
 
+## Folder management access
+
+`enable_folder_management` is a legacy-mode policy flag that defaults to
+`false`. It exists to gate mailbox-shape mutations, which change the account's
+folder layout rather than individual messages, and is therefore configured only
+by the account operator through TOML or
+`MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT`. Managed configuration carries no
+equivalent policy, so managed mode always resolves the flag to `false`.
+
 ## Attachment access
 
 Attachment downloads are disabled by default because the tool writes data from

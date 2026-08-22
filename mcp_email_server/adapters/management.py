@@ -433,13 +433,21 @@ class LocalManagementBackend:
             raise ManagementError("Stored legacy policy is invalid")
 
         try:
-            attachment_download, normalized_recipients, normalized_senders, report_blocked = (
-                compose_legacy_policy_environment(
-                    enable_attachment_download=attachment_download,
-                    allowed_recipients=recipients,
-                    allowed_senders=senders,
-                    report_blocked_mutations=report_blocked,
-                )
+            # ``enable_folder_management`` is legacy-only: managed configuration has no
+            # column for it, so the import snapshot deliberately discards the composed
+            # value instead of carrying a policy the managed catalog cannot represent.
+            (
+                attachment_download,
+                normalized_recipients,
+                normalized_senders,
+                report_blocked,
+                _folder_management,
+            ) = compose_legacy_policy_environment(
+                enable_attachment_download=attachment_download,
+                allowed_recipients=recipients,
+                allowed_senders=senders,
+                report_blocked_mutations=report_blocked,
+                enable_folder_management=False,
             )
         except ValueError as exc:
             raise ManagementError("Effective legacy policy environment is invalid") from exc

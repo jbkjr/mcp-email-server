@@ -79,6 +79,15 @@ Every tool advertises reviewed MCP `readOnlyHint`, `destructiveHint`,
 | `set_email_flags`, `mark_emails_as_read`                                     | no        | no          | yes        | yes        |
 | `delete_emails`, `move_emails`, `archive_emails`, `download_attachment`      | no        | yes         | no         | yes        |
 
+<!-- Port slots. Tools are being ported onto this architecture in parallel; each cluster
+     adds its tool names to the matching existing row above rather than appending a new
+     row, so the table stays grouped by annotation set. Slot order everywhere: A, B1, C, B2.
+     port-slot A: copy_emails and create_folder are non-destructive; delete_folder and
+     rename_folder are destructive.
+     port-slot B1: list_labels and get_email_labels are read-only; remove_label is destructive.
+     port-slot B2: create_label is non-destructive; delete_label is destructive; apply_label
+     is non-destructive. -->
+
 `get_emails_content` is conservatively non-read-only because
 `mark_as_read=true` changes remote flags. Download is destructive because the
 caller-selected destination may be replaced. Send, forward, and append create
@@ -367,6 +376,9 @@ as it does for `send_email`.
 For a worked example, see
 [Forward a message with its attachments](guides.md#forward-a-message-with-its-attachments).
 
+<!-- port-slot C: send-path documentation goes here, above this marker — Markdown message
+     bodies and quoted replies extend `send_email` rather than adding tools. -->
+
 ## Mailbox and mutation tools
 
 ### `list_mailboxes`
@@ -460,6 +472,13 @@ characters before provider access.
 When a sender allowlist is active, blocked messages are never changed. See
 [Sender allowlist](security.md#sender-allowlist) for the privacy behavior of
 blocked IDs.
+
+<!-- Port slots for new tool sections. Each cluster adds its `###` sections directly
+     ABOVE its own marker so parallel ports produce non-overlapping hunks, and the
+     final section order matches the fixed slot order A, B1, C, B2.
+     port-slot A: `copy_emails`, `create_folder`, `delete_folder`, `rename_folder`
+     port-slot B1: `list_labels`, `get_email_labels`, `remove_label`
+     port-slot B2: `create_label`, `delete_label`, `apply_label` -->
 
 ## Attachments
 

@@ -785,6 +785,94 @@ class TestClassicHandlerArchiveEmails:
         mock_move.assert_not_called()
 
 
+class TestClassicHandlerSpecialFolderCache:
+    """Tests for ClassicEmailHandler._find_special_folder caching and invalidation."""
+
+    @pytest.mark.asyncio
+    async def test_positive_resolution_is_cached_for_the_handler_instance(self, classic_handler):
+        """A resolved special folder is reused instead of issuing a second LIST."""
+        mock_list = AsyncMock(
+            return_value=[
+                MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+                MailboxInfo(name="All Mail", delimiter="/", flags=["\\Archive"]),
+            ]
+        )
+
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
+            first = await classic_handler._find_special_folder("archive")
+            second = await classic_handler._find_special_folder("archive")
+
+        assert first == second == "All Mail"
+        mock_list.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_negative_resolution_is_cached_too(self, classic_handler):
+        """A "not found" answer is cached, so a missing folder costs one LIST, not one per call."""
+        mock_list = AsyncMock(return_value=[MailboxInfo(name="INBOX", delimiter="/", flags=[])])
+
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
+            assert await classic_handler._find_special_folder("archive") is None
+            assert await classic_handler._find_special_folder("archive") is None
+
+        mock_list.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_invalidation_forces_a_fresh_lookup(self, classic_handler):
+        """After the mailbox hierarchy changes, invalidation makes the next call re-LIST."""
+        mock_list = AsyncMock(
+            side_effect=[
+                [MailboxInfo(name="INBOX", delimiter="/", flags=[])],
+                [
+                    MailboxInfo(name="INBOX", delimiter="/", flags=[]),
+                    MailboxInfo(name="Archive", delimiter="/", flags=[]),
+                ],
+            ]
+        )
+
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
+            assert await classic_handler._find_special_folder("archive") is None
+            classic_handler._invalidate_special_folder_cache()
+            assert await classic_handler._find_special_folder("archive") == "Archive"
+
+        assert mock_list.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failed_list_caches_nothing(self, classic_handler):
+        """A LIST failure propagates and leaves the cache empty so the next call retries."""
+        mock_list = AsyncMock(
+            side_effect=[
+                ConnectionError("LIST failed"),
+                [MailboxInfo(name="Archive", delimiter="/", flags=[])],
+            ]
+        )
+
+        with patch.object(classic_handler.incoming_client, "list_mailboxes", mock_list):
+            with pytest.raises(ConnectionError):
+                await classic_handler._find_special_folder("archive")
+            assert await classic_handler._find_special_folder("archive") == "Archive"
+
+        assert mock_list.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_cache_is_not_shared_between_handlers(self, email_settings):
+        """Each handler resolves independently; a stale answer cannot leak across accounts."""
+        first = ClassicEmailHandler(email_settings)
+        second = ClassicEmailHandler(email_settings)
+
+        with patch.object(
+            first.incoming_client,
+            "list_mailboxes",
+            AsyncMock(return_value=[MailboxInfo(name="Archive", delimiter="/", flags=[])]),
+        ):
+            assert await first._find_special_folder("archive") == "Archive"
+
+        second_list = AsyncMock(return_value=[MailboxInfo(name="INBOX", delimiter="/", flags=[])])
+        with patch.object(second.incoming_client, "list_mailboxes", second_list):
+            assert await second._find_special_folder("archive") is None
+
+        second_list.assert_awaited_once()
+
+
 class TestClassicHandlerListMailboxes:
     """Tests for ClassicEmailHandler.list_mailboxes delegation."""
 

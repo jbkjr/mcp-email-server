@@ -525,3 +525,49 @@ def test_allowed_senders_empty_env_clears_toml(tmp_path, monkeypatch):
         assert config_module.get_settings(reload=True).allowed_senders == []
     finally:
         config_module._settings = None
+
+
+def test_enable_folder_management_defaults_to_false(tmp_path, monkeypatch):
+    import mcp_email_server.config as config_module
+    from mcp_email_server.config import Settings
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("")
+    monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
+    monkeypatch.delenv("MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT", raising=False)
+    config_module._settings = None
+    try:
+        assert config_module.get_settings(reload=True).enable_folder_management is False
+    finally:
+        config_module._settings = None
+
+
+def test_enable_folder_management_from_env_true(tmp_path, monkeypatch):
+    import mcp_email_server.config as config_module
+    from mcp_email_server.config import Settings
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("")
+    monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
+    monkeypatch.setenv("MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT", "true")
+    config_module._settings = None
+    try:
+        assert config_module.get_settings(reload=True).enable_folder_management is True
+    finally:
+        config_module._settings = None
+
+
+def test_enable_folder_management_env_overrides_toml(tmp_path, monkeypatch):
+    """A false environment value wins over an enabling TOML value."""
+    import mcp_email_server.config as config_module
+    from mcp_email_server.config import Settings
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("enable_folder_management = true\n")
+    monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
+    monkeypatch.setenv("MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT", "0")
+    config_module._settings = None
+    try:
+        assert config_module.get_settings(reload=True).enable_folder_management is False
+    finally:
+        config_module._settings = None

@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
-from mcp_email_server.adapters.mutations import ClassicMutationProvider
+from mcp_email_server.adapters import mutations as mutation_adapters
+from mcp_email_server.adapters.authority import LocalAccountResolution
+from mcp_email_server.adapters.mutations import ClassicMutationProvider, LocalMutationBackend
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
     ForwardCommand,
@@ -21,7 +23,7 @@ from mcp_email_server.application.mutations import (
     SentCopyMutationOutcome,
     SetEmailFlagsCommand,
 )
-from mcp_email_server.config import EmailSettings
+from mcp_email_server.config import EmailSettings, Settings
 
 
 def _set_flags_provider(error: BaseException) -> ClassicMutationProvider:
@@ -405,3 +407,46 @@ async def test_mutation_adapter_sanitizes_unexpected_forward_delivery_failure() 
         )
 
     assert provider_detail not in str(caught.value)
+
+
+def _resolution(mode: str, *, enable_folder_management: bool) -> LocalAccountResolution:
+    account = EmailSettings.model_construct(account_name="primary")
+    settings = Settings.model_construct(
+        emails=[account],
+        providers=[],
+        enable_folder_management=enable_folder_management,
+    )
+    return LocalAccountResolution(mode=mode, settings=settings, account=account)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_legacy_snapshot_carries_the_configured_folder_management_flag(monkeypatch, enabled: bool) -> None:
+    monkeypatch.setattr(
+        mutation_adapters,
+        "resolve_local_account",
+        lambda *args, **kwargs: _resolution("legacy", enable_folder_management=enabled),
+    )
+
+    snapshot = LocalMutationBackend().resolve("primary")
+
+    assert snapshot.mode == "legacy"
+    assert snapshot.enable_folder_management is enabled
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_managed_snapshot_never_enables_folder_management(monkeypatch, configured: bool) -> None:
+    """Managed configuration has no folder-management policy, so the flag is hard-False."""
+    monkeypatch.setattr(
+        mutation_adapters,
+        "resolve_local_account",
+        lambda *args, **kwargs: _resolution("managed", enable_folder_management=configured),
+    )
+
+    snapshot = LocalMutationBackend().resolve("primary")
+
+    assert snapshot.mode == "managed"
+    assert snapshot.enable_folder_management is False
+
+
+def test_mutation_account_snapshot_defaults_folder_management_to_false() -> None:
+    assert MutationAccountSnapshot("primary", "managed", (), (), False).enable_folder_management is False

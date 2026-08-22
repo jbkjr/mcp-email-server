@@ -1178,3 +1178,13 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             mailboxes = await _call_tool(session, "list_mailboxes", {"account_name": "alice"})
             mailbox_names = {mailbox["name"] for mailbox in mailboxes["result"]}
             assert {"INBOX", "Sent", "Drafts", "Archive"} <= mailbox_names
+
+
+# Port slots for new per-cluster E2E tests. Each cluster appends its own test
+# function directly ABOVE its own marker rather than extending
+# `test_current_stdio_server_against_greenmail`, which is reserved for the
+# trash-first delete change. Slot order is fixed everywhere: A, B1, C, B2.
+# port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+# port-slot B1: label reads (list_labels, get_email_labels, remove_label)
+# port-slot C: send path (Markdown rendering, quoted replies)
+# port-slot B2: label writes (create_label, delete_label, apply_label)

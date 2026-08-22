@@ -1050,3 +1050,13 @@ async def download_attachment(
             mailbox=mailbox,
         )
     )
+
+
+# Port slots for tools being ported onto this architecture in parallel. Each
+# cluster registers its @mcp.tool functions directly ABOVE its own marker, so two
+# clusters extending this tail produce non-overlapping hunks instead of a
+# conflict. Slot order is fixed everywhere it appears: A, B1, C, B2.
+# port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+# port-slot B1: label reads (list_labels, get_email_labels, remove_label)
+# port-slot C: send path (no new tools; send_email gains Markdown and quoted replies)
+# port-slot B2: label writes (create_label, delete_label, apply_label)
