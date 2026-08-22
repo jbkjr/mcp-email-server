@@ -35,7 +35,6 @@ from aiosmtplib.errors import (
     SMTPServerDisconnected,
     SMTPTimeoutError,
 )
-from bs4 import BeautifulSoup
 
 from mcp_email_server.application.limits import APPLICATION_LIMITS, validate_imap_uid
 from mcp_email_server.application.metadata import (
@@ -59,6 +58,7 @@ from mcp_email_server.application.mutations import (
 )
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
 from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails.html_utils import html_to_text
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -639,29 +639,6 @@ def _decoded_payload(message: Message) -> bytes | None:
     """Return a decoded MIME payload when the email API produced bytes."""
     payload = message.get_payload(decode=True)
     return payload if isinstance(payload, bytes) else None
-
-
-def _html_to_text(html: str) -> str:
-    """Convert an HTML email body to readable plain text."""
-    soup = BeautifulSoup(html, "html.parser")
-    for element in soup(["script", "style"]):
-        element.decompose()
-
-    for link in soup.find_all("a"):
-        href = str(link.get("href") or "").strip()
-        normalized_href_scheme = re.sub(r"[\x00-\x20]+", "", href).lower()
-        if not href or href.startswith("#") or normalized_href_scheme.startswith(("mailto:", "javascript:")):
-            continue
-
-        link_text = link.get_text(" ", strip=True)
-        replacement = href if not link_text or link_text == href else f"{link_text} ({href})"
-        link.replace_with(replacement)
-
-    soup.smooth()
-    text = soup.get_text(separator="\n")
-    text = re.sub(r"\n\s*\n", "\n\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
 
 
 def _discard_imap_after_sync_failure(
@@ -1267,7 +1244,7 @@ class EmailClient:
         raw_email: bytes,
         email_id: str | None = None,
         body_offset: int = 0,
-        max_body_length: int = MAX_BODY_LENGTH,
+        max_body_length: int | None = MAX_BODY_LENGTH,
     ) -> dict[str, Any]:
         """Parse raw email data into a structured dictionary."""
         parser = BytesParser(policy=default)
@@ -1307,19 +1284,24 @@ class EmailClient:
 
         # Fall back to HTML if no plain text was found.
         if not body and html_body:
-            body = _html_to_text(html_body)
+            body = html_to_text(html_body)
         if body_offset < 0:
             raise ValueError("body_offset must be >= 0")
-        if max_body_length < 1:
-            raise ValueError("max_body_length must be >= 1")
+        if max_body_length is not None and max_body_length < 0:
+            raise ValueError("max_body_length must be >= 0")
 
-        # Return at most ``max_body_length`` characters starting at ``body_offset``. When more of
-        # the body remains past the window, append the ``...[TRUNCATED]`` marker so callers can page
-        # through a long email by re-requesting with ``body_offset += max_body_length``.
+        # ``max_body_length`` of 0 or None means "no truncation": return the whole body from
+        # ``body_offset`` onward and never append the marker. Otherwise return at most
+        # ``max_body_length`` characters starting at ``body_offset`` and, when more of the body
+        # remains past the window, append the ``...[TRUNCATED]`` marker so callers can page through
+        # a long email by re-requesting with ``body_offset += max_body_length``.
         if body:
-            window = body[body_offset : body_offset + max_body_length]
-            if body_offset + max_body_length < len(body):
-                window += "...[TRUNCATED]"
+            if max_body_length:
+                window = body[body_offset : body_offset + max_body_length]
+                if body_offset + max_body_length < len(body):
+                    window += "...[TRUNCATED]"
+            else:
+                window = body[body_offset:]
             body = window
         return {
             "email_id": email_id or "",
@@ -1949,7 +1931,7 @@ class EmailClient:
         mark_as_read: bool = False,
         allowed_senders: list[str] | None = None,
         body_offset: int = 0,
-        max_body_length: int = MAX_BODY_LENGTH,
+        max_body_length: int | None = MAX_BODY_LENGTH,
     ) -> dict[str, Any] | None:
         del mark_as_read  # Compatibility argument; the application owns the mutation.
         validate_imap_uid(email_id)
@@ -3503,7 +3485,7 @@ class ClassicEmailHandler(EmailHandler):
         mailbox: str = "INBOX",
         mark_as_read: bool = False,
         body_offset: int = 0,
-        max_body_length: int = MAX_BODY_LENGTH,
+        max_body_length: int | None = MAX_BODY_LENGTH,
     ) -> EmailContentBatchResponse:
         """Batch retrieve email body content, honoring the sender allowlist.
 

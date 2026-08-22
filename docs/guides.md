@@ -284,6 +284,23 @@ second = await get_emails_content(
 Keep the mailbox argument consistent with the mailbox used to obtain the
 `email_id`.
 
+When paging is more trouble than it is worth — a single message you want in full
+— ask for the whole body instead:
+
+```python
+whole = await get_emails_content(
+    account_name="work",
+    email_ids=["123"],
+    max_body_length=0,
+)
+```
+
+`0` and `null` both mean "no truncation", and the result never carries the
+`...[TRUNCATED]` marker. This is bounded by the shared per-message and aggregate
+body byte ceilings rather than by a character window, so a message above those
+ceilings returns a bounded limit error instead of a partial body; page it with an
+explicit `max_body_length` in that case.
+
 ## Import legacy accounts into a managed catalog
 
 Create the destination while keeping legacy runtime selected, preview the

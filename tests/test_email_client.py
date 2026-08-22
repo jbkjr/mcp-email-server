@@ -16,9 +16,9 @@ from mcp_email_server.emails.classic import (
     EmailClient,
     ImapAuthenticationError,
     _create_smtp_ssl_context,
-    _html_to_text,
     _imap_login,
 )
+from mcp_email_server.emails.html_utils import html_to_text
 
 
 @pytest.fixture
@@ -344,13 +344,41 @@ class TestEmailClient:
         with pytest.raises(ValueError, match="body_offset must be >= 0"):
             client._parse_email_data(raw_email, body_offset=-1, max_body_length=10)
 
-    def test_parse_email_data_rejects_non_positive_max_body_length(self):
-        """max_body_length must be positive, matching the public tool constraint."""
+    def test_parse_email_data_rejects_negative_max_body_length(self):
+        """max_body_length must be non-negative, matching the public tool constraint."""
         raw_email = self._make_raw_email("abc")
         client = EmailClient(MagicMock())
 
-        with pytest.raises(ValueError, match="max_body_length must be >= 1"):
-            client._parse_email_data(raw_email, body_offset=0, max_body_length=0)
+        with pytest.raises(ValueError, match="max_body_length must be >= 0"):
+            client._parse_email_data(raw_email, body_offset=0, max_body_length=-1)
+
+    def test_parse_email_data_zero_max_body_length_is_unlimited(self):
+        """max_body_length=0 returns the whole body and never appends the marker."""
+        raw_email = self._make_raw_email("x" * 250_000)
+        client = EmailClient(MagicMock())
+
+        result = client._parse_email_data(raw_email, body_offset=0, max_body_length=0)
+        assert result["body"] == "x" * 250_000
+        assert "[TRUNCATED]" not in result["body"]
+
+    def test_parse_email_data_none_max_body_length_is_unlimited(self):
+        """max_body_length=None is the same 'no truncation' request as 0."""
+        raw_email = self._make_raw_email("y" * 150_000)
+        client = EmailClient(MagicMock())
+
+        result = client._parse_email_data(raw_email, body_offset=0, max_body_length=None)
+        assert result["body"] == "y" * 150_000
+        assert "[TRUNCATED]" not in result["body"]
+
+    def test_parse_email_data_unlimited_honors_body_offset(self):
+        """An unlimited request still starts at body_offset and appends no marker."""
+        raw_email = self._make_raw_email("abcdefghij")
+        client = EmailClient(MagicMock())
+
+        for unlimited in (0, None):
+            result = client._parse_email_data(raw_email, body_offset=4, max_body_length=unlimited)
+            assert result["body"] == "efghij"
+            assert "[TRUNCATED]" not in result["body"]
 
     def test_html_to_text_removes_scripts_and_preserves_readable_text(self):
         """HTML fallback extraction uses an HTML parser for readable plain text."""
@@ -366,7 +394,7 @@ class TestEmailClient:
         </html>
         """
 
-        result = _html_to_text(html)
+        result = html_to_text(html)
 
         assert "alert" not in result
         assert "display" not in result
@@ -386,7 +414,7 @@ class TestEmailClient:
         <p>Textless <a href="https://example.com/textless"></a></p>
         """
 
-        result = _html_to_text(html)
+        result = html_to_text(html)
 
         assert "here (https://example.com/verify)" in result
         assert "https://example.com/help (https://example.com/help)" not in result
@@ -403,7 +431,7 @@ class TestEmailClient:
         <p><a href="">empty</a></p>
         """
 
-        result = _html_to_text(html)
+        result = html_to_text(html)
 
         assert "section" in result
         assert "email us" in result

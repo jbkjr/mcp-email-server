@@ -428,14 +428,17 @@ async def get_emails_content(
         ),
     ] = 0,
     max_body_length: Annotated[
-        int,
+        int | None,
         Field(
             default=20000,
-            ge=1,
+            ge=0,
             le=100000,
             description="Maximum number of body characters to return, counted from body_offset. "
             "If the body extends past this window, the '...[TRUNCATED]' marker is appended after "
-            "the requested body window.",
+            "the requested body window. Use 0 or null to return the whole body from body_offset "
+            "onward with no truncation and no marker; explicit limits are 1 to 100000. An "
+            "untruncated body is still subject to the shared per-message and aggregate body byte "
+            "ceilings, which return a bounded limit error instead of a partial body.",
         ),
     ] = 20000,
 ) -> EmailContentBatchResponse:

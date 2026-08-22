@@ -1180,6 +1180,95 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             assert {"INBOX", "Sent", "Drafts", "Archive"} <= mailbox_names
 
 
+@pytest.mark.asyncio
+async def test_unlimited_body_length_returns_whole_body_and_rejects_oversized_window(tmp_path: Path) -> None:
+    """max_body_length=0 returns an oversized body untruncated; 100001 is rejected."""
+    _wait_until_ready()
+    _ensure_empty_mailboxes(BOB, ["INBOX"])
+
+    run_id = uuid.uuid4().hex
+    subject = f"mcp-e2e-unlimited-body-{run_id}"
+    # Longer than both the default window and the explicit maximum, so a truncating
+    # request and an untruncated one cannot be confused for each other. Short unique
+    # lines keep the message 7-bit clean; assertions never assume a line ending.
+    line_count = 2_400
+    body = "".join(f"line{index:05d}-{'x' * 40}\n" for index in range(line_count))
+    assert len(body) > 100_001
+    _seed_message(subject, body)
+    _wait_for_message(BOB, "INBOX", subject)
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(CONFIG_TEMPLATE)
+    config_path.chmod(0o600)
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_CREDENTIAL_STORAGE": "plaintext",
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+    })
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    assert console_script.is_file(), f"Installed console script not found: {console_script}"
+    server = StdioServerParameters(command=str(console_script), args=["stdio"], env=server_env, cwd=Path.cwd())
+
+    async with stdio_client(server) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream, read_timeout_seconds=timedelta(seconds=15)) as session:
+            await session.initialize()
+            metadata = await _metadata_for_subject(session, "bob", subject)
+
+            truncated = await _call_tool(
+                session,
+                "get_emails_content",
+                {"account_name": "bob", "email_ids": [metadata["email_id"]], "max_body_length": 1_000},
+            )
+            marker = "...[TRUNCATED]"
+            truncated_body = truncated["emails"][0]["body"]
+            assert truncated_body.endswith(marker)
+            assert len(truncated_body) == 1_000 + len(marker)
+            assert truncated_body.startswith("line00000-")
+            assert f"line{line_count - 1:05d}-" not in truncated_body
+
+            untruncated_bodies = []
+            for unlimited in (0, None):
+                whole = await _call_tool(
+                    session,
+                    "get_emails_content",
+                    {"account_name": "bob", "email_ids": [metadata["email_id"]], "max_body_length": unlimited},
+                )
+                whole_body = whole["emails"][0]["body"]
+                assert marker not in whole_body
+                assert whole_body.startswith("line00000-")
+                # The last seeded line proves nothing was dropped past the explicit ceiling.
+                assert f"line{line_count - 1:05d}-" in whole_body
+                assert len(whole_body) > 100_001
+                untruncated_bodies.append(whole_body)
+            assert untruncated_bodies[0] == untruncated_bodies[1]
+
+            offset_window = await _call_tool(
+                session,
+                "get_emails_content",
+                {
+                    "account_name": "bob",
+                    "email_ids": [metadata["email_id"]],
+                    "body_offset": 50_000,
+                    "max_body_length": 0,
+                },
+            )
+            offset_body = offset_window["emails"][0]["body"]
+            assert marker not in offset_body
+            assert offset_body == untruncated_bodies[0][50_000:]
+
+            rejected = await session.call_tool(
+                "get_emails_content",
+                arguments={
+                    "account_name": "bob",
+                    "email_ids": [metadata["email_id"]],
+                    "max_body_length": 100_001,
+                },
+            )
+            assert rejected.isError is True
+            assert "max_body_length" in _text_content(rejected)
+
+
 # Port slots for new per-cluster E2E tests. Each cluster appends its own test
 # function directly ABOVE its own marker rather than extending
 # `test_current_stdio_server_against_greenmail`, which is reserved for the

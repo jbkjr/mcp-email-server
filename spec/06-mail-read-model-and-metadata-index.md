@@ -119,6 +119,18 @@ Body reads:
 - enforce a running UTF-8 body-byte budget in the provider adapter before each
   result is retained, then independently revalidate per-message and aggregate
   bytes at the application response boundary;
+- return a bounded body window selected by a caller offset and maximum length,
+  appending an explicit truncation marker only when content past the window
+  remains; an explicit maximum is bounded by the public ceiling, while the
+  documented unlimited request returns the whole body from the offset with no
+  marker and remains bounded by the per-message and aggregate body byte budgets
+  rather than by a character window;
+- convert an HTML-only body to plain text with the standard library parser,
+  without a third-party HTML tree builder and without rendering or executing the
+  message: suppressed `script`/`style`/`head` content, preserved block, list,
+  table, and blockquote structure, and link targets surfaced only when they add
+  information and only after scheme checking with embedded control characters
+  removed, so anchor-only, `mailto:`, and `javascript:` targets are never emitted;
 - expose nullable `In-Reply-To` and `References` observations only in the
   full-content response, not metadata listing or the SQLite projection;
 - return each parsed thread header as one decoded, unfolded string with folding
@@ -225,7 +237,13 @@ catalog authority or secret binding state.
    to the documented limit without persisting content or reply-thread headers;
    tests cover present, absent, whitespace-only, folded, duplicate, malformed,
    per-field, and aggregate `In-Reply-To`/`References` behavior.
-6. Attachment tests cover explicit enablement, exact explicit-path
+6. Body window tests cover the default window, explicit windows at both ends of
+   the public range, rejection above it, the unlimited request expressed as zero
+   and as an absent value, offset paging with and without a limit, and the
+   truncation marker appearing only when content past the window remains. HTML
+   fallback tests cover suppressed elements, structural markers, useful and
+   suppressed link targets, and control-character-obfuscated schemes.
+7. Attachment tests cover explicit enablement, exact explicit-path
    preservation, default Downloads/application-child resolution, safe
    randomized leaf naming, size limits, capability preflight before provider
    work, symlinks, Windows junctions and other reparse points, hard links,
@@ -233,9 +251,9 @@ catalog authority or secret binding state.
    crash-boundary replacement, validated partial/stale cleanup, final identity,
    and absence of path leakage to provider. Windows filesystem cases run on real
    NTFS rather than mocks alone.
-7. Projection failure cannot turn known provider read evidence into a false mail
+8. Projection failure cannot turn known provider read evidence into a false mail
    failure, and rebuild cannot alter catalog or credential state.
-8. Interoperability tests cover quoted and grouped address fields, attachment
+9. Interoperability tests cover quoted and grouped address fields, attachment
    subtree pruning, unknown MIME charsets, all English IMAP month tokens, exact
    ASCII astring escaping, multi-literal UTF-8 SEARCH continuations and failure
    framing, LIST completion filtering and literal lengths, and case-insensitive

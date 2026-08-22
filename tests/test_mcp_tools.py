@@ -393,6 +393,13 @@ class TestMcpTools:
         content_ids = tools["get_emails_content"]["email_ids"]
         assert content_ids["maxItems"] == APPLICATION_LIMITS.content_email_ids
         assert content_ids["items"]["maxLength"] == len(str(APPLICATION_LIMITS.maximum_imap_uid))
+        # 0 and null request an untruncated body; explicit windows stay bounded at 100000.
+        max_body_length = tools["get_emails_content"]["max_body_length"]
+        assert max_body_length["default"] == 20000
+        assert max_body_length["anyOf"] == [
+            {"type": "integer", "minimum": 0, "maximum": 100000},
+            {"type": "null"},
+        ]
         for tool_name in (
             "delete_emails",
             "set_email_flags",
@@ -651,6 +658,25 @@ class TestMcpTools:
         query = query_handler.await_args.args[0]
         assert query.body_offset == 4000
         assert query.max_body_length == 2000
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unlimited", [0, None])
+    async def test_get_emails_content_forwards_unlimited_body_length(self, unlimited):
+        """0 and null reach the application query unchanged as an untruncated request."""
+        response = EmailContentBatchResponse(emails=[], requested_count=1, retrieved_count=0, failed_ids=["123"])
+        query_handler = AsyncMock(return_value=response)
+
+        with patch("mcp_email_server.app.get_email_content_query", query_handler):
+            await get_emails_content(
+                account_name="test",
+                email_ids=["123"],
+                body_offset=4000,
+                max_body_length=unlimited,
+            )
+
+        query = query_handler.await_args.args[0]
+        assert query.body_offset == 4000
+        assert query.max_body_length == unlimited
 
     @pytest.mark.asyncio
     async def test_move_emails(self):
