@@ -307,3 +307,22 @@ enter public errors.
     interpolated raw, that an allowlist-blocked message is indistinguishable
     from a missing one, that per-target failures carry only reviewed fixed
     detail tags, and that only the label mailbox is invalidated.
+15. Composition renders a caller-authored body from Markdown to email-safe HTML in
+    one shared place, so every submission path inherits it, and an explicit raw-HTML
+    body suppresses rendering. Quoted evidence carried from another message is
+    escaped before rendering. Tests prove that rendering changes only the body
+    part's subtype and never turns an ASCII-header message into one that requires
+    SMTPUTF8, and that forwarded source markup is delivered literally.
+16. A reply reads the message it quotes before the outgoing provider is opened, and
+    the read is a distinct effect with its own authority resolution. Tests prove
+    that a source which no searched mailbox holds degrades to an unquoted send,
+    that every other read failure — unreadable, unparseable, oversized, timed out —
+    aborts before any SMTP session opens rather than sending unquoted, that an
+    allowlist-blocked source is indistinguishable from an absent one, and that the
+    body carrying the appended quote is revalidated against the body bound.
+17. Outgoing sender-software identification is configuration, not a constant: each
+    identification header is separately configurable, an empty value omits that
+    header, and the defaults carry no account-specific information. A value
+    containing control characters is rejected when configuration loads, so a
+    configured identifier cannot inject an additional header. Tests cover defaults,
+    per-header override, omission, rejection, and TOML round-trip.

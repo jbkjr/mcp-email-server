@@ -1345,7 +1345,8 @@ class TestComposeWithExtraParts:
 
         assert message.is_multipart()
         payload = message.get_payload()
-        assert [item.get_content_type() for item in payload] == ["text/plain", "application/vnd.ms-excel"]
+        # The body part is text/html because a non-html body is rendered from Markdown.
+        assert [item.get_content_type() for item in payload] == ["text/html", "application/vnd.ms-excel"]
 
     def test_extra_parts_follow_file_attachments(self, email_client, tmp_path):
         upload = tmp_path / "note.txt"

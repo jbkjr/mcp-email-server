@@ -263,7 +263,7 @@ does not continue after ambiguous state.
 Sends a message through the selected account's SMTP server. It supports:
 
 - To, CC, and BCC recipients.
-- Plain-text or HTML bodies.
+- Markdown bodies rendered to email-safe HTML, or pre-formatted raw HTML bodies.
 - Attachments from file paths available to the server process. Relative paths use the process working directory; absolute paths are recommended.
 - `Reply-To`, `In-Reply-To`, and `References` headers.
 
@@ -350,10 +350,16 @@ The subject is derived from the source message as `Fwd: <original subject>`. A
 source subject that already begins with `Fwd:` in any letter case is not
 prefixed a second time.
 
-The forwarded content is appended below the caller's note as a plain-text
+The forwarded content is appended below the caller's note as a
 `Forwarded message` block reporting the original's From, Recipients, Date, and
 Subject. That block reports `Recipients:` rather than `To:` because the parsed
 recipient list folds in Cc entries.
+
+The note is caller-authored and is rendered as Markdown like any other body. The
+forwarded block is quoted evidence read off another message, so its markup
+characters are escaped before rendering: a source body containing `<b>` or a
+`<script>` element reaches the recipient as the literal text it was, never as
+live markup the account owner did not write.
 
 The block is re-composed from the parsed plain-text body, so the original's HTML
 formatting is not preserved in the quoted text. The forwarded content is never
@@ -388,6 +394,62 @@ as it does for `send_email`.
 
 For a worked example, see
 [Forward a message with its attachments](guides.md#forward-a-message-with-its-attachments).
+
+### Markdown message bodies
+
+Every composed message body — `send_email`, `forward_email`, and
+`save_to_mailbox` alike — is written in Markdown and rendered to email-safe HTML
+before the MIME container is built. Headings, bold and italic text, links,
+bullet and numbered lists, tables, and fenced code blocks are all supported, and
+single newlines become line breaks so ordinary prose keeps the shape you wrote
+it in. The rendered document carries minimal inline styles rather than CSS
+classes, because mail clients cannot be relied on to keep a stylesheet.
+
+Set `html=true` on `send_email` or `save_to_mailbox` when the body is already
+pre-formatted raw HTML. That suppresses rendering and sends the body exactly as
+supplied; it is not a way to ask for a plain-text message. `forward_email` has
+no `html` parameter: its note is always Markdown.
+
+Rendering changes only the body part's subtype, never an address or threading
+header, so it has no effect on whether a message requires SMTPUTF8.
+
+### Quoted replies
+
+When `send_email` is given `in_reply_to`, the server reads the message being
+replied to over IMAP and appends it below your body as a collapsible quote
+block, the way a mail client would. Set `quote_reply=false` to reply without
+quoting.
+
+The original is looked up by its Message-ID in INBOX first, then in the account's
+Sent folder, so replying to your own message quotes it too. Both mailboxes are
+searched inside a single IMAP session. If the original has an HTML body it is
+quoted as markup with its document wrappers stripped; otherwise its text is
+escaped, line-broken, and truncated at 5000 characters with an explicit
+`[...quoted text truncated]` marker.
+
+Reading the original is a read, not an effect, and it happens before any SMTP
+session is opened. The two outcomes are deliberately different:
+
+- The original is not in any searched mailbox. Nothing is wrong and there is
+  nothing to quote, so the reply is sent unquoted.
+- The original is there but cannot be read — a transport fault, an unparseable
+  message, one that exceeds the raw message size limit. The call fails before
+  SMTP, because a caller who asked for a quoted reply must never silently get an
+  unquoted one.
+
+When a sender allowlist is configured, a blocked sender's message is treated as
+absent, so the allowlist cannot be used to probe which messages exist.
+
+The merged body is revalidated against the 1 MiB body bound after the quote is
+appended, so a large quote is rejected rather than silently truncated.
+
+The quote's markup follows the account's mail service, because clients only
+collapse a quote block they recognize. The service is detected from the IMAP
+host: `imap.gmail.com` is Gmail, a loopback host with certificate verification
+disabled is a ProtonMail Bridge, and anything else uses a generic blockquote.
+Set `email_service` on the account (or `MCP_EMAIL_SERVER_EMAIL_SERVICE`) to
+`protonmail`, `gmail`, or `generic` when detection guesses wrong — see
+[Configuration](configuration.md).
 
 <!-- port-slot C: send-path documentation goes here, above this marker — Markdown message
      bodies and quoted replies extend `send_email` rather than adding tools. -->

@@ -22,6 +22,7 @@ from email.parser import BytesParser
 from email.policy import SMTP as SMTP_POLICY
 from email.policy import SMTPUTF8 as SMTPUTF8_POLICY
 from email.policy import compat32, default
+from html import escape as html_escape
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
@@ -60,6 +61,7 @@ from mcp_email_server.application.mutations import (
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.html_utils import html_to_text
+from mcp_email_server.emails.markdown_utils import markdown_to_email_html
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -175,6 +177,117 @@ def _format_forwarded_text(sender: str, recipients: Sequence[str], date: str, su
     return f"{header}\n{body}"
 
 
+def _detect_email_service(email_settings: EmailSettings) -> str:
+    """Detect the email service from IMAP config for service-aware reply quoting.
+
+    Detection order:
+    1. Explicit override via email_service config field
+    2. imap.gmail.com host → 'gmail' (includes Google Workspace custom domains)
+    3. localhost/127.0.0.1 + verify_ssl=False → 'protonmail' (ProtonMail Bridge)
+    4. Everything else → 'generic'
+
+    Note: The localhost heuristic could mislabel other local IMAP servers with
+    self-signed certs as ProtonMail. Use email_service config override for those cases.
+    """
+    if email_settings.email_service:
+        return email_settings.email_service
+
+    host = email_settings.incoming.host.lower()
+
+    if host == "imap.gmail.com":
+        return "gmail"
+
+    if host in ("localhost", "127.0.0.1") and not email_settings.incoming.verify_ssl:
+        return "protonmail"
+
+    return "generic"
+
+
+def _strip_html_wrappers(html_content: str) -> str:
+    """Strip HTML document wrappers (DOCTYPE, html, head, body tags), keeping body content."""
+    content = re.sub(r"<!DOCTYPE[^>]*>", "", html_content, flags=re.IGNORECASE)
+    content = re.sub(r"<html[^>]*>", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"</html\s*>", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"<head[^>]*>.*?</head\s*>", "", content, flags=re.IGNORECASE | re.DOTALL)
+    content = re.sub(r"<body[^>]*>", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"</body\s*>", "", content, flags=re.IGNORECASE)
+    return content.strip()
+
+
+def _format_quoted_reply_html(original_email: dict[str, Any], service: str = "generic") -> str:
+    """Format an original email as an HTML blockquote for reply quoting.
+
+    Uses service-specific HTML structure so email clients can properly collapse
+    the quoted content (including the attribution line).
+
+    Args:
+        original_email: Parsed email dict with keys: from, date, body, html_body.
+        service: Email service name ('protonmail', 'gmail', 'generic').
+
+    Returns:
+        HTML string containing an attribution line and styled blockquote.
+    """
+    sender = original_email.get("from", "Unknown")
+    date = original_email.get("date")
+    raw_html_body = original_email.get("html_body", "")
+    text_body = original_email.get("body", "")
+
+    # Format date
+    if isinstance(date, datetime):
+        date_str = date.strftime("%a, %b %d, %Y at %I:%M %p")
+    else:
+        date_str = str(date) if date else "Unknown date"
+
+    # Build quoted content
+    if raw_html_body:
+        quoted_content = _strip_html_wrappers(raw_html_body)
+    elif text_body:
+        if len(text_body) > MAX_QUOTED_BODY_LENGTH:
+            text_body = text_body[:MAX_QUOTED_BODY_LENGTH] + "\n[...quoted text truncated]"
+        quoted_content = "<br>\n".join(html_escape(line) for line in text_body.splitlines())
+    else:
+        quoted_content = ""
+
+    attribution = f"On {date_str}, {html_escape(sender)} wrote:"
+
+    if service == "protonmail":
+        return (
+            f'<div class="protonmail_quote">'
+            f"{attribution}<br>"
+            f'<blockquote class="protonmail_quote" type="cite">'
+            f"{quoted_content}"
+            f"</blockquote><br>"
+            f"</div>"
+        )
+
+    if service == "gmail":
+        return (
+            f'<div class="gmail_quote">'
+            f'<div class="gmail_attr" dir="ltr">{attribution}<br></div>'
+            f'<blockquote class="gmail_quote" style="'
+            f"margin:0 0 0 .8ex;"
+            f"border-inline-start:1px solid rgb(204,204,204);"
+            f'padding-inline-start:1ex">'
+            f"{quoted_content}"
+            f"</blockquote>"
+            f"</div>"
+        )
+
+    # generic: attribution inside blockquote for maximum compatibility
+    return (
+        f'<div style="margin-top: 1em;">'
+        f'<blockquote type="cite" style="'
+        f"margin: 0 0 0 0.5em; "
+        f"padding: 0.5em 1em; "
+        f"border-left: 3px solid #ccc; "
+        f'color: #555;">'
+        f'<p style="color: #666;">{attribution}</p>'
+        f"{quoted_content}"
+        f"</blockquote>"
+        f"</div>"
+    )
+
+
 class _LiteralSearchCommand(aioimaplib.Command):
     """Drive one synchronizing UID SEARCH containing UTF-8 literals."""
 
@@ -262,12 +375,21 @@ _IMAP_CAPABILITY_TIMEOUT_SECONDS = 30.0
 # Common Archive folder names, used as a fallback when no RFC 6154 \Archive flag is found.
 _ARCHIVE_FOLDER_CANDIDATES = ("Archive", "Archives", "[Gmail]/All Mail")
 
+# Longest plain-text original carried into a quoted reply before it is truncated.
+# An HTML original is quoted whole: it is already bounded by the raw-message limit,
+# and cutting markup mid-element would corrupt the recipient's rendering.
+MAX_QUOTED_BODY_LENGTH = 5000
+
+# Common Sent folder names, used as a fallback when no RFC 6154 \Sent flag is found.
+_SENT_FOLDER_CANDIDATES = ("Sent", "INBOX.Sent", "Sent Items", "Sent Mail", "[Gmail]/Sent Mail", "INBOX/Sent")
+
 # RFC 6154 special-use folders resolvable by ``ClassicEmailHandler._find_special_folder``.
 # Each entry maps a kind to its special-use attribute (normalized: no leading
 # backslash, lowercased) and the ordered common-name fallbacks tried when no
 # mailbox advertises that attribute.
 _SPECIAL_FOLDER_KINDS: dict[str, tuple[str, tuple[str, ...]]] = {
     "archive": ("archive", _ARCHIVE_FOLDER_CANDIDATES),
+    "sent": ("sent", _SENT_FOLDER_CANDIDATES),
 }
 
 
@@ -2290,6 +2412,126 @@ class EmailClient:
             except Exception:
                 logger.info("IMAP logout failed")
 
+    def _extract_html_body(self, email_message: Message) -> str:
+        """Return the message's own ``text/html`` body, empty when it has none.
+
+        ``_parse_email_data`` folds an HTML-only body down to extracted text because
+        every other read path wants text. Reply quoting is the exception: it embeds
+        the original in an HTML blockquote, so the source markup is worth keeping.
+        """
+        html_body = ""
+        for part, is_attachment in self._iter_content_parts(email_message):
+            if not is_attachment and part.get_content_type() == "text/html":
+                html_body += self._decode_text_part(part)
+        return html_body
+
+    async def _find_quote_source_in_mailbox(
+        self,
+        imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
+        mailbox: str,
+        message_id: str,
+        allowed_senders: list[str] | None,
+    ) -> dict[str, Any] | None:
+        """Locate and read one message by Message-ID inside an already-open session.
+
+        Returns None when this mailbox does not hold the message, so the caller can
+        try the next one. Selecting, checking the allowlist, and reading the body all
+        happen against the same SELECTed view, so the message cannot be swapped
+        between the authority check and the read.
+        """
+        select_response = await imap.select(_quote_mailbox(mailbox))
+        _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+
+        search_response = await _uid_search(imap, ["HEADER", "MESSAGE-ID", self._sanitize_imap_value(message_id)])
+        _raise_for_imap_command_failure(search_response, f"SEARCH mailbox {mailbox}")
+        _, messages = search_response
+        uids = _normalize_search_uids(messages) if messages and messages[0] else []
+        if not uids:
+            return None
+
+        # A Message-ID is globally unique, so a second hit is a duplicate of the same
+        # message; quote the newest copy the mailbox holds.
+        email_id = max(uids, key=_uid_sort_key)
+
+        # Read-path allowlist: a blocked sender's message is never fetched and is
+        # reported exactly like a message this mailbox does not hold.
+        if allowed_senders:
+            uid_senders = await self._batch_fetch_senders(imap, [email_id])
+            if not sender_allowed(uid_senders.get(email_id, ""), allowed_senders):
+                logger.debug("Quote source sender is not on the allowlist; treating it as absent")
+                return None
+
+        data = await self._fetch_email_with_formats(imap, email_id)
+        if not data:
+            raise ValueError(f"Failed to fetch quote source with UID {email_id}")
+        raw_email = self._extract_raw_email(data)
+        if not raw_email:
+            raise ValueError(f"Could not find quote source data for UID {email_id}")
+        if len(raw_email) > MAX_RAW_EMAIL_BYTES:
+            raise ValueError("Quote source exceeds the raw message size limit")
+
+        try:
+            email_data = self._parse_email_data(raw_email, email_id)
+            email_message = BytesParser(policy=default).parsebytes(raw_email)
+        except Exception as error:
+            raise ValueError(f"Could not parse quote source {email_id}: {error}") from error
+
+        return {
+            "from": email_data["from"],
+            "date": email_data["date"],
+            "body": email_data["body"],
+            "html_body": self._extract_html_body(email_message),
+        }
+
+    async def fetch_quote_source(
+        self,
+        message_id: str,
+        mailboxes: Sequence[str],
+        allowed_senders: list[str] | None = None,
+        service: str = "generic",
+    ) -> str | None:
+        """Read the message being replied to and format it as a quoted-reply block.
+
+        The mailboxes are tried in order inside a single IMAP session, because the
+        message being replied to is usually in INBOX but is in the Sent folder when
+        the account is following up on its own mail.
+
+        Not-found and unreadable are deliberately different outcomes. Returning None
+        means no mailbox holds the message, and the caller may go on to send an
+        unquoted reply. Every way of failing to read a message that IS there raises
+        instead, so a transport fault can never quietly turn a quoted reply into an
+        unquoted one.
+
+        Args:
+            message_id: Message-ID of the original, as passed in ``in_reply_to``.
+            mailboxes: Mailboxes to search, in priority order.
+            allowed_senders: Optional sender allowlist; a blocked sender's message is
+                treated as absent and its body is never fetched.
+            service: Quote markup shape ('protonmail', 'gmail', 'generic').
+
+        Returns:
+            The formatted HTML quote block, or None when the original was not found.
+
+        Raises:
+            ValueError: The message was found but could not be read or parsed.
+            RuntimeError: An IMAP command returned a non-OK status.
+        """
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            for mailbox in mailboxes:
+                original = await self._find_quote_source_in_mailbox(imap, mailbox, message_id, allowed_senders)
+                if original is not None:
+                    return _format_quoted_reply_html(original, service=service)
+            logger.debug("Original message not found for quoting")
+            return None
+        finally:
+            try:
+                await imap.logout()
+            except Exception:
+                logger.info("IMAP logout failed")
+
     def _validate_attachment(self, file_path: str) -> Path:
         """Validate attachment file path."""
         path = Path(file_path)
@@ -2370,6 +2612,18 @@ class EmailClient:
 
         return msg
 
+    def _apply_identification_headers(self, msg: Message) -> None:
+        """Add the configured de-facto sender-software identification headers.
+
+        Some providers reject a message that carries no identification at all, so
+        these default to the project name. Configuring either to an empty string
+        omits that header entirely, for a deployment that would rather send none.
+        """
+        if self.email_server.smtp_user_agent:
+            msg["User-Agent"] = self.email_server.smtp_user_agent
+        if self.email_server.smtp_x_mailer:
+            msg["X-Mailer"] = self.email_server.smtp_x_mailer
+
     def compose_message(
         self,
         recipients: list[str],
@@ -2389,7 +2643,8 @@ class EmailClient:
         """Compose an email message without sending it.
 
         Builds MIME structure, sets headers (Subject, From, To, Cc, Date,
-        Message-Id, User-Agent, X-Mailer, and threading headers). Synchronous — no I/O.
+        Message-Id, the configured identification headers, and threading headers).
+        Synchronous — no I/O.
 
         When ``include_bcc_header`` is True (used for local IMAP storage such
         as Drafts or Sent copies), the Bcc header is included so mail clients
@@ -2400,8 +2655,20 @@ class EmailClient:
         ``extra_parts`` carries already-built MIME parts (a forward's re-attached
         source parts) into the same multipart container as file attachments. It is
         keyword-only so existing positional call sites keep their meaning.
+
+        A body that is not already raw HTML is treated as Markdown and rendered to
+        an email-safe HTML document before the MIME container is built, so callers
+        get predictable formatting without having to write HTML. ``html=True`` means
+        "this body is already HTML" and suppresses the conversion; the resulting
+        part is UTF-8 ``text/html`` either way, which is the same shape the plain
+        branch produced, so RFC 6532 detection is unaffected (it inspects headers,
+        never the body).
         """
         envelope_sender = self.envelope_sender
+
+        if not html:
+            body = markdown_to_email_html(body, wrap_in_html=True)
+            html = True
 
         if attachments or extra_parts:
             msg = self._create_message_with_attachments(body, html, attachments, extra_parts)
@@ -2442,10 +2709,7 @@ class EmailClient:
         sender_domain = envelope_sender.rsplit("@", 1)[-1]
         msg["Message-Id"] = email.utils.make_msgid(domain=sender_domain)
 
-        # De-facto sender identification headers improve compatibility with
-        # providers that inspect sender-software identification.
-        msg["User-Agent"] = "mcp-email-server"
-        msg["X-Mailer"] = "mcp-email-server"
+        self._apply_identification_headers(msg)
 
         # Policy must follow every address-bearing and threading header, not
         # only the SMTP envelope sender. This also keeps later Sent/Draft
@@ -4083,6 +4347,32 @@ class ClassicEmailHandler(EmailHandler):
     async def _find_archive_folder(self) -> str | None:
         """Locate the Archive folder via the RFC 6154 ``\\Archive`` flag, then common names."""
         return await self._find_special_folder("archive")
+
+    async def quote_source_mailboxes(self) -> tuple[str, ...]:
+        """Mailboxes to search for the message a reply is quoting, in priority order.
+
+        INBOX first because a reply usually answers received mail, then the Sent
+        folder so an account following up on its own message still quotes it. A
+        Sent folder that cannot be resolved is simply not searched; failing the
+        lookup here would turn a routine reply into an error.
+        """
+        try:
+            sent_folder = await self._find_special_folder("sent")
+        except Exception as error:
+            logger.debug(f"Sent folder lookup failed while resolving quote sources: {error}")
+            sent_folder = None
+        if sent_folder is None or sent_folder == "INBOX":
+            return ("INBOX",)
+        return ("INBOX", sent_folder)
+
+    async def fetch_quote_source(self, message_id: str, allowed_senders: list[str] | None = None) -> str | None:
+        """Format the message identified by ``message_id`` as a quoted-reply block."""
+        return await self.incoming_client.fetch_quote_source(
+            message_id,
+            await self.quote_source_mailboxes(),
+            allowed_senders,
+            _detect_email_service(self.email_settings),
+        )
 
     async def archive_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str], str]:
         """Move emails to the auto-detected Archive folder. Returns (moved_ids, failed_ids, archive_folder)."""
