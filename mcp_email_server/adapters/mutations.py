@@ -31,6 +31,7 @@ from mcp_email_server.application.mutations import (
     MutationProviderAccess,
     MutationProviderError,
     MutationProviderPurpose,
+    RemoveLabelCommand,
     RenameFolderCommand,
     SaveToMailboxCommand,
     SendCommand,
@@ -197,6 +198,21 @@ class ClassicMutationProvider:
         del account
         return await self._mailbox_shape_effect(
             self._handler.incoming_client.rename_mailbox_with_outcome(command.old_name, command.new_name)
+        )
+
+    async def remove_label(
+        self,
+        command: RemoveLabelCommand,
+        account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome:
+        return await _bounded_mutation_call(
+            self._handler.incoming_client.remove_label_with_outcome(
+                list(command.email_ids),
+                command.label_mailbox,
+                command.source_mailbox,
+                list(account.allowed_senders),
+                account.report_blocked_mutations,
+            )
         )
 
     async def find_archive_mailbox(self, source_mailbox: str) -> str:

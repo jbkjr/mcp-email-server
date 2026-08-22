@@ -1450,6 +1450,164 @@ async def test_folder_operations_stdio_round_trip_against_greenmail(tmp_path: Pa
 
 
 # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+@pytest.mark.asyncio
+async def test_label_reads_and_removal_against_greenmail(tmp_path: Path) -> None:
+    """`Labels/` naming, Message-ID lookup, and label-scoped deletion over real IMAP.
+
+    GreenMail's hierarchy delimiter is `.`, but the ProtonMail convention this port
+    implements puts a literal `/` inside the mailbox *name*, not a hierarchy path.
+    GreenMail accepts `CREATE "Labels/<name>"` verbatim and `LIST "" "Labels/*"`
+    matches it, so this exercises the production naming path rather than a
+    delimiter-adapted stand-in. Applying a label is another cluster's tool, so the
+    label copy is seeded here with a raw APPEND of the message's own bytes.
+    """
+    _wait_until_ready()
+    _ensure_empty_mailboxes(BOB, ["INBOX"])
+
+    run_id = uuid.uuid4().hex[:8]
+    label_name = f"E2E-{run_id}"
+    label_mailbox = f"Labels/{label_name}"
+    labelled_subject = f"mcp-e2e-labelled-{run_id}"
+    plain_subject = f"mcp-e2e-unlabelled-{run_id}"
+
+    def _raw_message(mailbox: str, uid: str) -> bytes:
+        with _imap_session(BOB) as client:
+            status, _ = client.select(mailbox, readonly=True)
+            assert status == "OK"
+            status, fetched = client.uid("fetch", uid, "(BODY.PEEK[])")
+            assert status == "OK"
+            response = next((item for item in fetched if isinstance(item, tuple)), None)
+            assert response is not None
+            return response[1]
+
+    def _label_message_count() -> int:
+        """Count the label mailbox, always releasing it with CLOSE.
+
+        GreenMail wedges on DELETE of a mailbox that an earlier session selected
+        and then dropped without CLOSE, so every inspection of a mailbox this
+        test later deletes gives it back explicitly. The shared helpers do not
+        CLOSE, which is why this one is local.
+        """
+        with _imap_session(BOB) as client:
+            status, data = client.select(label_mailbox, readonly=True)
+            assert status == "OK", f"SELECT {label_mailbox} failed: {status}"
+            try:
+                return int(data[0])
+            finally:
+                client.close()
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(CONFIG_TEMPLATE)
+    config_path.chmod(0o600)
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_CREDENTIAL_STORAGE": "plaintext",
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+    })
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    assert console_script.is_file(), f"Installed console script not found: {console_script}"
+    server = StdioServerParameters(command=str(console_script), args=["stdio"], env=server_env, cwd=Path.cwd())
+
+    try:
+        with _imap_session(BOB) as client:
+            status, _ = client.create(f'"{label_mailbox}"')
+            assert status == "OK", f"CREATE {label_mailbox} failed: {status}"
+
+        _seed_message(labelled_subject, "This message carries a label")
+        _seed_message(plain_subject, "This message carries no label")
+        labelled = _wait_for_message(BOB, "INBOX", labelled_subject)
+        _wait_for_message(BOB, "INBOX", plain_subject)
+
+        # Seed the label's own copy the way a provider would: the identical bytes,
+        # so both copies share one Message-ID.
+        with _imap_session(BOB) as client:
+            status, _ = client.append(f'"{label_mailbox}"', None, None, _raw_message("INBOX", labelled.uid))
+            assert status == "OK", f"APPEND to {label_mailbox} failed: {status}"
+        assert _label_message_count() == 1
+
+        async with stdio_client(server) as (read_stream, write_stream):
+            async with ClientSession(
+                read_stream,
+                write_stream,
+                read_timeout_seconds=timedelta(seconds=15),
+            ) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                assert {"list_labels", "get_email_labels", "remove_label"} <= {tool.name for tool in tools.tools}
+
+                labels = await _call_tool(session, "list_labels", {"account_name": "bob"})
+                seeded = [label for label in labels["result"] if label["name"] == label_name]
+                assert len(seeded) == 1, labels
+                assert seeded[0]["full_path"] == label_mailbox
+                assert seeded[0]["delimiter"] == "."
+                assert isinstance(seeded[0]["flags"], list)
+                # The prefix is stripped and the bare container is never a label.
+                assert not any(label["name"].startswith("Labels/") for label in labels["result"])
+                assert all(label["name"] for label in labels["result"])
+
+                labelled_metadata = await _metadata_for_subject(session, "bob", labelled_subject)
+                plain_metadata = await _metadata_for_subject(session, "bob", plain_subject)
+
+                applied = await _call_tool(
+                    session,
+                    "get_email_labels",
+                    {"account_name": "bob", "email_id": labelled_metadata["email_id"], "mailbox": "INBOX"},
+                )
+                assert applied["result"] == [label_name]
+
+                unapplied = await _call_tool(
+                    session,
+                    "get_email_labels",
+                    {"account_name": "bob", "email_id": plain_metadata["email_id"], "mailbox": "INBOX"},
+                )
+                assert unapplied["result"] == []
+
+                removed = await _call_tool(
+                    session,
+                    "remove_label",
+                    {
+                        "account_name": "bob",
+                        "email_ids": [labelled_metadata["email_id"]],
+                        "label_name": label_name,
+                        "source_mailbox": "INBOX",
+                    },
+                )
+                assert removed["result"] == f"Successfully removed label '{label_name}' from 1 email(s)"
+
+                # Only the label's copy is gone: the message the caller named, and
+                # every unrelated message, stay exactly where they were.
+                assert _label_message_count() == 0
+                assert _find_message(BOB, "INBOX", labelled_subject) is not None
+                assert _find_message(BOB, "INBOX", plain_subject) is not None
+
+                after = await _call_tool(
+                    session,
+                    "get_email_labels",
+                    {"account_name": "bob", "email_id": labelled_metadata["email_id"], "mailbox": "INBOX"},
+                )
+                assert after["result"] == []
+
+                repeated = await _call_tool(
+                    session,
+                    "remove_label",
+                    {
+                        "account_name": "bob",
+                        "email_ids": [labelled_metadata["email_id"]],
+                        "label_name": label_name,
+                        "source_mailbox": "INBOX",
+                    },
+                )
+                assert "label-not-found" in repeated["result"]
+    finally:
+        with contextlib.suppress(Exception), _imap_session(BOB) as client:
+            # Release the mailbox from this session before removing it; a leftover
+            # run-scoped label is harmless if GreenMail still refuses the DELETE.
+            if client.select(f'"{label_mailbox}"')[0] == "OK":
+                client.close()
+            client.delete(f'"{label_mailbox}"')
+
+
 # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
 # port-slot C: send path (Markdown rendering, quoted replies)
 # port-slot B2: label writes (create_label, delete_label, apply_label)

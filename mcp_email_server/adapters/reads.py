@@ -19,6 +19,7 @@ from mcp_email_server.application.reads import (
     AttachmentPayload,
     DownloadAttachmentCommand,
     GetEmailContentQuery,
+    GetEmailLabelsQuery,
     ListMailboxesQuery,
     ReadAccountSnapshot,
     ReadProviderAccess,
@@ -52,6 +53,38 @@ class ClassicReadProvider:
             raise
         except Exception:
             raise ReadProviderError("provider_failure: mailbox discovery failed") from None
+
+    async def fetch_message_id(
+        self,
+        query: GetEmailLabelsQuery,
+        account: ReadAccountSnapshot,
+    ) -> str | None:
+        try:
+            return await self._handler.incoming_client.fetch_message_id(
+                query.email_id,
+                query.mailbox,
+                allowed_senders=list(account.allowed_senders),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ReadProviderError("provider_failure: message identifier lookup failed") from None
+
+    async def search_message_id_in_mailboxes(
+        self,
+        message_id: str,
+        mailboxes: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        try:
+            return await self._handler.incoming_client.search_message_id_in_mailboxes(message_id, mailboxes)
+        except asyncio.CancelledError:
+            raise
+        except ValueError:
+            # An unusable Message-ID is a caller-visible input problem, not a
+            # transport failure: keep it distinguishable from "no labels".
+            raise
+        except Exception:
+            raise ReadProviderError("provider_failure: label membership lookup failed") from None
 
     async def get_content(
         self,

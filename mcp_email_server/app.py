@@ -10,6 +10,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from mcp_email_server.application.accounts import AvailableAccount, EffectiveConfiguration
+from mcp_email_server.application.labels import MAXIMUM_LABEL_NAME_BYTES
 from mcp_email_server.application.limits import APPLICATION_LIMITS
 from mcp_email_server.application.metadata import ListEmailMetadataQuery
 from mcp_email_server.application.mutations import (
@@ -29,6 +30,7 @@ from mcp_email_server.application.mutations import (
     MoveCommand,
     MutableEmailFlag,
     RecipientPolicyDeniedError,
+    RemoveLabelCommand,
     RenameFolderCommand,
     SaveToMailboxCommand,
     SendCommand,
@@ -39,12 +41,15 @@ from mcp_email_server.application.mutations import (
 from mcp_email_server.application.reads import (
     DownloadAttachmentCommand,
     GetEmailContentQuery,
+    GetEmailLabelsQuery,
+    ListLabelsQuery,
     ListMailboxesQuery,
 )
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailContentBatchResponse,
     EmailMetadataPageResponse,
+    LabelInfo,
     MailboxInfo,
 )
 from mcp_email_server.runtime import close_application_runtime, get_application_runtime
@@ -475,8 +480,8 @@ async def list_allowed_recipients() -> PolicyDiscoveryResult:
         "List the configured inbound sender allowlist — the address patterns whose mail the server "
         "will read or act on. When configured, only these senders' mail is visible to the read tools "
         "(list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation "
-        "tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, copy_emails). "
-        "Returns an "
+        "tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, "
+        "copy_emails, remove_label). Returns an "
         "empty list "
         "when unrestricted."
     ),
@@ -1233,6 +1238,142 @@ async def rename_folder(
 
 
 # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
+LabelNameInput = Annotated[str, Field(max_length=MAXIMUM_LABEL_NAME_BYTES)]
+
+# Batch results never reveal a `failed` detail (see `_tagged_batch_result`), but a
+# label removal fails for reasons the caller can act on — the message carries no
+# Message-ID, or the label was simply not applied. These reviewed fixed tags are
+# the only detail text this tool may surface.
+_PUBLIC_LABEL_DETAILS = frozenset({
+    "expunge-not-attempted",
+    "expunge-rejected",
+    "expunge-unknown",
+    "label-not-found",
+    "label-search-failed",
+    "label-unavailable",
+    "message-id-missing",
+    "message-id-unsupported",
+    "not-attempted",
+    "provider-timeout",
+    "sender-policy",
+    "store-rejected",
+    "store-unknown",
+    "uidplus-unavailable",
+})
+
+
+def _tagged_label_result(outcome: BatchMutationOutcome) -> str:
+    sections = _ordered_target_sections(
+        outcome.outcomes,
+        detail_allowlist=_PUBLIC_LABEL_DETAILS,
+        include_failed_detail=True,
+        include_unknown_detail=True,
+    )
+    if outcome.reconciliation_needed:
+        sections.append("warning: reconciliation needed")
+    return "; ".join(sections)
+
+
+async def list_labels_query(query: ListLabelsQuery) -> list[LabelInfo]:
+    return await get_application_runtime().reads.labels.execute(query)
+
+
+async def get_email_labels_query(query: GetEmailLabelsQuery) -> list[str]:
+    return await get_application_runtime().reads.email_labels.execute(query)
+
+
+async def remove_label_command(command: RemoveLabelCommand) -> BatchMutationOutcome:
+    return await get_application_runtime().mutations.remove_label.execute(command)
+
+
+@mcp.tool(
+    description=(
+        "List the account's labels. A label is an ordinary IMAP mailbox stored under the literal "
+        "'Labels/' prefix, which is how ProtonMail and ProtonMail Bridge expose labels; accounts "
+        "without that convention return an empty list. Each entry reports the label name, the "
+        "mailbox that stores it, the hierarchy delimiter, and the mailbox flags."
+    ),
+    annotations=_READ_ONLY_REMOTE,
+)
+async def list_labels(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+) -> list[LabelInfo]:
+    return await list_labels_query(ListLabelsQuery(account_name=account_name))
+
+
+@mcp.tool(
+    description=(
+        "List the labels applied to one email. The message's Message-ID is read from its own mailbox "
+        "and then looked for in every label mailbox within a single IMAP session. Returns an empty "
+        "list when the message cannot be read, carries no Message-ID, or has no labels. A label "
+        "mailbox that cannot be searched is skipped, so the result reports the labels that could be "
+        "confirmed rather than failing outright."
+    ),
+    annotations=_READ_ONLY_REMOTE,
+)
+async def get_email_labels(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    email_id: Annotated[UidInput, Field(description="The email_id to inspect (from list_emails_metadata).")],
+    mailbox: Annotated[
+        str,
+        Field(
+            default="INBOX",
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The mailbox that contains the email.",
+        ),
+    ] = "INBOX",
+) -> list[str]:
+    return await get_email_labels_query(
+        GetEmailLabelsQuery(account_name=account_name, email_id=email_id, mailbox=mailbox)
+    )
+
+
+@mcp.tool(
+    description=(
+        "Remove one label from one or more emails. The label's own copy of each message is located "
+        "in the 'Labels/<label_name>' mailbox by Message-ID and deleted there with a target-scoped "
+        "UID EXPUNGE; the message in source_mailbox is never modified. Use list_labels and "
+        "list_emails_metadata first. Partial or ambiguous effects report per-ID "
+        "succeeded/failed/unknown status and are not retried automatically."
+    ),
+    annotations=_DESTRUCTIVE_REMOTE_MUTATION,
+)
+async def remove_label(
+    account_name: Annotated[
+        str, Field(max_length=APPLICATION_LIMITS.account_name_bytes, description="The name of the email account.")
+    ],
+    email_ids: Annotated[
+        list[UidInput],
+        Field(
+            min_length=1,
+            max_length=APPLICATION_LIMITS.mutation_uids,
+            description="List of email_id to remove the label from (obtained from list_emails_metadata).",
+        ),
+    ],
+    label_name: Annotated[
+        LabelNameInput,
+        Field(description="The label to remove, without the 'Labels/' prefix (obtained from list_labels)."),
+    ],
+    source_mailbox: Annotated[
+        str,
+        Field(
+            default="INBOX",
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="The mailbox that contains the emails.",
+        ),
+    ] = "INBOX",
+) -> str:
+    outcome = await remove_label_command(RemoveLabelCommand(account_name, tuple(email_ids), label_name, source_mailbox))
+    succeeded = outcome.targets("succeeded")
+    if len(succeeded) == len(email_ids) and not outcome.reconciliation_needed:
+        return f"Successfully removed label '{label_name}' from {len(succeeded)} email(s)"
+    return f"Remove-label result [{_tagged_label_result(outcome)}]"
+
+
 # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
 # port-slot C: send path (no new tools; send_email gains Markdown and quoted replies)
 # port-slot B2: label writes (create_label, delete_label, apply_label)

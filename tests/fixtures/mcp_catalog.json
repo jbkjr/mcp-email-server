@@ -713,7 +713,7 @@
         },
         {
             "name": "list_allowed_senders",
-            "description": "List the configured inbound sender allowlist — the address patterns whose mail the server will read or act on. When configured, only these senders' mail is visible to the read tools (list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, copy_emails). Returns an empty list when unrestricted.",
+            "description": "List the configured inbound sender allowlist — the address patterns whose mail the server will read or act on. When configured, only these senders' mail is visible to the read tools (list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, copy_emails, remove_label). Returns an empty list when unrestricted.",
             "inputSchema": {
                 "properties": {},
                 "title": "list_allowed_sendersArguments",
@@ -1821,6 +1821,182 @@
                 },
                 "required": ["result"],
                 "title": "rename_folderOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "list_labels",
+            "description": "List the account's labels. A label is an ordinary IMAP mailbox stored under the literal 'Labels/' prefix, which is how ProtonMail and ProtonMail Bridge expose labels; accounts without that convention return an empty list. Each entry reports the label name, the mailbox that stores it, the hierarchy delimiter, and the mailbox flags.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name"],
+                "title": "list_labelsArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "$defs": {
+                    "LabelInfo": {
+                        "description": "One ProtonMail-style label, derived from a mailbox under the `Labels/` prefix.\n\n`name` is the label as a user knows it; `full_path` is the mailbox that\nstores it, so mutation tools never have to re-derive the prefix.",
+                        "properties": {
+                            "name": {
+                                "title": "Name",
+                                "type": "string"
+                            },
+                            "full_path": {
+                                "title": "Full Path",
+                                "type": "string"
+                            },
+                            "delimiter": {
+                                "title": "Delimiter",
+                                "type": "string"
+                            },
+                            "flags": {
+                                "items": {
+                                    "type": "string"
+                                },
+                                "title": "Flags",
+                                "type": "array"
+                            }
+                        },
+                        "required": ["name", "full_path", "delimiter", "flags"],
+                        "title": "LabelInfo",
+                        "type": "object"
+                    }
+                },
+                "properties": {
+                    "result": {
+                        "items": {
+                            "$ref": "#/$defs/LabelInfo"
+                        },
+                        "title": "Result",
+                        "type": "array"
+                    }
+                },
+                "required": ["result"],
+                "title": "list_labelsOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "get_email_labels",
+            "description": "List the labels applied to one email. The message's Message-ID is read from its own mailbox and then looked for in every label mailbox within a single IMAP session. Returns an empty list when the message cannot be read, carries no Message-ID, or has no labels. A label mailbox that cannot be searched is skipped, so the result reports the labels that could be confirmed rather than failing outright.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "email_id": {
+                        "description": "The email_id to inspect (from list_emails_metadata).",
+                        "maxLength": 10,
+                        "pattern": "^[1-9][0-9]*$",
+                        "title": "Email Id",
+                        "type": "string"
+                    },
+                    "mailbox": {
+                        "default": "INBOX",
+                        "description": "The mailbox that contains the email.",
+                        "maxLength": 1024,
+                        "title": "Mailbox",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "email_id"],
+                "title": "get_email_labelsArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "items": {
+                            "type": "string"
+                        },
+                        "title": "Result",
+                        "type": "array"
+                    }
+                },
+                "required": ["result"],
+                "title": "get_email_labelsOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "remove_label",
+            "description": "Remove one label from one or more emails. The label's own copy of each message is located in the 'Labels/<label_name>' mailbox by Message-ID and deleted there with a target-scoped UID EXPUNGE; the message in source_mailbox is never modified. Use list_labels and list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "email_ids": {
+                        "description": "List of email_id to remove the label from (obtained from list_emails_metadata).",
+                        "items": {
+                            "maxLength": 10,
+                            "pattern": "^[1-9][0-9]*$",
+                            "type": "string"
+                        },
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Email Ids",
+                        "type": "array"
+                    },
+                    "label_name": {
+                        "description": "The label to remove, without the 'Labels/' prefix (obtained from list_labels).",
+                        "maxLength": 1017,
+                        "title": "Label Name",
+                        "type": "string"
+                    },
+                    "source_mailbox": {
+                        "default": "INBOX",
+                        "description": "The mailbox that contains the emails.",
+                        "maxLength": 1024,
+                        "title": "Source Mailbox",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "email_ids", "label_name"],
+                "title": "remove_labelArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "remove_labelOutput",
                 "type": "object"
             },
             "annotations": {

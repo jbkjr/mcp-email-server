@@ -515,6 +515,7 @@ The allowlist protects:
 - Attachment download.
 - Deletion and approved flag/read-state mutations.
 - Move and archive operations.
+- Label membership lookup and label removal.
 
 A blocked message's body and attachments are not fetched or marked as read. By
 default, blocked mutation IDs are returned as successful no-ops so the caller

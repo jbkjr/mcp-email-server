@@ -309,6 +309,26 @@ def _is_imap_astring(value: str) -> bool:
     )
 
 
+def _quoted_imap_message_id(message_id: str) -> str:
+    """Return one RFC 3501 quoted-string SEARCH value for a Message-ID.
+
+    The value is always quoted. Some servers reject an unquoted multi-word
+    search value outright, and quoting is the only form that reliably survives
+    the punctuation a Message-ID legitimately carries. Quoted-specials are
+    escaped rather than interpolated raw, so a Message-ID that contains ``"`` or
+    ``\\`` cannot close the string and append SEARCH keys of its own.
+    """
+    value = message_id.strip()
+    if not value:
+        raise ValueError("Message-ID must not be empty")
+    if not value.isascii() or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        # Anything outside printable ASCII would need a synchronizing literal,
+        # which this search path deliberately does not negotiate.
+        raise ValueError("Message-ID must be printable ASCII")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _validate_imap_uids(email_ids: list[str]) -> None:
     """Reject non-canonical UIDs before any low-level IMAP operation."""
 
@@ -789,6 +809,37 @@ async def _uid_search(
     if any(isinstance(token, _ImapSearchLiteral) for token in criteria):
         return await _uid_search_with_literals(imap, criteria)
     return await imap.uid_search(*(cast(str, token) for token in criteria), charset=None)
+
+
+def _iter_fetched_header_blocks(data: Sequence[Any]) -> Iterator[tuple[str, bytes]]:
+    """Yield ``(uid, raw header bytes)`` for each header block in a FETCH response.
+
+    aioimaplib reports the UID either on the line that introduces the literal or
+    on the line that closes it, so both placements are accepted; anything else is
+    skipped rather than guessed at.
+    """
+    for index, item in enumerate(data):
+        if not isinstance(item, bytes) or b"BODY[HEADER" not in item:
+            continue
+        if index + 1 >= len(data) or not isinstance(data[index + 1], bytearray):
+            continue
+        uid_match = re.search(rb"UID (\d+)", item)
+        if uid_match is None and index + 2 < len(data) and isinstance(data[index + 2], bytes):
+            uid_match = re.search(rb"UID (\d+)", data[index + 2])
+        if uid_match is None:
+            continue
+        yield uid_match.group(1).decode(), bytes(data[index + 1])
+
+
+async def _search_message_id_uids(
+    imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
+    quoted_message_id: str,
+) -> list[str]:
+    """Return every UID in the selected mailbox carrying one Message-ID."""
+    response = await _uid_search(imap, ["HEADER", "Message-ID", quoted_message_id])
+    _raise_for_imap_command_failure(response, "SEARCH Message-ID")
+    _, messages = response
+    return _normalize_search_uids(messages)
 
 
 async def _imap_login(
@@ -1549,6 +1600,49 @@ class EmailClient:
                     results[uid] = metadata
         return results
 
+    async def _batch_fetch_header_field(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_ids: list[bytes] | list[str],
+        *,
+        field: str,
+        metadata_key: str,
+        field_label: str,
+        chunk_size: int = 500,
+        header_budget: _MetadataHeaderBudget | None = None,
+    ) -> dict[str, str]:
+        """Batch fetch one header field for all UIDs (chunked, sequential).
+
+        Returns {uid: raw header value} for every UID whose fetched block carried
+        the field. Fetching a single ``HEADER.FIELDS`` entry keeps the response
+        light, and ``_parse_headers`` tolerates a one-field header block.
+        """
+        if not email_ids:
+            return {}
+
+        chunk_size = min(chunk_size, MAX_METADATA_HEADER_FETCH_UIDS)
+        chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
+        values: dict[str, str] = {}
+        budget = header_budget or _MetadataHeaderBudget()
+        partial = f"<0.{MAX_METADATA_HEADER_BYTES + 1}>"
+        for chunk in chunks:
+            str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in chunk]
+            uid_list = ",".join(str_ids)
+            fetch_response = await imap.uid("fetch", uid_list, f"BODY.PEEK[HEADER.FIELDS ({field})]{partial}")
+            _raise_for_imap_command_failure(fetch_response, f"FETCH {field_label} headers for {len(chunk)} UIDs")
+            _, data = fetch_response
+            for uid, raw_headers in _iter_fetched_header_blocks(data):
+                budget.add(raw_headers)
+                meta = self._parse_headers(uid, raw_headers)
+                if not meta:
+                    continue
+                value = meta.get(metadata_key)
+                # ``None`` means the field was absent; an empty string is a real
+                # header value and must stay distinguishable from a missing UID.
+                if value is not None:
+                    values[meta["email_id"]] = str(value)
+        return values
+
     async def _batch_fetch_senders(
         self,
         imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
@@ -1556,44 +1650,39 @@ class EmailClient:
         chunk_size: int = 500,
         header_budget: _MetadataHeaderBudget | None = None,
     ) -> dict[str, str]:
-        """Batch fetch the From header for all UIDs (chunked, sequential), for allowlist filtering.
+        """Batch fetch the From header for all UIDs, for allowlist filtering."""
+        return await self._batch_fetch_header_field(
+            imap,
+            email_ids,
+            field="FROM",
+            metadata_key="from",
+            field_label="From",
+            chunk_size=chunk_size,
+            header_budget=header_budget,
+        )
 
-        Returns {uid: raw From header}. Fetches only HEADER.FIELDS (FROM) to stay light and reuses
-        _parse_headers (which tolerates a From-only header block).
+    async def _batch_fetch_message_ids(
+        self,
+        imap: aioimaplib.IMAP4_SSL | aioimaplib.IMAP4,
+        email_ids: list[bytes] | list[str],
+        chunk_size: int = 500,
+        header_budget: _MetadataHeaderBudget | None = None,
+    ) -> dict[str, str]:
+        """Batch fetch the Message-ID header for all UIDs, for cross-mailbox lookup.
+
+        UIDs whose message carries no Message-ID are simply absent from the
+        result rather than mapped to an empty value, because an empty
+        Message-ID cannot locate anything.
         """
-        if not email_ids:
-            return {}
-
-        chunk_size = min(chunk_size, MAX_METADATA_HEADER_FETCH_UIDS)
-        chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
-        senders: dict[str, str] = {}
-        budget = header_budget or _MetadataHeaderBudget()
-        for chunk in chunks:
-            str_ids = [uid.decode() if isinstance(uid, bytes) else uid for uid in chunk]
-            uid_list = ",".join(str_ids)
-            partial = f"<0.{MAX_METADATA_HEADER_BYTES + 1}>"
-            fetch_response = await imap.uid("fetch", uid_list, f"BODY.PEEK[HEADER.FIELDS (FROM)]{partial}")
-            _raise_for_imap_command_failure(fetch_response, f"FETCH From headers for {len(chunk)} UIDs")
-            _, data = fetch_response
-            for i, item in enumerate(data):
-                if not isinstance(item, bytes) or b"BODY[HEADER" not in item:
-                    continue
-                uid_match = re.search(rb"UID (\d+)", item)
-                if uid_match and i + 1 < len(data) and isinstance(data[i + 1], bytearray):
-                    raw_headers = bytes(data[i + 1])
-                    budget.add(raw_headers)
-                    meta = self._parse_headers(uid_match.group(1).decode(), raw_headers)
-                    if meta:
-                        senders[meta["email_id"]] = meta["from"]
-                elif i + 2 < len(data) and isinstance(data[i + 1], bytearray):
-                    uid_after = re.search(rb"UID (\d+)", data[i + 2]) if isinstance(data[i + 2], bytes) else None
-                    if uid_after:
-                        raw_headers = bytes(data[i + 1])
-                        budget.add(raw_headers)
-                        meta = self._parse_headers(uid_after.group(1).decode(), raw_headers)
-                        if meta:
-                            senders[meta["email_id"]] = meta["from"]
-        return senders
+        return await self._batch_fetch_header_field(
+            imap,
+            email_ids,
+            field="MESSAGE-ID",
+            metadata_key="message_id",
+            field_label="Message-ID",
+            chunk_size=chunk_size,
+            header_budget=header_budget,
+        )
 
     async def _enforce_sender_allowlist(
         self,
@@ -3488,6 +3577,193 @@ class EmailClient:
             [email_id for email_id in email_ids if email_id in moved_set],
             [email_id for email_id in email_ids if email_id in failed_set],
         )
+
+    async def fetch_message_id(
+        self,
+        email_id: str,
+        mailbox: str = "INBOX",
+        allowed_senders: list[str] | None = None,
+    ) -> str | None:
+        """Return one message's Message-ID, or ``None`` when it cannot be used.
+
+        A blocked sender is indistinguishable from a missing message: both yield
+        ``None``, so the allowlist never reveals that a message exists. The
+        allowlist is evaluated before the header fetch.
+        """
+        _validate_imap_uids([email_id])
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            if await self._blocked_uids(imap, [email_id], allowed_senders):
+                return None
+            message_ids = await self._batch_fetch_message_ids(imap, [email_id])
+        finally:
+            await _best_effort_imap_logout(imap)
+        message_id = message_ids.get(email_id)
+        return message_id.strip() or None if message_id else None
+
+    async def search_message_id_in_mailboxes(
+        self,
+        message_id: str,
+        mailboxes: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Return the subset of *mailboxes* that hold a copy of one Message-ID.
+
+        All mailboxes are probed inside one IMAP session. A mailbox that cannot
+        be selected or searched is skipped rather than failing the lookup, so a
+        single stale folder cannot hide the labels that did resolve.
+        """
+        quoted = _quoted_imap_message_id(message_id)
+        if not mailboxes:
+            return ()
+        found: list[str] = []
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            for mailbox in mailboxes:
+                try:
+                    select_response = await imap.select(_quote_mailbox(mailbox))
+                    if _imap_status(select_response) != "OK":
+                        logger.debug(f"Skipping mailbox {mailbox}: SELECT was not accepted")
+                        continue
+                    if await _search_message_id_uids(imap, quoted):
+                        found.append(mailbox)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug(f"Skipping mailbox {mailbox}: {type(exc).__name__}")
+        finally:
+            await _best_effort_imap_logout(imap)
+        return tuple(found)
+
+    async def remove_label_with_outcome(  # noqa: C901 - explicit per-UID lookup and effect states
+        self,
+        email_ids: list[str],
+        label_mailbox: str,
+        source_mailbox: str = "INBOX",
+        allowed_senders: list[str] | None = None,
+        report_blocked_mutations: bool = False,
+    ) -> BatchMutationOutcome:
+        """Delete each message's copy from one label mailbox, leaving the source intact.
+
+        Message-IDs are read from *source_mailbox*, the matching copies are
+        located in *label_mailbox* by a quoted Message-ID search, and only those
+        UIDs are marked ``\\Deleted`` and expunged. Every effect is scoped to the
+        label mailbox: the message the caller named is never touched.
+        """
+        _validate_imap_uids(email_ids)
+        imap = await self._connect_imap()
+        outcomes: dict[str, TargetMutationOutcome] = {}
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            await _refresh_imap_capabilities(imap)
+            select_response = await imap.select(_quote_mailbox(source_mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {source_mailbox}")
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            permitted: list[str] = []
+            for email_id in email_ids:
+                if email_id in blocked:
+                    outcomes[email_id] = TargetMutationOutcome(
+                        email_id,
+                        "failed" if report_blocked_mutations else "succeeded",
+                        "sender-policy" if report_blocked_mutations else None,
+                    )
+                else:
+                    permitted.append(email_id)
+
+            # Phase 1 (source mailbox, reads only): resolve each permitted UID to
+            # a usable Message-ID.
+            message_ids = await self._batch_fetch_message_ids(imap, permitted) if permitted else {}
+            searchable: list[tuple[str, str]] = []
+            for email_id in permitted:
+                message_id = message_ids.get(email_id)
+                if not message_id or not message_id.strip():
+                    outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "message-id-missing")
+                    continue
+                try:
+                    quoted = _quoted_imap_message_id(message_id)
+                except ValueError:
+                    outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "message-id-unsupported")
+                    continue
+                searchable.append((email_id, quoted))
+
+            if searchable:
+                # Phase 2 (label mailbox, reads only): locate every copy before
+                # any flag is set, so cancellation here cannot strand a mutation.
+                label_select = await imap.select(_quote_mailbox(label_mailbox))
+                targets: list[tuple[str, list[str]]] = []
+                if _imap_status(label_select) != "OK":
+                    for email_id, _ in searchable:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "label-unavailable")
+                elif not _supports_uid_expunge(imap):
+                    for email_id, _ in searchable:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "uidplus-unavailable")
+                else:
+                    for email_id, quoted in searchable:
+                        try:
+                            label_uids = await _search_message_id_uids(imap, quoted)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "label-search-failed")
+                            continue
+                        if not label_uids:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "label-not-found")
+                            continue
+                        targets.append((email_id, label_uids))
+
+                # Phase 3 (label mailbox): scoped STORE, then one scoped UID EXPUNGE.
+                pending_expunge: dict[str, list[str]] = {}
+                store_cancelled = False
+                for index, (email_id, label_uids) in enumerate(targets):
+                    try:
+                        response = await imap.uid("store", ",".join(label_uids), "+FLAGS", r"(\Deleted)")
+                    except asyncio.CancelledError:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "store-unknown")
+                        for remaining_id, _ in targets[index + 1 :]:
+                            outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "not-attempted")
+                        for pending_id in pending_expunge:
+                            outcomes[pending_id] = TargetMutationOutcome(pending_id, "unknown", "expunge-not-attempted")
+                        store_cancelled = True
+                        break
+                    except Exception:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "store-unknown")
+                        continue
+                    store_status = _imap_effect_status(response)
+                    if store_status != "succeeded":
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id,
+                            store_status,
+                            "store-rejected" if store_status == "failed" else "store-unknown",
+                        )
+                        continue
+                    pending_expunge[email_id] = label_uids
+                if pending_expunge and not store_cancelled:
+                    expunge_detail = "expunge-unknown"
+                    expunge_uids = [uid for uids in pending_expunge.values() for uid in uids]
+                    try:
+                        response = await imap.uid("expunge", ",".join(expunge_uids))
+                    except asyncio.CancelledError:
+                        response = None
+                    except Exception:
+                        response = None
+                    else:
+                        if _imap_effect_status(response) == "failed":
+                            expunge_detail = "expunge-rejected"
+                    if response is not None and _imap_effect_status(response) == "succeeded":
+                        for email_id in pending_expunge:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "succeeded")
+                    else:
+                        for email_id in pending_expunge:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", expunge_detail)
+        finally:
+            await _best_effort_imap_logout(imap)
+        return BatchMutationOutcome(tuple(outcomes[email_id] for email_id in email_ids))
 
     async def list_mailboxes(self, pattern: str = "*", reference: str = "") -> list[MailboxInfo]:
         """List available IMAP mailboxes with flags and delimiter."""
