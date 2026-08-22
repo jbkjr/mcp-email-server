@@ -185,6 +185,12 @@ If a body extends beyond the requested window, the returned body ends with
 `...[TRUNCATED]`. Fetch the next chunk by increasing `body_offset` by
 `max_body_length`.
 
+Set `max_body_length` to `0` or `null` to disable truncation: the whole body from
+`body_offset` onward is returned and the `...[TRUNCATED]` marker is never
+appended. An untruncated body is still subject to the shared per-message and
+aggregate body byte ceilings, so an oversized message returns a bounded limit
+error for the request rather than a silently shortened body.
+
 The batch response reports requested and retrieved counts and includes
 `failed_ids` for messages that could not be fetched. A full-message literal from
 a successful IMAP FETCH is parsed regardless of its byte length; protocol
@@ -205,6 +211,14 @@ the body of an attached or forwarded `message/rfc822` message is never merged
 into the containing message body, even when that part has no filename. If one
 text part declares an unknown charset or contains invalid bytes, it falls back
 to UTF-8 replacement decoding without hiding the other readable parts.
+
+A message with no `text/plain` part has its HTML converted to plain text with the
+standard library's HTML parser. `script`, `style`, and `head` content is dropped;
+paragraphs, line breaks, headings, list markers, tab-separated table rows, and
+blockquote markers are preserved; and a link's target is appended after its text
+when it adds information. Anchor-only, `mailto:`, and `javascript:` targets are
+never surfaced, and the scheme is checked after removing embedded control
+characters. HTML email is never rendered or executed — the result is text.
 
 A request accepts 1 to 500 canonical positive decimal ASCII IMAP UIDs; zero,
 leading zero, non-ASCII digits, signs, ranges, sets, and values above the IMAP UID

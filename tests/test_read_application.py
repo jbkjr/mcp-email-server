@@ -287,11 +287,28 @@ async def test_mailbox_service_maps_query_and_preserves_provider_order() -> None
         (GetEmailContentQuery("work", ("01",)), "canonical positive"),
         (GetEmailContentQuery("work", tuple(str(uid) for uid in range(1, 502))), "between 1 and 500"),
         (GetEmailContentQuery("work", ("1",), max_body_length=100_001), "between 1 and 100000"),
+        (GetEmailContentQuery("work", ("1",), max_body_length=-1), "between 1 and 100000"),
+        (GetEmailContentQuery("work", ("1",), body_offset=-1), "must not be negative"),
     ],
 )
 def test_content_query_rejects_invalid_or_unbounded_input(query: GetEmailContentQuery, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         query.validate()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        GetEmailContentQuery("work", ("1",), max_body_length=0),
+        GetEmailContentQuery("work", ("1",), max_body_length=None),
+        GetEmailContentQuery("work", ("1",), max_body_length=0, body_offset=20_000),
+        GetEmailContentQuery("work", ("1",), max_body_length=1),
+        GetEmailContentQuery("work", ("1",), max_body_length=100_000),
+    ],
+)
+def test_content_query_accepts_unlimited_and_bounded_body_lengths(query: GetEmailContentQuery) -> None:
+    """0 and None request an untruncated body; explicit lengths keep the 1..100000 window."""
+    query.validate()
 
 
 @pytest.mark.parametrize(

@@ -60,7 +60,7 @@ class EmailHandler(abc.ABC):
         mailbox: str = "INBOX",
         mark_as_read: bool = False,
         body_offset: int = 0,
-        max_body_length: int = 20000,
+        max_body_length: int | None = 20000,
     ) -> "EmailContentBatchResponse":
         """
         Get full content (including body) of multiple emails by their email IDs (IMAP UIDs).
@@ -69,6 +69,7 @@ class EmailHandler(abc.ABC):
             body_offset: Character offset into each body to start reading from (for paging).
             max_body_length: Maximum number of body characters to return, counted from
                 body_offset. If more remains, the body ends with the '...[TRUNCATED]' marker.
+                0 or None returns the body from body_offset onward without truncation.
         """
 
     @abc.abstractmethod

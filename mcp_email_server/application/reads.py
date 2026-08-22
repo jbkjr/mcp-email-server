@@ -94,7 +94,9 @@ class GetEmailContentQuery:
     mailbox: str = "INBOX"
     mark_as_read: bool = False
     body_offset: int = 0
-    max_body_length: int = 20_000
+    # 0 or None requests the whole body from ``body_offset`` onward. The window is still
+    # bounded by the shared per-body and aggregate byte ceilings at the provider adapter.
+    max_body_length: int | None = 20_000
 
     def validate(self) -> None:
         _validate_account_name(self.account_name)
@@ -102,8 +104,8 @@ class GetEmailContentQuery:
         _validate_mailbox(self.mailbox)
         if self.body_offset < 0:
             raise ValueError("body_offset must not be negative")
-        if not 1 <= self.max_body_length <= 100_000:
-            raise ValueError("max_body_length must be between 1 and 100000")
+        if self.max_body_length is not None and not 0 <= self.max_body_length <= 100_000:
+            raise ValueError("max_body_length must be 0 (unlimited) or between 1 and 100000")
 
 
 @dataclass(frozen=True)
