@@ -406,6 +406,7 @@ class TestMcpTools:
             "mark_emails_as_read",
             "move_emails",
             "archive_emails",
+            "copy_emails",
         ):
             ids = tools[tool_name]["email_ids"]
             assert ids["maxItems"] == APPLICATION_LIMITS.mutation_uids
@@ -440,6 +441,14 @@ class TestMcpTools:
         # Port slots. Clusters porting fork tools onto this architecture in parallel all
         # extend this assertion block; each adds its limit assertions directly ABOVE its
         # own marker so the hunks stay non-overlapping. Order is fixed: A, B1, C, B2.
+        for tool_name, mailbox_fields in (
+            ("copy_emails", ("destination_mailbox", "source_mailbox")),
+            ("create_folder", ("folder_name",)),
+            ("delete_folder", ("folder_name",)),
+            ("rename_folder", ("old_name", "new_name")),
+        ):
+            for field in mailbox_fields:
+                assert tools[tool_name][field]["maxLength"] == APPLICATION_LIMITS.mailbox_bytes
         # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
         # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
         # port-slot C: send path (send_email Markdown and quoted-reply parameters)
@@ -1296,6 +1305,22 @@ async def test_tool_annotations_expose_agent_safety_and_retry_hints() -> None:
     }
     # Port slots for per-cluster annotation assertions; add each cluster's assertions
     # directly ABOVE its own marker and keep the catch-all below last.
+    for nondestructive in ("copy_emails", "create_folder"):
+        assert tools[nondestructive].annotations is not None
+        assert tools[nondestructive].annotations.model_dump(exclude_none=True) == {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        }
+    for destructive in ("delete_folder", "rename_folder"):
+        assert tools[destructive].annotations is not None
+        assert tools[destructive].annotations.model_dump(exclude_none=True) == {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        }
     # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
     # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
     # port-slot C: send path (no new tools)

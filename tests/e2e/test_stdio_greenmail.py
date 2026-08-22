@@ -1273,6 +1273,182 @@ async def test_unlimited_body_length_returns_whole_body_and_rejects_oversized_wi
 # function directly ABOVE its own marker rather than extending
 # `test_current_stdio_server_against_greenmail`, which is reserved for the
 # trash-first delete change. Slot order is fixed everywhere: A, B1, C, B2.
+def _hierarchy_delimiter(credentials: tuple[str, str]) -> str:
+    """Read the server's own hierarchy delimiter instead of assuming one.
+
+    GreenMail uses `.`, most other servers use `/`, and a nested folder name
+    built from the wrong one silently becomes a top-level folder.
+    """
+    with _imap_session(credentials) as client:
+        # imaplib splices arguments verbatim, so the empty reference must arrive quoted.
+        status, rows = client.list('""', "INBOX")
+        assert status == "OK", f"LIST INBOX failed: {status}"
+        for row in rows:
+            if isinstance(row, bytes) and b'"' in row:
+                # `(flags) "<delimiter>" "INBOX"` — the delimiter is the first quoted token.
+                return row.split(b'"')[1].decode()
+    pytest.fail(f"No hierarchy delimiter reported for INBOX: {rows!r}")
+
+
+def _mailbox_subjects(credentials: tuple[str, str], mailbox: str) -> set[str]:
+    """Read a mailbox's subjects and always CLOSE before logging out.
+
+    GreenMail keeps a mailbox busy when a session selects it and then
+    disconnects without CLOSE: a later DELETE of that mailbox never answers at
+    all. `_find_message` does not close, so a test that deletes the folder it
+    just inspected must use this helper instead.
+    """
+    with _imap_session(credentials) as client:
+        try:
+            status, _ = client.select(mailbox, readonly=True)
+            assert status == "OK", f"SELECT {mailbox} failed: {status}"
+            status, rows = client.uid("search", None, "ALL")
+            assert status == "OK", f"UID SEARCH in {mailbox} failed: {status}"
+            subjects: set[str] = set()
+            for uid in (rows[0] or b"").split():
+                status, fetched = client.uid("fetch", uid, "(BODY.PEEK[HEADER])")
+                assert status == "OK", f"UID FETCH {uid!r} in {mailbox} failed: {status}"
+                response = next((item for item in fetched if isinstance(item, tuple)), None)
+                assert response is not None
+                message = BytesParser(policy=policy.default).parsebytes(response[1])
+                subjects.add(str(message.get("Subject", "")))
+            return subjects
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+
+
+def _mailbox_exists(credentials: tuple[str, str], mailbox: str) -> bool:
+    with _imap_session(credentials) as client:
+        status, rows = client.list('""', f'"{mailbox}"')
+        assert status == "OK", f"LIST {mailbox} failed: {status}"
+        return any(isinstance(row, bytes) and row.strip() for row in rows)
+
+
+def _drop_mailboxes(credentials: tuple[str, str], mailboxes: list[str]) -> None:
+    with _imap_session(credentials) as client:
+        with contextlib.suppress(Exception):
+            client.close()
+        for mailbox in mailboxes:
+            with contextlib.suppress(Exception):
+                client.delete(mailbox)
+
+
+@pytest.mark.asyncio
+async def test_folder_operations_stdio_round_trip_against_greenmail(tmp_path: Path) -> None:
+    """create -> copy into -> rename -> delete through the MCP tools, plus the policy gate."""
+    _wait_until_ready()
+    _ensure_empty_mailboxes(BOB, ["INBOX"])
+
+    run_id = uuid.uuid4().hex[:12]
+    delimiter = _hierarchy_delimiter(BOB)
+    created_folder = f"mcp-folder-{run_id}"
+    # Built from the server's own delimiter: hard-coding `/` silently produces a
+    # top-level folder on a `.`-delimited server such as GreenMail.
+    child_folder = f"{created_folder}{delimiter}sub"
+    renamed_folder = f"mcp-folder-{run_id}-renamed"
+    copy_subject = f"mcp-e2e-copy-{run_id}"
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f"enable_folder_management = true\n{CONFIG_TEMPLATE}")
+    config_path.chmod(0o600)
+    base_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env = {
+        **base_env,
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_CREDENTIAL_STORAGE": "plaintext",
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+    }
+    console_script = Path(sys.executable).with_name("mcp-email-server")
+    assert console_script.is_file(), f"Installed console script not found: {console_script}"
+
+    def _server(env: dict[str, str]) -> StdioServerParameters:
+        return StdioServerParameters(command=str(console_script), args=["stdio"], env=env, cwd=Path.cwd())
+
+    try:
+        async with stdio_client(_server(server_env)) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream, read_timeout_seconds=timedelta(seconds=15)) as session:
+                await session.initialize()
+                tool_names = {tool.name for tool in (await session.list_tools()).tools}
+                assert {"copy_emails", "create_folder", "delete_folder", "rename_folder"} <= tool_names
+
+                created = await _call_tool(
+                    session, "create_folder", {"account_name": "bob", "folder_name": created_folder}
+                )
+                assert created["result"] == f"Folder '{created_folder}' created"
+                assert _mailbox_exists(BOB, created_folder)
+
+                child = await _call_tool(session, "create_folder", {"account_name": "bob", "folder_name": child_folder})
+                assert child["result"] == f"Folder '{child_folder}' created"
+                mailboxes = await _call_tool(session, "list_mailboxes", {"account_name": "bob"})
+                listed = {mailbox["name"]: mailbox for mailbox in mailboxes["result"]}
+                assert {created_folder, child_folder} <= listed.keys()
+                assert listed[child_folder]["delimiter"] == delimiter
+
+                _seed_message(copy_subject, f"Copy me into {created_folder}")
+                _wait_for_message(BOB, "INBOX", copy_subject)
+                metadata = await _metadata_for_subject(session, "bob", copy_subject)
+
+                copied = await _call_tool(
+                    session,
+                    "copy_emails",
+                    {
+                        "account_name": "bob",
+                        "email_ids": [metadata["email_id"]],
+                        "source_mailbox": "INBOX",
+                        "destination_mailbox": created_folder,
+                    },
+                )
+                assert copied["result"] == f"Successfully copied 1 email(s) to {created_folder}"
+                assert copy_subject in _mailbox_subjects(BOB, created_folder)
+                # A copy is additive: the source message must still be in INBOX.
+                assert _find_message(BOB, "INBOX", copy_subject) is not None
+
+                # Remove the child first: most servers refuse to delete a parent
+                # that still has children.
+                dropped_child = await _call_tool(
+                    session, "delete_folder", {"account_name": "bob", "folder_name": child_folder}
+                )
+                assert dropped_child["result"] == f"Folder '{child_folder}' deleted"
+                assert not _mailbox_exists(BOB, child_folder)
+
+                renamed = await _call_tool(
+                    session,
+                    "rename_folder",
+                    {"account_name": "bob", "old_name": created_folder, "new_name": renamed_folder},
+                )
+                assert renamed["result"] == f"Folder '{created_folder}' renamed to '{renamed_folder}'"
+                assert _mailbox_exists(BOB, renamed_folder)
+                # The copied message travels with the mailbox.
+                assert copy_subject in _mailbox_subjects(BOB, renamed_folder)
+
+                deleted = await _call_tool(
+                    session, "delete_folder", {"account_name": "bob", "folder_name": renamed_folder}
+                )
+                assert deleted["result"] == f"Folder '{renamed_folder}' deleted"
+                assert not _mailbox_exists(BOB, renamed_folder)
+
+        # A second server with the policy off must refuse the same shape mutation,
+        # while the ungated copy tool stays available.
+        gated_off_env = {**server_env, "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT": "false"}
+        async with stdio_client(_server(gated_off_env)) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream, read_timeout_seconds=timedelta(seconds=15)) as session:
+                await session.initialize()
+                tool_names = {tool.name for tool in (await session.list_tools()).tools}
+                # The tools stay visible; the denial is a runtime policy decision.
+                assert {"create_folder", "delete_folder", "rename_folder"} <= tool_names
+
+                denied = await session.call_tool(
+                    "create_folder",
+                    arguments={"account_name": "bob", "folder_name": f"{created_folder}-denied"},
+                )
+                assert denied.isError is True
+                assert "Folder management is disabled" in _text_content(denied)
+                assert not _mailbox_exists(BOB, f"{created_folder}-denied")
+    finally:
+        _drop_mailboxes(BOB, [child_folder, renamed_folder, created_folder, f"{created_folder}-denied"])
+
+
 # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
 # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
 # port-slot C: send path (Markdown rendering, quoted replies)

@@ -88,6 +88,30 @@ def _timeout_batch(targets: tuple[str, ...]) -> BatchMutationOutcome:
 
 
 @dataclass(frozen=True)
+class FolderMutationOutcome:
+    """Evidence for one mailbox-shape effect (create, delete, or rename).
+
+    A mailbox-shape mutation has a single target rather than a per-UID batch, so
+    it carries one status. The ``failed``/``unknown`` distinction is preserved
+    for the same reason the UID mutations preserve it: an explicit provider
+    rejection is safe to report as "nothing happened", while a lost or cancelled
+    response is not.
+    """
+
+    status: MutationStatus
+    detail: str | None = None
+    reconciliation_needed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.status == "unknown" and not self.reconciliation_needed:
+            object.__setattr__(self, "reconciliation_needed", True)
+
+
+def _timeout_folder() -> FolderMutationOutcome:
+    return FolderMutationOutcome("unknown", "provider-timeout", reconciliation_needed=True)
+
+
+@dataclass(frozen=True)
 class AppendMutationOutcome:
     status: MutationStatus
     message_id: str
@@ -200,6 +224,61 @@ class MoveCommand:
         )
         if self.source_mailbox == self.destination_mailbox or same_reserved_inbox:
             raise ValueError("source_mailbox and destination_mailbox must differ")
+
+
+@dataclass(frozen=True)
+class CopyCommand:
+    """Duplicate messages into another mailbox, leaving the source untouched.
+
+    Unlike :class:`MoveCommand` this deliberately allows the source and
+    destination to be the same mailbox: a copy is additive, so duplicating a
+    message inside its own mailbox is meaningful rather than a no-op mistake.
+    """
+
+    account_name: str
+    email_ids: tuple[str, ...]
+    source_mailbox: str
+    destination_mailbox: str
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        _validate_email_ids(self.email_ids)
+        validate_mailbox_name(self.source_mailbox)
+        validate_mailbox_name(self.destination_mailbox)
+
+
+@dataclass(frozen=True)
+class CreateFolderCommand:
+    account_name: str
+    folder_name: str
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        validate_mailbox_name(self.folder_name)
+
+
+@dataclass(frozen=True)
+class DeleteFolderCommand:
+    account_name: str
+    folder_name: str
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        validate_mailbox_name(self.folder_name)
+
+
+@dataclass(frozen=True)
+class RenameFolderCommand:
+    account_name: str
+    old_name: str
+    new_name: str
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        validate_mailbox_name(self.old_name)
+        validate_mailbox_name(self.new_name)
+        if self.old_name == self.new_name:
+            raise ValueError("old_name and new_name must differ")
 
 
 @dataclass(frozen=True)
@@ -375,6 +454,30 @@ class MutationProvider(Protocol):
     # module. Each cluster inserts its members directly ABOVE its own marker, so
     # two clusters touching this region produce non-overlapping hunks instead of a
     # conflict. Slot order is fixed everywhere it appears: A, B1, C, B2.
+    async def copy(
+        self,
+        command: CopyCommand,
+        account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome: ...
+
+    async def create_folder(
+        self,
+        command: CreateFolderCommand,
+        account: MutationAccountSnapshot,
+    ) -> FolderMutationOutcome: ...
+
+    async def delete_folder(
+        self,
+        command: DeleteFolderCommand,
+        account: MutationAccountSnapshot,
+    ) -> FolderMutationOutcome: ...
+
+    async def rename_folder(
+        self,
+        command: RenameFolderCommand,
+        account: MutationAccountSnapshot,
+    ) -> FolderMutationOutcome: ...
+
     # port-slot A: folder ops (copy_emails, create_folder, delete_folder, rename_folder)
     # port-slot B1: label reads (list_labels, get_email_labels, remove_label)
     # port-slot C: send path (Markdown bodies, quoted replies)
@@ -634,6 +737,18 @@ def _validate_batch_result(outcome: BatchMutationOutcome) -> BatchMutationOutcom
     _validate_target_outcomes(outcome.outcomes)
     _validate_result_payload({
         "outcomes": [_outcome_payload(item) for item in outcome.outcomes],
+        "reconciliation_needed": outcome.reconciliation_needed,
+    })
+    return outcome
+
+
+def _validate_folder_result(outcome: FolderMutationOutcome) -> FolderMutationOutcome:
+    if outcome.status not in ("succeeded", "failed", "unknown"):
+        raise _result_limit_error()
+    _validate_result_detail(outcome.detail)
+    _validate_result_payload({
+        "status": outcome.status,
+        "detail": outcome.detail,
         "reconciliation_needed": outcome.reconciliation_needed,
     })
     return outcome
@@ -1044,6 +1159,117 @@ class ForwardService(_MutationWorkflow):
 
 # Port slots for new mutation services. See the slot note in the MutationProvider
 # Protocol above; each cluster defines its service classes directly ABOVE its marker.
+class CopyService(_MutationWorkflow):
+    async def execute(self, command: CopyCommand) -> BatchMutationOutcome:
+        command.validate()
+        account = self._resolve(command.account_name)
+        access = self._open(account)
+        try:
+            outcome = _validate_batch_result(
+                await _bounded_provider_effect(access.provider.copy(command, access.account))
+            )
+        except TimeoutError:
+            outcome = _validate_batch_result(_timeout_batch(command.email_ids))
+        if not outcome.effect_may_have_started:
+            return outcome
+        # COPY never removes the source message, so only the destination
+        # projection can have gone stale.
+        invalidated = await self._invalidate(access.account, (command.destination_mailbox,))
+        return _validate_batch_result(
+            BatchMutationOutcome(
+                outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
+            )
+        )
+
+
+class _FolderShapeService(_MutationWorkflow):
+    """Shared authority gate and settlement for mailbox-shape mutations.
+
+    Creating, deleting, and renaming a mailbox change the account's folder
+    layout rather than individual messages, so they are gated behind the
+    operator-owned ``enable_folder_management`` policy. The gate is checked on
+    the pre-open snapshot and again on the opened account, mirroring
+    ``AttachmentDownloadService``: neither a stale snapshot nor a policy change
+    between resolution and provider construction may let the effect through.
+    """
+
+    _FOLDER_MANAGEMENT_DENIED = (
+        "Folder management is disabled. Set 'enable_folder_management=true' in settings "
+        "or set MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true to enable this feature."
+    )
+
+    @classmethod
+    def _require_folder_management(cls, account: MutationAccountSnapshot) -> None:
+        if not account.enable_folder_management:
+            raise PermissionError(cls._FOLDER_MANAGEMENT_DENIED)
+
+    def _authorize(self, account_name: str) -> MutationProviderAccess:
+        account = self._resolve(account_name)
+        self._require_folder_management(account)
+        # Re-resolve selected-mode authority immediately before the shape effect.
+        access = self._open(account)
+        self._require_folder_management(access.account)
+        return access
+
+    async def _settle(
+        self,
+        account: MutationAccountSnapshot,
+        outcome: FolderMutationOutcome,
+        mailboxes: tuple[str, ...],
+    ) -> FolderMutationOutcome:
+        if outcome.status not in ("succeeded", "unknown"):
+            return outcome
+        invalidated = await self._invalidate(account, mailboxes)
+        return _validate_folder_result(
+            FolderMutationOutcome(
+                outcome.status,
+                outcome.detail,
+                reconciliation_needed=outcome.reconciliation_needed or not invalidated,
+            )
+        )
+
+
+class CreateFolderService(_FolderShapeService):
+    async def execute(self, command: CreateFolderCommand) -> FolderMutationOutcome:
+        command.validate()
+        access = self._authorize(command.account_name)
+        try:
+            outcome = _validate_folder_result(
+                await _bounded_provider_effect(access.provider.create_folder(command, access.account))
+            )
+        except TimeoutError:
+            outcome = _validate_folder_result(_timeout_folder())
+        return await self._settle(access.account, outcome, (command.folder_name,))
+
+
+class DeleteFolderService(_FolderShapeService):
+    async def execute(self, command: DeleteFolderCommand) -> FolderMutationOutcome:
+        command.validate()
+        access = self._authorize(command.account_name)
+        try:
+            outcome = _validate_folder_result(
+                await _bounded_provider_effect(access.provider.delete_folder(command, access.account))
+            )
+        except TimeoutError:
+            outcome = _validate_folder_result(_timeout_folder())
+        return await self._settle(access.account, outcome, (command.folder_name,))
+
+
+class RenameFolderService(_FolderShapeService):
+    async def execute(self, command: RenameFolderCommand) -> FolderMutationOutcome:
+        command.validate()
+        access = self._authorize(command.account_name)
+        try:
+            outcome = _validate_folder_result(
+                await _bounded_provider_effect(access.provider.rename_folder(command, access.account))
+            )
+        except TimeoutError:
+            outcome = _validate_folder_result(_timeout_folder())
+        # A rename invalidates the projection for both spellings: messages leave
+        # the old mailbox and appear under the new one in the same effect.
+        return await self._settle(access.account, outcome, (command.old_name, command.new_name))
+
+
 # port-slot A: folder ops (CopyService, CreateFolderService, DeleteFolderService, RenameFolderService)
 # port-slot B1: label reads (RemoveLabelService)
 # port-slot C: send path (Markdown bodies, quoted replies — extends SendService in place)
@@ -1061,6 +1287,10 @@ class MutationServices:
     send: SendService
     forward: ForwardService
     # Port slots for new service fields; add each cluster's fields above its marker.
+    copy: CopyService
+    create_folder: CreateFolderService
+    delete_folder: DeleteFolderService
+    rename_folder: RenameFolderService
     # port-slot A: folder ops
     # port-slot B1: label reads
     # port-slot C: send path
@@ -1085,6 +1315,10 @@ class MutationServices:
             send=SendService(*arguments),
             forward=ForwardService(*arguments),
             # Port slots for new service construction; add each cluster's entries above its marker.
+            copy=CopyService(*arguments),
+            create_folder=CreateFolderService(*arguments),
+            delete_folder=DeleteFolderService(*arguments),
+            rename_folder=RenameFolderService(*arguments),
             # port-slot A: folder ops
             # port-slot B1: label reads
             # port-slot C: send path

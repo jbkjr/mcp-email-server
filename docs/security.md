@@ -563,6 +563,20 @@ by the account operator through TOML or
 `MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT`. Managed configuration carries no
 equivalent policy, so managed mode always resolves the flag to `false`.
 
+`create_folder`, `delete_folder`, and `rename_folder` are the gated tools. The
+flag is checked twice per call — once on the resolved account before any
+provider is constructed, and again on the opened account immediately before the
+effect — so a policy that changes between resolution and provider construction
+cannot let a mailbox-shape mutation through. A denial raises before the server
+opens an IMAP session, and the tools stay listed in the catalog so the refusal
+is a runtime policy decision rather than a change of surface.
+
+`copy_emails` is deliberately not gated: it duplicates messages between existing
+mailboxes without changing the folder layout, and it enforces the sender
+allowlist exactly as `move_emails` does. A blocked sender's UID is never copied;
+by default it is reported as a no-op success indistinguishable from a
+nonexistent UID.
+
 ## Attachment access
 
 Attachment downloads are disabled by default because the tool writes data from

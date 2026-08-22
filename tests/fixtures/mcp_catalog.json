@@ -713,7 +713,7 @@
         },
         {
             "name": "list_allowed_senders",
-            "description": "List the configured inbound sender allowlist — the address patterns whose mail the server will read or act on. When configured, only these senders' mail is visible to the read tools (list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails). Returns an empty list when unrestricted.",
+            "description": "List the configured inbound sender allowlist — the address patterns whose mail the server will read or act on. When configured, only these senders' mail is visible to the read tools (list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, copy_emails). Returns an empty list when unrestricted.",
             "inputSchema": {
                 "properties": {},
                 "title": "list_allowed_sendersArguments",
@@ -1632,6 +1632,195 @@
                     "saved_path"
                 ],
                 "title": "AttachmentDownloadResponse",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "copy_emails",
+            "description": "Copy one or more emails into another IMAP folder by email_id, leaving the originals in place. Use list_emails_metadata and list_mailboxes first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "email_ids": {
+                        "description": "List of email_id to copy (obtained from list_emails_metadata).",
+                        "items": {
+                            "maxLength": 10,
+                            "pattern": "^[1-9][0-9]*$",
+                            "type": "string"
+                        },
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Email Ids",
+                        "type": "array"
+                    },
+                    "destination_mailbox": {
+                        "description": "The destination mailbox/folder to copy emails into.",
+                        "maxLength": 1024,
+                        "title": "Destination Mailbox",
+                        "type": "string"
+                    },
+                    "source_mailbox": {
+                        "default": "INBOX",
+                        "description": "The source mailbox containing the emails.",
+                        "maxLength": 1024,
+                        "title": "Source Mailbox",
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "account_name",
+                    "email_ids",
+                    "destination_mailbox"
+                ],
+                "title": "copy_emailsArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "copy_emailsOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "create_folder",
+            "description": "Create a new IMAP folder/mailbox. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "folder_name": {
+                        "description": "The name of the folder to create. Use list_mailboxes to learn the hierarchy delimiter.",
+                        "maxLength": 1024,
+                        "title": "Folder Name",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "folder_name"],
+                "title": "create_folderArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "create_folderOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "delete_folder",
+            "description": "Delete an IMAP folder/mailbox. Most servers require the folder to be empty and refuse to delete a folder that still has children. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "folder_name": {
+                        "description": "The name of the folder to delete.",
+                        "maxLength": 1024,
+                        "title": "Folder Name",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "folder_name"],
+                "title": "delete_folderArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "delete_folderOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "rename_folder",
+            "description": "Rename an IMAP folder/mailbox, carrying its messages and child folders with it. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "old_name": {
+                        "description": "The current folder name.",
+                        "maxLength": 1024,
+                        "title": "Old Name",
+                        "type": "string"
+                    },
+                    "new_name": {
+                        "description": "The new folder name. It must differ from the current name.",
+                        "maxLength": 1024,
+                        "title": "New Name",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "old_name", "new_name"],
+                "title": "rename_folderArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "rename_folderOutput",
                 "type": "object"
             },
             "annotations": {
