@@ -261,6 +261,14 @@ _IMAP_CAPABILITY_TIMEOUT_SECONDS = 30.0
 # Common Archive folder names, used as a fallback when no RFC 6154 \Archive flag is found.
 _ARCHIVE_FOLDER_CANDIDATES = ("Archive", "Archives", "[Gmail]/All Mail")
 
+# RFC 6154 special-use folders resolvable by ``ClassicEmailHandler._find_special_folder``.
+# Each entry maps a kind to its special-use attribute (normalized: no leading
+# backslash, lowercased) and the ordered common-name fallbacks tried when no
+# mailbox advertises that attribute.
+_SPECIAL_FOLDER_KINDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "archive": ("archive", _ARCHIVE_FOLDER_CANDIDATES),
+}
+
 
 # RFC 3501 atoms exclude controls and these protocol-special characters.
 _IMAP_ATOM_SPECIALS = frozenset('(){%*]\\"')
@@ -3438,6 +3446,9 @@ class ClassicEmailHandler(EmailHandler):
         )
         self.save_to_sent = email_settings.save_to_sent
         self.sent_folder_name = email_settings.sent_folder_name
+        # Per-instance special-use folder resolutions. A present key with a None
+        # value is a cached "not found", so negative lookups avoid a repeat LIST.
+        self._special_folder_cache: dict[str, str | None] = {}
 
     async def get_emails_metadata(
         self,
@@ -3662,19 +3673,49 @@ class ClassicEmailHandler(EmailHandler):
             report_blocked_mutations=settings.report_blocked_mutations,
         )
 
+    async def _find_special_folder(self, kind: str) -> str | None:
+        """Locate an RFC 6154 special-use folder by attribute, then by common names.
+
+        ``kind`` selects an entry from :data:`_SPECIAL_FOLDER_KINDS`. Special-use
+        attribute matching is case-insensitive and exact once the leading backslash
+        is stripped, so an unrelated attribute that merely contains the name cannot
+        match. Common-name fallback is likewise case-insensitive but returns the
+        server's own spelling of the mailbox.
+
+        Resolutions are cached on this handler instance, negative results included,
+        so repeated lookups within one operation issue a single ``LIST``. A failed
+        ``LIST`` propagates and caches nothing. Callers that mutate the mailbox
+        hierarchy must call :meth:`_invalidate_special_folder_cache` afterwards.
+        """
+        if kind in self._special_folder_cache:
+            return self._special_folder_cache[kind]
+
+        special_use, candidates = _SPECIAL_FOLDER_KINDS[kind]
+        mailboxes = await self.incoming_client.list_mailboxes()
+
+        resolved: str | None = None
+        for mailbox_info in mailboxes:
+            if any(flag.lstrip("\\").lower() == special_use for flag in mailbox_info.flags):
+                resolved = mailbox_info.name
+                break
+        else:
+            names_by_lowercase = {mailbox_info.name.lower(): mailbox_info.name for mailbox_info in mailboxes}
+            for candidate in candidates:
+                match = names_by_lowercase.get(candidate.lower())
+                if match is not None:
+                    resolved = match
+                    break
+
+        self._special_folder_cache[kind] = resolved
+        return resolved
+
+    def _invalidate_special_folder_cache(self) -> None:
+        """Drop cached special-folder resolutions after a mailbox-hierarchy change."""
+        self._special_folder_cache.clear()
+
     async def _find_archive_folder(self) -> str | None:
         """Locate the Archive folder via the RFC 6154 ``\\Archive`` flag, then common names."""
-        mailboxes = await self.incoming_client.list_mailboxes()
-        for mailbox_info in mailboxes:
-            if any(flag.lstrip("\\").lower() == "archive" for flag in mailbox_info.flags):
-                return mailbox_info.name
-
-        names_by_lowercase = {mailbox_info.name.lower(): mailbox_info.name for mailbox_info in mailboxes}
-        for candidate in _ARCHIVE_FOLDER_CANDIDATES:
-            archive_folder = names_by_lowercase.get(candidate.lower())
-            if archive_folder is not None:
-                return archive_folder
-        return None
+        return await self._find_special_folder("archive")
 
     async def archive_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str], str]:
         """Move emails to the auto-detected Archive folder. Returns (moved_ids, failed_ids, archive_folder)."""
