@@ -383,6 +383,9 @@ MAX_QUOTED_BODY_LENGTH = 5000
 # Common Sent folder names, used as a fallback when no RFC 6154 \Sent flag is found.
 _SENT_FOLDER_CANDIDATES = ("Sent", "INBOX.Sent", "Sent Items", "Sent Mail", "[Gmail]/Sent Mail", "INBOX/Sent")
 
+# Common Trash folder names, used as a fallback when no RFC 6154 \Trash flag is found.
+_TRASH_FOLDER_CANDIDATES = ("Trash", "Deleted Items", "Deleted Messages", "[Gmail]/Trash", "INBOX.Trash")
+
 # RFC 6154 special-use folders resolvable by ``ClassicEmailHandler._find_special_folder``.
 # Each entry maps a kind to its special-use attribute (normalized: no leading
 # backslash, lowercased) and the ordered common-name fallbacks tried when no
@@ -390,6 +393,7 @@ _SENT_FOLDER_CANDIDATES = ("Sent", "INBOX.Sent", "Sent Items", "Sent Mail", "[Gm
 _SPECIAL_FOLDER_KINDS: dict[str, tuple[str, tuple[str, ...]]] = {
     "archive": ("archive", _ARCHIVE_FOLDER_CANDIDATES),
     "sent": ("sent", _SENT_FOLDER_CANDIDATES),
+    "trash": ("trash", _TRASH_FOLDER_CANDIDATES),
 }
 
 
@@ -4347,6 +4351,10 @@ class ClassicEmailHandler(EmailHandler):
     async def _find_archive_folder(self) -> str | None:
         """Locate the Archive folder via the RFC 6154 ``\\Archive`` flag, then common names."""
         return await self._find_special_folder("archive")
+
+    async def _find_trash_folder(self) -> str | None:
+        """Locate the Trash folder via the RFC 6154 ``\\Trash`` flag, then common names."""
+        return await self._find_special_folder("trash")
 
     async def quote_source_mailboxes(self) -> tuple[str, ...]:
         """Mailboxes to search for the message a reply is quoting, in priority order.

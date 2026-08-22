@@ -485,14 +485,23 @@ an explicit destination when the provider uses another name.
 
 ## Delete or move reports failures on an older IMAP server
 
-Message-scoped delete requires IMAP `UIDPLUS` and uses target-scoped
-`UID EXPUNGE`. It deliberately never falls back to mailbox-wide `EXPUNGE`,
-because that could remove unrelated messages already marked `\Deleted` by
-another client.
+`delete_emails` normally moves messages to the account's trash mailbox, so it
+needs whatever `move_emails` needs. Permanent deletion — no trash mailbox, or
+deleting from the trash mailbox itself — is message-scoped: it requires IMAP
+`UIDPLUS` and uses target-scoped `UID EXPUNGE`. It deliberately never falls back
+to mailbox-wide `EXPUNGE`, because that could remove unrelated messages already
+marked `\Deleted` by another client.
 
-When a server lacks both native `MOVE` and `UIDPLUS`, `move_emails` also rejects
-the COPY-and-delete fallback before copying. Use the provider's native client or
-upgrade/configure the server to support `MOVE` or `UIDPLUS`.
+When a server lacks both native `MOVE` and `UIDPLUS`, `move_emails` and the
+trash-first branch of `delete_emails` both reject the COPY-and-delete fallback
+before copying. Use the provider's native client or upgrade/configure the server
+to support `MOVE` or `UIDPLUS`.
+
+A `delete_emails` call that fails with a trash-mailbox discovery error means the
+mailbox listing itself did not complete. Nothing was deleted: an unresolved
+lookup is never treated as "this account has no trash mailbox", because that
+would silently turn a recoverable delete into a permanent one. Retry once the
+provider answers `LIST` again.
 
 ## A mutation result contains `unknown` or `reconciliation needed`
 

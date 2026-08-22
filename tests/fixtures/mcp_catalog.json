@@ -1186,7 +1186,7 @@
         },
         {
             "name": "delete_emails",
-            "description": "Delete one or more emails by email_id using target-scoped UID EXPUNGE. Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "description": "Delete one or more emails by email_id. Deletion is recoverable where the account allows it: the emails are moved to the Trash mailbox, auto-detected via the RFC 6154 \\Trash flag (falling back to common names like Trash, Deleted Items, or [Gmail]/Trash). When the account has no Trash mailbox, and when the emails are already in Trash, they are instead removed permanently using target-scoped UID EXPUNGE. The result says which happened. Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
             "inputSchema": {
                 "properties": {
                     "account_name": {

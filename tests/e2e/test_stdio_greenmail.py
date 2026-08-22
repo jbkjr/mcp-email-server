@@ -283,7 +283,9 @@ def _run_cli(console_script: Path, env: dict[str, str], arguments: list[str], *,
 async def test_managed_cli_setup_restart_and_stdio_list_mailboxes_against_greenmail(tmp_path: Path) -> None:
     """Prove CLI setup -> test -> restart -> live managed IMAP without catalog activation."""
     _wait_until_ready()
-    _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts", "Archive"])
+    # Trash is created up front so the trash-first delete below is exercised in
+    # managed mode regardless of which other tests have run against this server.
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts", "Archive", "Trash"])
     subject = f"managed-index-{uuid.uuid4().hex}"
     _seed_message_as(BOB, ALICE[0], subject, "Managed indexed metadata")
     _wait_for_message(ALICE, "INBOX", subject)
@@ -464,8 +466,11 @@ async def test_managed_cli_setup_restart_and_stdio_list_mailboxes_against_greenm
                     "mailbox": "Drafts",
                 },
             )
-            assert deleted["result"] == "Successfully deleted 1 email(s)"
+            # Managed mode takes the same trash-first branch, and the projection for
+            # the mailbox the message left is invalidated exactly as before.
+            assert deleted["result"] == "Successfully deleted 1 email(s) by moving them to Trash"
             assert _find_message(ALICE, "Drafts", draft_subject) is None
+            _wait_for_message(ALICE, "Trash", draft_subject)
             with contextlib.closing(sqlite3.connect(database)) as connection:
                 remaining = connection.execute(
                     """SELECT COUNT(*) FROM index_coverage c
@@ -821,8 +826,10 @@ async def test_metadata_index_paging_fallback_and_restart_reuse_against_greenmai
 async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
     """Exercise the current public MCP/CLI/config boundary against real mail sockets."""
     _wait_until_ready()
-    _ensure_empty_mailboxes(ALICE, ["INBOX", "Sent", "Drafts", "Archive"])
-    _ensure_empty_mailboxes(BOB, ["INBOX", "Drafts", "Archive"])
+    # Trash exists for both accounts, so `delete_emails` takes its trash-first branch
+    # here rather than depending on whichever mailboxes an earlier test happened to create.
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Sent", "Drafts", "Archive", "Trash"])
+    _ensure_empty_mailboxes(BOB, ["INBOX", "Drafts", "Archive", "Trash"])
 
     run_id = uuid.uuid4().hex
     sent_subject = f"mcp-e2e-send-{run_id}"
@@ -1120,11 +1127,14 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
                     "mailbox": "Drafts",
                 },
             )
-            assert delete_draft["result"] == "Successfully deleted 1 email(s)"
+            # Deleting is recoverable where the account allows it: the draft leaves
+            # Drafts and lands in Trash rather than being expunged out of existence.
+            assert delete_draft["result"] == "Successfully deleted 1 email(s) by moving them to Trash"
             assert _find_message(ALICE, "Drafts", draft_subject) is None
+            _wait_for_message(ALICE, "Trash", draft_subject)
 
             # Another IMAP client may already have left an unrelated message with
-            # \\Deleted set. A message-scoped MCP delete must expunge only its own
+            # \\Deleted set. A message-scoped MCP delete must move only its own
             # target rather than silently committing the other client's deletion.
             pending_subject = f"mcp-e2e-unrelated-pending-delete-{run_id}"
             delete_subject = f"mcp-e2e-scoped-delete-{run_id}"
@@ -1145,10 +1155,44 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
                     "mailbox": "INBOX",
                 },
             )
-            assert scoped_delete["result"] == "Successfully deleted 1 email(s)"
+            assert scoped_delete["result"] == "Successfully deleted 1 email(s) by moving them to Trash"
             assert _find_message(BOB, "INBOX", delete_subject) is None
+            _wait_for_message(BOB, "Trash", delete_subject)
             still_pending = _wait_for_message(BOB, "INBOX", pending_subject)
             assert r"\Deleted" in still_pending.flags
+
+            # Deleting from inside Trash has nowhere further to move to, so it is
+            # permanent — and permanent still means target-scoped UID EXPUNGE, which
+            # must not commit another client's pending deletion sitting beside it.
+            trash_pending_subject = f"mcp-e2e-trash-pending-{run_id}"
+            trash_purge_subject = f"mcp-e2e-trash-purge-{run_id}"
+            _seed_message(trash_pending_subject, "Pending deletion inside Trash")
+            _seed_message(trash_purge_subject, "Purge only this message from Trash")
+            for subject in (trash_pending_subject, trash_purge_subject):
+                _wait_for_message(BOB, "INBOX", subject)
+                metadata = await _metadata_for_subject(session, "bob", subject)
+                await _call_tool(
+                    session,
+                    "delete_emails",
+                    {"account_name": "bob", "email_ids": [metadata["email_id"]], "mailbox": "INBOX"},
+                )
+            trash_pending = _wait_for_message(BOB, "Trash", trash_pending_subject)
+            _wait_for_message(BOB, "Trash", trash_purge_subject)
+            _mark_deleted_without_expunge(BOB, "Trash", trash_pending.uid)
+            purge_metadata = await _metadata_for_subject_in_mailbox(session, "bob", "Trash", trash_purge_subject)
+
+            purged = await _call_tool(
+                session,
+                "delete_emails",
+                {
+                    "account_name": "bob",
+                    "email_ids": [purge_metadata["email_id"]],
+                    "mailbox": "Trash",
+                },
+            )
+            assert purged["result"] == "Successfully deleted 1 email(s) permanently"
+            assert _find_message(BOB, "Trash", trash_purge_subject) is None
+            assert r"\Deleted" in _wait_for_message(BOB, "Trash", trash_pending_subject).flags
 
             # Native MOVE must preserve the same unrelated pending deletion too.
             move_pending_subject = f"mcp-e2e-unrelated-pending-move-{run_id}"
@@ -1178,7 +1222,7 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
 
             mailboxes = await _call_tool(session, "list_mailboxes", {"account_name": "alice"})
             mailbox_names = {mailbox["name"] for mailbox in mailboxes["result"]}
-            assert {"INBOX", "Sent", "Drafts", "Archive"} <= mailbox_names
+            assert {"INBOX", "Sent", "Drafts", "Archive", "Trash"} <= mailbox_names
 
 
 @pytest.mark.asyncio

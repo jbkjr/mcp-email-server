@@ -26,6 +26,7 @@ from mcp_email_server.application.mutations import (
     DeleteCommand,
     DeleteFolderCommand,
     DeleteLabelCommand,
+    DeleteMutationOutcome,
     FlagOperation,
     FolderMutationOutcome,
     ForwardCommand,
@@ -92,7 +93,7 @@ async def save_to_mailbox_command(command: SaveToMailboxCommand) -> AppendMutati
     return await get_application_runtime().mutations.save_to_mailbox.execute(command)
 
 
-async def delete_emails_command(command: DeleteCommand) -> BatchMutationOutcome:
+async def delete_emails_command(command: DeleteCommand) -> DeleteMutationOutcome:
     return await get_application_runtime().mutations.delete.execute(command)
 
 
@@ -816,8 +817,12 @@ async def save_to_mailbox(
 
 @mcp.tool(
     description=(
-        "Delete one or more emails by email_id using target-scoped UID EXPUNGE. Use list_emails_metadata first. "
-        "Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically."
+        "Delete one or more emails by email_id. Deletion is recoverable where the account allows it: the emails "
+        "are moved to the Trash mailbox, auto-detected via the RFC 6154 \\Trash flag (falling back to common names "
+        "like Trash, Deleted Items, or [Gmail]/Trash). When the account has no Trash mailbox, and when the emails "
+        "are already in Trash, they are instead removed permanently using target-scoped UID EXPUNGE. The result "
+        "says which happened. Use list_emails_metadata first. Partial or ambiguous effects report per-ID "
+        "succeeded/failed/unknown status and are not retried automatically."
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -843,10 +848,15 @@ async def delete_emails(
     ] = "INBOX",
 ) -> str:
     outcome = await delete_emails_command(DeleteCommand(account_name, tuple(email_ids), mailbox))
-    succeeded = outcome.targets("succeeded")
-    if len(succeeded) == len(email_ids) and not outcome.reconciliation_needed:
-        return f"Successfully deleted {len(succeeded)} email(s)"
-    return f"Delete result [{_tagged_batch_result(outcome)}]"
+    succeeded = outcome.batch.targets("succeeded")
+    complete = len(succeeded) == len(email_ids) and not outcome.batch.reconciliation_needed
+    if outcome.trash_mailbox is None:
+        if complete:
+            return f"Successfully deleted {len(succeeded)} email(s) permanently"
+        return f"Delete result [{_tagged_batch_result(outcome.batch)}; permanent]"
+    if complete:
+        return f"Successfully deleted {len(succeeded)} email(s) by moving them to {outcome.trash_mailbox}"
+    return f"Delete result [{_tagged_batch_result(outcome.batch)}; mailbox: {outcome.trash_mailbox}]"
 
 
 @mcp.tool(

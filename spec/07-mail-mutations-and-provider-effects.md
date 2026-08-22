@@ -153,6 +153,24 @@ Bare mailbox-wide `EXPUNGE` is forbidden. If a provider lacks a safe scoped
 primitive, the operation rejects before marking any message deleted. It MUST NOT
 attempt an unsafe best effort.
 
+Delete selects between those strategies rather than fixing one. It first resolves
+the account's trash mailbox through the same special-use discovery that move and
+archive use. A trash mailbox distinct from the selected mailbox makes delete the
+move strategy, so the effect is recoverable and both mailbox projections are
+invalidated. Absence of a trash mailbox, and a selected mailbox that already is
+the trash mailbox, are the two authoritative answers that make delete the scoped
+expunge strategy; the latter is what makes emptying the trash actually empty it.
+
+Discovery is a read rather than an effect, but it is the read that decides
+whether the effect is reversible, so it is not permitted to fail open. Only an
+authoritative "no distinct trash mailbox" answer may reach the expunge strategy.
+A discovery that fails or exceeds its bound aborts the workflow before authority
+is re-resolved and before any message is touched, because an unresolved lookup
+carries no evidence that permanent removal is what the caller asked for. The
+result distinguishes the two strategies explicitly, naming the destination
+mailbox for a move and stating permanence otherwise, so a caller never has to
+infer which one ran.
+
 ## SMTP Delivery and Sent Copy
 
 The configured sender identity remains structured across protocol boundaries.
@@ -350,3 +368,14 @@ enter public errors.
     the sender allowlist and never modifies or removes the source message, that
     only the label mailbox is invalidated, and that results name the label rather
     than the mailbox derived from it.
+19. Delete resolves the trash mailbox before choosing its strategy, moving to a
+    distinct trash mailbox and expunging only when the account has none or the
+    selected mailbox already is it. Discovery runs as its own provider access with
+    authority re-resolved before the effect. Tests prove that a failed or timed-out
+    discovery aborts without deleting or moving anything rather than falling through
+    to permanent removal, that the move carries the same sender allowlist and
+    blocked-mutation policy as any other move, that the move invalidates both the
+    source and trash projections while permanent removal invalidates only the
+    source, that special-use matching accepts the `\Trash` attribute ahead of
+    case-insensitive common names and rejects lookalikes, and that the result
+    distinguishes a move to trash from a permanent deletion.

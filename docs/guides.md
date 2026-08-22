@@ -55,15 +55,24 @@ with an account whose provider permissions are read-only.
 
 ## Safe delete and move behavior
 
-Message-scoped deletion never uses mailbox-wide IMAP `EXPUNGE`, which would
-remove every message already marked `\Deleted`, including messages selected by
-another email client. The server uses `UID EXPUNGE` only when the provider
-advertises the RFC 4315 `UIDPLUS` capability.
+`delete_emails` is trash-first. When the account has a trash mailbox other than
+the one being deleted from, the messages are moved there and stay recoverable,
+and the result names the mailbox. Deletion is permanent only when the account
+has no trash mailbox at all, or when the selected mailbox is the trash mailbox
+itself; the result says so in those cases. See
+[`delete_emails`](tools.md#delete_emails) for how the trash mailbox is
+resolved.
 
-If a provider lacks `UIDPLUS`, `delete_emails` reports the requested messages as
-failed before changing their flags. When the provider also lacks native `MOVE`,
-`move_emails` rejects its COPY-and-delete fallback before copying anything. Use
-the provider's own client or an IMAP server that supports `MOVE` or `UIDPLUS`.
+Permanent deletion is message-scoped: it never uses mailbox-wide IMAP `EXPUNGE`,
+which would remove every message already marked `\Deleted`, including messages
+selected by another email client. The server uses `UID EXPUNGE` only when the
+provider advertises the RFC 4315 `UIDPLUS` capability.
+
+If a provider lacks `UIDPLUS`, a permanent `delete_emails` reports the requested
+messages as failed before changing their flags. When the provider also lacks
+native `MOVE`, both `move_emails` and a trash-first `delete_emails` reject the
+COPY-and-delete fallback before copying anything. Use the provider's own client
+or an IMAP server that supports `MOVE` or `UIDPLUS`.
 
 ## ProtonMail Bridge and self-signed TLS
 
