@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiosmtplib.email import flatten_message
 
+from mcp_email_server.application.limits import APPLICATION_LIMITS
 from mcp_email_server.config import EmailServer
 from mcp_email_server.emails.classic import (
     EmailClient,
@@ -1214,6 +1215,41 @@ class TestFetchForwardSource:
         assert result["subject"] == "Quarterly package"
 
     @pytest.mark.asyncio
+    async def test_long_body_is_returned_in_full_not_display_truncated(self, email_client):
+        """The read path's 20k display window must never decide what a forward carries."""
+        long_body = "x" * 30_000
+        raw_email = (
+            b"From: sender@example.com\r\n"
+            b"To: rcpt@example.com\r\n"
+            b"Subject: Long\r\n"
+            b"Date: Fri, 8 May 2026 19:17:09 +0200\r\n"
+            b"Content-Type: text/plain; charset=us-ascii\r\n"
+            b"\r\n" + long_body.encode("ascii")
+        )
+        result = await self._run(email_client, raw_email)
+
+        assert "...[TRUNCATED]" not in result["body"]
+        assert result["body"].endswith(long_body)
+
+    @pytest.mark.asyncio
+    async def test_parser_truncation_always_leaves_an_over_limit_body(self, email_client):
+        """A source body past the forward window must surface as over-limit, never shortened.
+
+        One character encodes to at least one UTF-8 byte, so the surviving window
+        still exceeds ``APPLICATION_LIMITS.body_bytes`` and application validation
+        rejects the forward instead of sending silently truncated content.
+        """
+        raw_email = (
+            b"From: sender@example.com\r\n"
+            b"Subject: Big\r\n"
+            b"Content-Type: text/plain; charset=us-ascii\r\n"
+            b"\r\n" + b"y" * (APPLICATION_LIMITS.body_bytes + 10)
+        )
+        result = await self._run(email_client, raw_email)
+
+        assert len(result["body"].encode("utf-8")) > APPLICATION_LIMITS.body_bytes
+
+    @pytest.mark.asyncio
     async def test_missing_date_header_falls_back_to_the_parsed_date(self, email_client):
         raw_email = MIMEText("no date here", "plain", "utf-8").as_bytes()
         result = await self._run(email_client, raw_email)
@@ -1364,8 +1400,14 @@ class TestComposeWithExtraParts:
         assert not message.is_multipart()
 
 
-class TestForwardSendEightBitGuard:
-    """A forwarded part is the only way raw 8-bit octets can reach compose output."""
+class TestForwardEightBitTransport:
+    """A forwarded part is the only way raw 8-bit octets can reach compose output.
+
+    Transport classification itself is shared ``send_email_with_outcome`` behavior;
+    these tests pin how re-attached 8-bit parts interact with it: the composed
+    container is labeled ``8bit`` so a correctly labeled source part rides
+    ``BODY=8BITMIME`` instead of being refused as a mislabeled composite.
+    """
 
     @staticmethod
     def _smtp(*, extensions: tuple[str, ...] = ()):
@@ -1423,7 +1465,7 @@ class TestForwardSendEightBitGuard:
 
     @pytest.mark.asyncio
     async def test_seven_bit_clean_forward_is_delivered_without_8bitmime(self, email_client):
-        """The six-part fixture is entirely base64/7bit, so the guard must not fire."""
+        """The six-part fixture is entirely base64/7bit, so no 8bit label or option appears."""
         _, normalized = _forward_source_parts(email_client)
         smtp = self._smtp()
         with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
@@ -1435,8 +1477,8 @@ class TestForwardSendEightBitGuard:
         assert smtp.data.await_args.args[0].isascii()
 
     @pytest.mark.asyncio
-    async def test_ordinary_send_is_unaffected_by_the_guard(self, email_client):
-        """Without extra_parts the guard is unreachable, so nothing regresses."""
+    async def test_ordinary_send_is_unaffected_by_forward_labeling(self, email_client):
+        """Without extra_parts everything composed is base64/QP, so nothing regresses."""
         smtp = self._smtp()
         with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
             outcome = await email_client.send_email_with_outcome(["dest@example.com"], "Grüße", "Grüße aus München")

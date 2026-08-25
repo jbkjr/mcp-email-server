@@ -1011,6 +1011,35 @@ async def test_forward_recipient_policy_denial_after_open_fails_before_retrieval
 
 
 @pytest.mark.asyncio
+async def test_forward_send_incapable_account_performs_no_provider_access() -> None:
+    # An IMAP-only account must be refused before the source message is logged
+    # into, downloaded, or parsed — not after a full source read.
+    provider = _forward_provider()
+    services, _, factory, _ = _services(account=_account(can_send=False), provider=provider)
+
+    with pytest.raises(MutationProviderError, match="SMTP is not configured"):
+        await services.forward.execute(_forward_command())
+
+    factory.open.assert_not_called()
+    provider.fetch_forward_source.assert_not_awaited()
+    provider.forward.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forward_send_capability_loss_after_open_fails_before_retrieval() -> None:
+    provider = _forward_provider()
+    services, _, factory, _ = _services(provider=provider)
+    factory.open.return_value = MutationProviderAccess(_account(can_send=False), provider)
+
+    with pytest.raises(MutationProviderError, match="SMTP is not configured"):
+        await services.forward.execute(_forward_command())
+
+    assert factory.open.call_count == 1
+    provider.fetch_forward_source.assert_not_awaited()
+    provider.forward.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_forward_recipient_policy_denial_before_delivery_fails_after_retrieval() -> None:
     provider = _forward_provider()
     services, _, factory, _ = _services(provider=provider)

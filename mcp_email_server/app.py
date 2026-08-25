@@ -132,7 +132,10 @@ def effective_configuration() -> EffectiveConfiguration:
 _PUBLIC_SEND_DETAILS = frozenset({
     "not-attempted",
     "provider-timeout",
+    "smtp-8bitmime-required",
+    "smtp-binarymime-unsupported",
     "smtp-cancelled-before-data",
+    "smtp-mime-transport-invalid",
     "smtp-data-rejected",
     "smtp-data-unknown",
     "smtp-mail-cancelled",
@@ -140,7 +143,6 @@ _PUBLIC_SEND_DETAILS = frozenset({
     "smtp-mail-unavailable",
     "smtp-recipient-rejected",
     "smtp-session-lost-before-data",
-    "smtp-8bitmime-required",
     "smtp-utf8-unsupported",
 })
 _PUBLIC_APPEND_DETAILS = frozenset({

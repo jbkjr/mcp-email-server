@@ -57,6 +57,10 @@ class MutationAccountSnapshot:
     # Legacy-mode-only gate for mailbox-shape mutations. Managed mode has no policy
     # column for it, so the managed authority path always resolves it to False.
     enable_folder_management: bool = False
+    # Non-secret capability evidence: whether the account has an outgoing binding.
+    # Lets submission workflows refuse before any provider I/O without resolving
+    # the outgoing secret; opening the outgoing provider remains the enforcement.
+    can_send: bool = True
 
 
 @dataclass(frozen=True)
@@ -1060,6 +1064,11 @@ class _MutationWorkflow:
         return _validate_send_result(SendMutationOutcome(delivery.outcomes, sent_copy, reconciliation_needed))
 
     @staticmethod
+    def _require_send_capability(account: MutationAccountSnapshot) -> None:
+        if not account.can_send:
+            raise MutationProviderError("capability_unavailable: SMTP is not configured for this account")
+
+    @staticmethod
     def _delivery_timeout(command: ComposeCommand) -> SendMutationOutcome:
         recipients = (*command.recipients, *command.cc, *command.bcc)
         return _validate_send_result(
@@ -1347,8 +1356,14 @@ class ForwardService(_MutationWorkflow):
     async def execute(self, command: ForwardCommand) -> SendMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        # A forward is a submission: refuse a send-incapable account before the
+        # source message is ever logged into, downloaded, or parsed. The flag is
+        # non-secret authority evidence, so the outgoing secret stays unresolved
+        # until the submission effect itself opens the outgoing provider.
+        self._require_send_capability(account)
         _validate_recipient_policy(command, account)
         incoming = self._open(account, purpose="incoming")
+        self._require_send_capability(incoming.account)
         _validate_recipient_policy(command, incoming.account)
         try:
             source = await _bounded_provider_effect(incoming.provider.fetch_forward_source(command, incoming.account))

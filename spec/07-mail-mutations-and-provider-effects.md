@@ -188,7 +188,32 @@ is serialized under the matching policy and `SMTPUTF8` is requested on `MAIL`;
 a provider without the extension returns the fixed `smtp-utf8-unsupported`
 failure before `MAIL`, `RCPT`, or `DATA`. A non-ASCII display name paired with an
 ASCII addr-spec remains an encoded RFC 5322 display name and does not alone
-require SMTPUTF8.
+require SMTPUTF8. RFC 6531 additionally requires an SMTPUTF8-aware server to
+advertise `8BITMIME` and an SMTPUTF8-aware client to request `BODY=8BITMIME`;
+missing 8BITMIME therefore returns `smtp-8bitmime-required` before `MAIL` even
+when the MIME body itself is otherwise 7-bit clean.
+
+The final serialized SMTP message is classified before `MAIL` according to the
+transport required by its body. Outside the RFC 6531 case above, a 7-bit-clean
+body uses ordinary `DATA` without requesting `BODY=8BITMIME`. Raw high-bit body
+octets require an advertised
+`8BITMIME` capability and `BODY=8BITMIME`; otherwise every target returns the
+fixed `smtp-8bitmime-required` failure before `MAIL`, `RCPT`, or `DATA`. A leaf
+that emits raw high-bit payload bytes without declaring the `8bit` MIME transfer
+encoding is malformed rather than eligible for capability-based transport; it
+returns `smtp-mime-transport-invalid` at the same pre-effect boundary. Composite
+`multipart` and `message` entities also reject transfer encodings other than
+`7bit`, `8bit`, or `binary`, and a composite entity carrying actual 8-bit child
+data must itself declare the `8bit` domain.
+
+`8BITMIME` does not make arbitrary binary content safe for the line-oriented
+`DATA` command. A MIME tree declaring `Content-Transfer-Encoding: binary`, or a
+serialized message containing NUL, bare line endings, or a line longer than the
+RFC 5321 limit, requires a binary submission path. This client does not implement
+`BINARYMIME` with `CHUNKING`/`BDAT`, so it returns the fixed
+`smtp-binarymime-unsupported` failure before `MAIL` even when the provider
+advertises those capabilities. The preflight does not silently rewrite MIME
+parts or attempt a recursive base64/quoted-printable downgrade.
 
 SMTP delivery and IMAP sent-copy APPEND are independent effects:
 
@@ -233,6 +258,12 @@ read and validation of current account lifecycle, capability, and policy:
 2. SMTP delivery of the newly composed message;
 3. the IMAP sent-copy APPEND described above.
 
+A forward is a submission: the workflow MUST reject an account without send
+capability before the source read performs any provider I/O. That precondition
+uses non-secret authority evidence (outgoing endpoint presence) so the outgoing
+secret is still resolved only by the SMTP delivery effect itself; opening the
+outgoing provider remains the enforcing boundary.
+
 The source read MUST complete successfully before an SMTP session is opened. A
 failed, denied, cancelled, or ambiguous source read aborts the workflow with no
 delivery attempt, because a forward delivered without the parts it was supposed
@@ -244,9 +275,15 @@ is not prefixed again when the source subject already carries that prefix in any
 letter case. Forwarded content is re-composed as a bounded plain-text block
 carrying the original's originator, recipient, date, and subject headers; it does
 not reproduce the source's HTML rendering, and it is bounded by the same compose
-body limits as other send input. Re-attached parts preserve their source MIME
-main type, subtype, and parameters rather than being coerced into
-`application/*`.
+body limits as other send input. The source body MUST be parsed with a window
+wider than the compose byte limit so that display-oriented parser truncation can
+never yield a sendable value: an over-limit source body is rejected by compose
+validation, never silently shortened. Re-attached parts preserve their source
+MIME main type, subtype, and parameters rather than being coerced into
+`application/*`; a re-attached part carrying correctly labeled raw 8-bit
+content widens the composed container's declared transfer-encoding domain to
+`8bit`, and transport acceptability is then decided by the shared SMTP DATA
+transport classification owned by the send boundary above.
 
 The source read is a mail read and is subject to the sender allowlist under the
 same privacy rule as every other read path: a blocked source is not
@@ -284,8 +321,10 @@ Mutation requests bound target count, address count/bytes, headers, body, total
 encoded bytes, mailbox names, and batch size. Results bound per-target details,
 warnings, provider-code normalization, and aggregate serialization. Public send
 results may include only reviewed fixed delivery-detail tags such as
-`smtp-mail-rejected`, `smtp-recipient-rejected`, or `provider-timeout` alongside
-the affected target. Unrecognized detail is omitted. Raw provider responses,
+`smtp-mail-rejected`, `smtp-recipient-rejected`, `smtp-8bitmime-required`,
+`smtp-binarymime-unsupported`, `smtp-mime-transport-invalid`, or
+`provider-timeout` alongside the affected
+target. Unrecognized detail is omitted. Raw provider responses,
 message content, credentials, stack traces, and uncontrolled local paths do not
 enter public errors.
 
@@ -317,12 +356,22 @@ enter public errors.
     SMTPUTF8 detection and pre-effect rejection, display-name downgrade without
     a false SMTPUTF8 requirement, pre-SELECT RFC 6855 negotiation, exact literal8
     APPEND framing, and abort/no-replay behavior at ambiguous framing boundaries.
-12. Forward executes source read, SMTP delivery, and sent copy as three
+12. Byte-level SMTP tests prove that ordinary 7-bit-clean messages do not
+    request `BODY=8BITMIME`, SMTPUTF8 messages require both advertised SMTPUTF8
+    and 8BITMIME plus both `MAIL` parameters, correctly labeled raw high-bit body
+    octets require an advertised `8BITMIME` capability, and mislabeled high-bit payloads, binary
+    transfer encoding, NUL, bare line endings, and overlong DATA lines fail
+    before `MAIL`, `RCPT`, or `DATA` without MIME
+    rewriting or automatic replay.
+13. Forward executes source read, SMTP delivery, and sent copy as three
     independent effects with authority revalidated before each. Tests prove that a
-    failed, denied, or allowlist-blocked source read aborts before any SMTP
-    session opens, that re-attached parts preserve source MIME type and
-    parameters, and that an existing `Fwd:` subject prefix is not duplicated.
-13. Mailbox-shape mutations are separated from message mutations. Copy applies the
+    send-incapable account performs no provider I/O, that a failed, denied, or
+    allowlist-blocked source read aborts before any SMTP session opens, that a
+    source body beyond the display parse window is forwarded in full or rejected
+    as over-limit rather than silently truncated, that re-attached parts preserve
+    source MIME type and parameters, and that an existing `Fwd:` subject prefix
+    is not duplicated.
+14. Mailbox-shape mutations are separated from message mutations. Copy applies the
     sender allowlist exactly as move does, never flags `\Deleted` or expunges, and
     invalidates only the destination projection. Create, delete, and rename are
     gated by `enable_folder_management` on the resolved account and again on the
@@ -332,33 +381,33 @@ enter public errors.
     resolutions on every attempt. Tests prove the pre-open and post-open denials,
     the timeout-to-`unknown` mapping, and that a lost response is never reported as
     a rejection.
-14. Label removal locates a message's copy in the label mailbox by `Message-ID`
+15. Label removal locates a message's copy in the label mailbox by `Message-ID`
     and scopes every flag change and expunge to that mailbox. Tests prove that
     the caller's own message is never modified, that the `Message-ID` reaches
     IMAP SEARCH as a quoted value with quoted-specials escaped rather than
     interpolated raw, that an allowlist-blocked message is indistinguishable
     from a missing one, that per-target failures carry only reviewed fixed
     detail tags, and that only the label mailbox is invalidated.
-15. Composition renders a caller-authored body from Markdown to email-safe HTML in
+16. Composition renders a caller-authored body from Markdown to email-safe HTML in
     one shared place, so every submission path inherits it, and an explicit raw-HTML
     body suppresses rendering. Quoted evidence carried from another message is
     escaped before rendering. Tests prove that rendering changes only the body
     part's subtype and never turns an ASCII-header message into one that requires
     SMTPUTF8, and that forwarded source markup is delivered literally.
-16. A reply reads the message it quotes before the outgoing provider is opened, and
+17. A reply reads the message it quotes before the outgoing provider is opened, and
     the read is a distinct effect with its own authority resolution. Tests prove
     that a source which no searched mailbox holds degrades to an unquoted send,
     that every other read failure — unreadable, unparseable, oversized, timed out —
     aborts before any SMTP session opens rather than sending unquoted, that an
     allowlist-blocked source is indistinguishable from an absent one, and that the
     body carrying the appended quote is revalidated against the body bound.
-17. Outgoing sender-software identification is configuration, not a constant: each
+18. Outgoing sender-software identification is configuration, not a constant: each
     identification header is separately configurable, an empty value omits that
     header, and the defaults carry no account-specific information. A value
     containing control characters is rejected when configuration loads, so a
     configured identifier cannot inject an additional header. Tests cover defaults,
     per-header override, omission, rejection, and TOML round-trip.
-18. Label writes own no provider primitive: creating and deleting a label are the
+19. Label writes own no provider primitive: creating and deleting a label are the
     mailbox-shape create and delete applied to `Labels/<label_name>`, and applying
     a label is the copy effect with that mailbox as its destination. Tests prove
     the label name is validated before authority is resolved and bounded so the
@@ -368,7 +417,7 @@ enter public errors.
     the sender allowlist and never modifies or removes the source message, that
     only the label mailbox is invalidated, and that results name the label rather
     than the mailbox derived from it.
-19. Delete resolves the trash mailbox before choosing its strategy, moving to a
+20. Delete resolves the trash mailbox before choosing its strategy, moving to a
     distinct trash mailbox and expunging only when the account has none or the
     selected mailbox already is it. Discovery runs as its own provider access with
     authority re-resolved before the effect. Tests prove that a failed or timed-out

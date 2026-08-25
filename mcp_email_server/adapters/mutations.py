@@ -426,6 +426,9 @@ class LocalMutationBackend:
                 enable_folder_management=(
                     resolved.settings.enable_folder_management if resolved.mode == "legacy" else False
                 ),
+                # Endpoint presence is authority metadata, not a secret: resolving
+                # it here does not read any outgoing credential.
+                can_send=resolved.account.can_send,
             ),
         )
 
