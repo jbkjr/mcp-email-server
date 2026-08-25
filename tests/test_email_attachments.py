@@ -1250,12 +1250,39 @@ class TestFetchForwardSource:
         assert len(result["body"].encode("utf-8")) > APPLICATION_LIMITS.body_bytes
 
     @pytest.mark.asyncio
-    async def test_missing_date_header_falls_back_to_the_parsed_date(self, email_client):
+    async def test_missing_date_header_omits_the_date_line(self, email_client):
+        """No fabricated provenance: absent source Date means no Date line at all."""
         raw_email = MIMEText("no date here", "plain", "utf-8").as_bytes()
         result = await self._run(email_client, raw_email)
 
-        assert result["date"]
-        assert f"Date: {result['date']}" in result["body"]
+        assert result["date"] == ""
+        assert "Date:" not in result["body"]
+
+    @pytest.mark.asyncio
+    async def test_root_attachment_is_stripped_to_content_headers(self, email_client):
+        """A single-part source whose root IS the attachment must not leak its envelope."""
+        raw_email = (
+            b"Received: from mx.example.com by mail.example.test; Fri, 8 May 2026 19:17:09 +0200\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: rcpt@example.com\r\n"
+            b"Bcc: hidden@example.com\r\n"
+            b"Subject: Scan\r\n"
+            b"Date: Fri, 8 May 2026 19:17:09 +0200\r\n"
+            b"Message-ID: <root-attach@example.com>\r\n"
+            b"Content-Type: application/pdf\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b'Content-Disposition: attachment; filename="scan.pdf"\r\n'
+            b"\r\n"
+            b"c2Nhbg==\r\n"
+        )
+        result = await self._run(email_client, raw_email)
+
+        assert len(result["parts"]) == 1
+        part_bytes = result["parts"][0].as_bytes()
+        for leaked in (b"Received:", b"From:", b"To:", b"Bcc:", b"Subject:", b"Message-ID:"):
+            assert leaked not in part_bytes
+        assert b'filename="scan.pdf"' in part_bytes
+        assert b"c2Nhbg==" in part_bytes
 
     @pytest.mark.asyncio
     async def test_blocked_sender_raises_before_the_body_is_fetched(self, email_client):

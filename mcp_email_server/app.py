@@ -188,6 +188,15 @@ def _tagged_batch_result(outcome: BatchMutationOutcome) -> str:
     return "; ".join(sections)
 
 
+def _send_outcome_is_clean(outcome: SendMutationOutcome) -> bool:
+    """One owner for "every effect succeeded" so send and forward cannot drift."""
+    return (
+        all(item.status == "succeeded" for item in outcome.delivery)
+        and outcome.sent_copy.status in ("succeeded", "skipped")
+        and not outcome.reconciliation_needed
+    )
+
+
 def _tagged_send_result(outcome: SendMutationOutcome) -> str:
     sections = _ordered_target_sections(
         outcome.delivery,
@@ -277,8 +286,9 @@ async def get_account(account_name: str) -> AvailableAccount | None:
 @mcp.tool(
     description=(
         "List configured accounts as stable non-secret capability records. Use only accounts with "
-        "can_receive=true for mail reads and can_send=true for send_email. If the result is empty, ask the "
-        "user to run `mcp-email-server ui` or the user-operated CLI; never ask for credentials in chat."
+        "can_receive=true for mail reads and can_send=true for send_email and forward_email. If the result is "
+        "empty, ask the user to run `mcp-email-server ui` or the user-operated CLI; never ask for credentials "
+        "in chat."
     ),
     annotations=_READ_ONLY_LOCAL,
 )
@@ -478,8 +488,9 @@ async def get_emails_content(
 
 @mcp.tool(
     description=(
-        "List the configured recipient allowlist — the addresses that send_email is permitted to "
-        "send to and save_to_mailbox is permitted to address. Returns an empty list when unrestricted."
+        "List the configured recipient allowlist — the addresses that send_email and forward_email are "
+        "permitted to send to and save_to_mailbox is permitted to address. Returns an empty list when "
+        "unrestricted."
     ),
     annotations=_READ_ONLY_LOCAL,
 )
@@ -491,7 +502,8 @@ async def list_allowed_recipients() -> PolicyDiscoveryResult:
     description=(
         "List the configured inbound sender allowlist — the address patterns whose mail the server "
         "will read or act on. When configured, only these senders' mail is visible to the read tools "
-        "(list_emails_metadata, get_emails_content, download_attachment) and eligible for the mutation "
+        "(list_emails_metadata, get_emails_content, download_attachment, and forward_email's source read) "
+        "and eligible for the mutation "
         "tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, "
         "copy_emails, apply_label, remove_label). Returns an "
         "empty list "
@@ -614,11 +626,7 @@ async def send_email(
         )
     except RecipientPolicyDeniedError as exc:
         raise ValueError("Recipient(s) not in allowlist") from exc
-    if (
-        all(item.status == "succeeded" for item in outcome.delivery)
-        and outcome.sent_copy.status in ("succeeded", "skipped")
-        and not outcome.reconciliation_needed
-    ):
+    if _send_outcome_is_clean(outcome):
         recipient_str = ", ".join(recipients)
         attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
         return f"Email sent successfully to {recipient_str}{attachment_info}"
@@ -701,11 +709,7 @@ async def forward_email(
         )
     except RecipientPolicyDeniedError as exc:
         raise ValueError("Recipient(s) not in allowlist") from exc
-    if (
-        all(item.status == "succeeded" for item in outcome.delivery)
-        and outcome.sent_copy.status in ("succeeded", "skipped")
-        and not outcome.reconciliation_needed
-    ):
+    if _send_outcome_is_clean(outcome):
         return f"Email forwarded successfully to {', '.join(recipients)}"
     return f"Email forward [{_tagged_send_result(outcome)}]"
 

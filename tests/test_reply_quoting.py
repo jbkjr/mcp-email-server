@@ -322,6 +322,7 @@ def _snapshot(allowed_senders: tuple[str, ...] = ()) -> MutationAccountSnapshot:
         allowed_senders=allowed_senders,
         allowed_recipients=(),
         report_blocked_mutations=False,
+        can_send=True,
     )
 
 

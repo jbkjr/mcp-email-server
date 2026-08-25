@@ -43,8 +43,8 @@ capability records. Each record contains `account_name`, `account_type`,
 descriptions are limited to 4 KiB of UTF-8 data and expose the same structural
 bound in the output schema. In managed mode, disabled accounts are omitted before any credential lookup or provider
 access. Use only an account with `can_receive=true` for mail reads and
-`can_send=true` for `send_email`. Text content, structured content, and the output
-schema describe the same fields.
+`can_send=true` for `send_email` and `forward_email`. Text content, structured
+content, and the output schema describe the same fields.
 
 If the result is empty, account setup is unavailable over MCP. The agent should
 ask the user to run `mcp-email-server ui` or the documented interactive CLI in
@@ -392,6 +392,17 @@ explicitly with `send_email`.
 Attachments carried into the forward keep the source part's MIME main type,
 subtype, and parameters instead of being coerced into `application/*`. Set
 `include_attachments=false` to forward only the text.
+
+Re-attached parts are bounded by the shared application limits: at most 20
+retained parts, 25 MiB per part, and 50 MiB in total, each measured on the
+serialized form the SMTP transaction actually carries. A source with more
+retained parts than the limit is rejected after the read; forward its text with
+`include_attachments=false` instead. Only parts the server classifies as
+attachments are re-attached — an inline part with no filename and no attachment
+disposition (for example a `Content-ID` image referenced by an HTML body) is
+not carried, matching what the metadata and content tools report as
+attachments. The quoting block reports the source's own Date header and omits
+the line entirely when the source has none.
 
 The tool is always present in the stable MCP catalog. The selected
 `account_name` must itself be enabled and send-capable; an IMAP-only account is

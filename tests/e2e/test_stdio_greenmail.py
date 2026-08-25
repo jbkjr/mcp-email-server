@@ -1003,6 +1003,12 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             assert forwarded_parts[0].get_filename() == forwarded_attachment_name
             assert forwarded_parts[0].get_payload(decode=True) == forwarded_attachment_bytes
 
+            # The source read is a pure peek: forwarding must not mark the
+            # source message as read.
+            source_after_forward = _find_message(ALICE, "INBOX", forward_source_subject)
+            assert source_after_forward is not None
+            assert r"\Seen" not in source_after_forward.flags
+
             forwarded_sent_copy = _wait_for_message(ALICE, "Sent", forwarded_subject)
             forwarded_sent_text = forwarded_sent_copy.message.get_body(preferencelist=("html",)).get_content()
             assert forward_note in forwarded_sent_text

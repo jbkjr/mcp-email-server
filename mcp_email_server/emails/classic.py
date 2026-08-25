@@ -235,20 +235,47 @@ def normalize_forwarded_part(part: Message) -> Message:
     Payload bytes are carried verbatim, including the two cases a naive truthiness check
     drops: a zero-byte attachment (``get_payload(decode=True)`` returns ``b""``) and a
     ``message/rfc822`` part (returns ``None``).
+
+    Known trade-off: the initial ``policy=default`` serialization re-folds any header
+    parameter a non-conformant source stored as raw 8-bit octets (an unencoded
+    ``filename="café.pdf"``) into RFC 2231 ``unknown-8bit`` form before the freeze.
+    That representation is standard-conformant and identical on every send path, but
+    it is not byte-identical to the source header; conformant RFC 2231/2047
+    parameters round-trip untouched.
     """
     return BytesParser(policy=compat32).parsebytes(part.as_bytes())
 
 
+def _strip_to_content_headers(part: Message) -> Message:
+    """Return a compat32 copy of one part carrying only its MIME content headers.
+
+    A single-part source whose top level IS the attachment (root Content-Disposition:
+    attachment) would otherwise be re-attached whole — envelope headers included —
+    leaking the source's Received/DKIM/Message-ID chain, and the Bcc header a Sent-copy
+    source carries, into the outgoing forward as a malformed body part.
+    """
+    clone = BytesParser(policy=compat32).parsebytes(part.as_bytes())
+    for name in list(clone.keys()):
+        if not name.lower().startswith("content-"):
+            del clone[name]
+    return clone
+
+
 def _format_forwarded_text(sender: str, recipients: Sequence[str], date: str, subject: str, body: str) -> str:
-    """Build the plain-text forwarded-message block quoted below the caller's note."""
+    """Build the plain-text forwarded-message block quoted below the caller's note.
+
+    An empty ``date`` omits the line: a source without a Date header must not have
+    a composed-at timestamp fabricated as its provenance.
+    """
     header = (
         "---------- Forwarded message ----------\n"
         f"From: {sender}\n"
         # Neutral label: the parsed recipient list folds in Cc, so "To:" would mislead.
         f"Recipients: {', '.join(recipients)}\n"
-        f"Date: {date}\n"
-        f"Subject: {subject}\n"
     )
+    if date:
+        header += f"Date: {date}\n"
+    header += f"Subject: {subject}\n"
     return f"{header}\n{body}"
 
 
@@ -1497,10 +1524,14 @@ class EmailClient:
         email_id: str | None = None,
         body_offset: int = 0,
         max_body_length: int | None = MAX_BODY_LENGTH,
+        parsed: Message | None = None,
     ) -> dict[str, Any]:
-        """Parse raw email data into a structured dictionary."""
-        parser = BytesParser(policy=default)
-        email_message = parser.parsebytes(raw_email)
+        """Parse raw email data into a structured dictionary.
+
+        ``parsed`` lets a caller that already holds the ``policy=default`` parse of
+        ``raw_email`` share it instead of paying a second full parse.
+        """
+        email_message = parsed if parsed is not None else BytesParser(policy=default).parsebytes(raw_email)
 
         # Extract email parts
         subject = email_message.get("Subject", "")
@@ -2454,14 +2485,21 @@ class EmailClient:
                 raise ValueError("Email exceeds the raw message size limit")
 
             try:
+                email_message = BytesParser(policy=default).parsebytes(raw_email)
                 # The read-path 20k display window must not decide what a forward
                 # carries: parse past the compose byte limit so the application
                 # layer's body validation stays authoritative for oversize.
-                email_data = self._parse_email_data(raw_email, email_id, max_body_length=FORWARD_SOURCE_BODY_WINDOW)
-                email_message = BytesParser(policy=default).parsebytes(raw_email)
+                email_data = self._parse_email_data(
+                    raw_email,
+                    email_id,
+                    max_body_length=FORWARD_SOURCE_BODY_WINDOW,
+                    parsed=email_message,
+                )
             except Exception as error:
-                msg = f"Could not parse email {email_id} for forwarding: {error}"
-                logger.error(msg)
+                # The public message stays fixed-shape: parser exception text can
+                # embed fragments of the offending header or payload.
+                logger.error(f"Could not parse email {email_id} for forwarding: {error}")
+                msg = f"Could not parse email {email_id} for forwarding"
                 raise ValueError(msg) from error
 
             # Collect attachment roots without descending into them, so a nested
@@ -2469,16 +2507,23 @@ class EmailClient:
             # carried across whole instead of being flattened into its leaves.
             parts: list[Message] = []
             if include_attachments:
+                # A root that is itself the attachment is stripped to its content
+                # headers so the source's envelope block never rides along.
                 parts = [
-                    normalize_forwarded_part(part)
+                    _strip_to_content_headers(part) if part is email_message else normalize_forwarded_part(part)
                     for part, is_attachment in self._iter_content_parts(email_message)
                     if is_attachment
                 ]
 
             recipients = email_data["to"]
-            date = _first_thread_header(email_message, "Date") or email.utils.format_datetime(email_data["date"])
+            # No fabricated provenance: a source without a Date header yields an
+            # empty date and the quoting block omits the line entirely.
+            date = _first_thread_header(email_message, "Date") or ""
             return {
-                "subject": email_data["subject"],
+                # The policy=default Subject is a structured header object (a str
+                # subclass); coerce so both derived-subject branches downstream
+                # carry a plain str with uniform folding behavior.
+                "subject": str(email_data["subject"]),
                 "from": email_data["from"],
                 "recipients": recipients,
                 "date": date,
@@ -2690,12 +2735,14 @@ class EmailClient:
         # the caller's own files.
         for part in extra_parts or []:
             msg.attach(part)
-        if any(not part.as_bytes().isascii() for part in extra_parts or []):
+        if any(_classify_mime_entity_transport(part) == "8bit" for part in extra_parts or []):
             # RFC 2045 §6.4: a composite entity whose contents include raw 8-bit
             # octets must itself declare the 8bit domain. Everything composed here
             # is base64/quoted-printable, so only a verbatim forwarded part can
-            # widen the domain; without this label the transport classifier would
-            # refuse the message as mislabeled instead of using BODY=8BITMIME.
+            # widen the domain; without this label the shared transport classifier
+            # would refuse the message as mislabeled instead of using BODY=8BITMIME.
+            # Deriving the label from that same classifier keeps the two rules
+            # from ever disagreeing, without re-serializing any part.
             msg["Content-Transfer-Encoding"] = "8bit"
 
         return msg

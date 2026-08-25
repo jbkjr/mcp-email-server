@@ -47,8 +47,9 @@ Or configure one through environment variables without
 }
 ```
 
-`send_email` remains in the static MCP tool list, but calling it for this
-account fails its SMTP capability check before provider access. IMAP mutation
+`send_email` and `forward_email` remain in the static MCP tool list, but
+calling either for this account fails its SMTP capability check before provider
+access — for a forward, before the source message is read. IMAP mutation
 tools remain available, so this is not a strict read-only mode. To limit
 mutations, also constrain which MCP tools the client may call or run the server
 with an account whose provider permissions are read-only.

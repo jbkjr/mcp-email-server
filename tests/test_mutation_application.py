@@ -47,6 +47,7 @@ def _account(**changes: object) -> MutationAccountSnapshot:
         allowed_senders=(),
         allowed_recipients=(),
         report_blocked_mutations=False,
+        can_send=True,
     )
     return replace(account, **changes)
 
@@ -703,22 +704,14 @@ async def test_sent_copy_timeout_preserves_delivery_and_is_unknown(monkeypatch) 
 def _forward_source(**changes: object) -> ForwardSource:
     source = ForwardSource(
         subject="Quarterly report",
-        sender="author@example.test",
-        recipients=("original@example.test",),
-        date="Mon, 03 Feb 2025 09:00:00 +0000",
         body_text="---------- Forwarded message ----------\nFrom: author@example.test\n\noriginal body",
         parts=(),
     )
     return replace(source, **changes)
 
 
-def _part(byte_size: int, *, filename: str = "report.pdf") -> ForwardSourcePart:
-    return ForwardSourcePart(
-        content_type="application/pdf",
-        filename=filename,
-        byte_size=byte_size,
-        raw_part=object(),
-    )
+def _part(byte_size: int) -> ForwardSourcePart:
+    return ForwardSourcePart(byte_size=byte_size, raw_part=object())
 
 
 def _forward_command(**changes: object) -> ForwardCommand:
@@ -876,15 +869,15 @@ async def test_forward_source_timeout_raises_instead_of_producing_an_outcome(mon
     ("parts", "message"),
     [
         (
-            tuple(_part(1, filename=f"part-{index}.pdf") for index in range(APPLICATION_LIMITS.attachments + 1)),
+            tuple(_part(1) for index in range(APPLICATION_LIMITS.attachments + 1)),
             "at most",
         ),
         ((_part(APPLICATION_LIMITS.attachment_bytes + 1),), "a forwarded part exceeds"),
         (
             (
-                _part(APPLICATION_LIMITS.attachment_bytes, filename="one.pdf"),
-                _part(APPLICATION_LIMITS.attachment_bytes, filename="two.pdf"),
-                _part(1, filename="three.pdf"),
+                _part(APPLICATION_LIMITS.attachment_bytes),
+                _part(APPLICATION_LIMITS.attachment_bytes),
+                _part(1),
             ),
             "bytes in total",
         ),
@@ -908,8 +901,8 @@ async def test_forward_rejects_out_of_bound_parts_before_any_delivery(
 @pytest.mark.asyncio
 async def test_forward_accepts_parts_at_the_aggregate_boundary() -> None:
     parts = (
-        _part(APPLICATION_LIMITS.attachment_bytes, filename="one.pdf"),
-        _part(APPLICATION_LIMITS.total_attachment_bytes - APPLICATION_LIMITS.attachment_bytes, filename="two.pdf"),
+        _part(APPLICATION_LIMITS.attachment_bytes),
+        _part(APPLICATION_LIMITS.total_attachment_bytes - APPLICATION_LIMITS.attachment_bytes),
     )
     provider = _forward_provider(source=_forward_source(parts=parts))
     services, _, _, _ = _services(provider=provider)
@@ -1007,6 +1000,49 @@ async def test_forward_recipient_policy_denial_after_open_fails_before_retrieval
 
     assert factory.open.call_count == 1
     provider.fetch_forward_source.assert_not_awaited()
+    provider.forward.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"subject": "URGENT: contract"}, "forward subject is derived"),
+        ({"html": True}, "composed as plain text"),
+        ({"attachments": ("extra.pdf",)}, "does not accept caller attachments"),
+    ],
+)
+def test_forward_command_rejects_unsupported_compose_input(changes: dict[str, object], message: str) -> None:
+    """Locked fields fail loudly instead of being silently overwritten or mishandled."""
+    with pytest.raises(ValueError, match=message):
+        _forward_command(**changes).validate()
+
+
+@pytest.mark.asyncio
+async def test_send_incapable_account_is_rejected_before_the_outgoing_open() -> None:
+    provider = MagicMock()
+    provider.send = AsyncMock()
+    services, _, factory, _ = _services(account=_account(can_send=False), provider=provider)
+
+    with pytest.raises(MutationProviderError, match="SMTP is not configured"):
+        await services.send.execute(SendCommand("primary", ("a@example.test",), "s", "b"))
+
+    factory.open.assert_not_called()
+    provider.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forward_send_capability_loss_on_the_outgoing_open_fails_before_delivery() -> None:
+    provider = _forward_provider()
+    services, _, factory, _ = _services(provider=provider)
+    factory.open.side_effect = [
+        factory.open.return_value,
+        MutationProviderAccess(_account(can_send=False), provider),
+    ]
+
+    with pytest.raises(MutationProviderError, match="SMTP is not configured"):
+        await services.forward.execute(_forward_command())
+
+    provider.fetch_forward_source.assert_awaited_once()
     provider.forward.assert_not_awaited()
 
 

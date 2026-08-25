@@ -33,7 +33,7 @@ def _set_flags_provider(error: BaseException) -> ClassicMutationProvider:
 
 
 def _account() -> MutationAccountSnapshot:
-    return MutationAccountSnapshot("primary", "managed", (), (), False)
+    return MutationAccountSnapshot("primary", "managed", (), (), False, can_send=True)
 
 
 @pytest.mark.asyncio
@@ -75,7 +75,7 @@ async def test_mutation_adapter_forwards_generic_flag_contract_and_policy() -> N
     handler = MagicMock()
     handler.incoming_client.set_email_flags_with_outcome = AsyncMock(return_value=outcome)
     provider = ClassicMutationProvider(handler)
-    account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), True)
+    account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), True, can_send=True)
     command = SetEmailFlagsCommand("primary", ("1", "2"), "remove", (r"\Seen", r"\Flagged"), "Archive")
 
     assert await provider.set_flags(command, account) is outcome
@@ -242,7 +242,7 @@ async def test_mutation_adapter_threads_allowlist_and_attachment_choice_into_for
     part = _forward_part()
     handler = MagicMock()
     handler.incoming_client.fetch_forward_source = AsyncMock(return_value=_forward_source_payload([part]))
-    account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), False)
+    account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), False, can_send=True)
 
     source = await ClassicMutationProvider(handler).fetch_forward_source(
         _forward_command(include_attachments=False), account
@@ -254,17 +254,10 @@ async def test_mutation_adapter_threads_allowlist_and_attachment_choice_into_for
         ["*@allowed.test"],
         False,
     )
-    assert (source.subject, source.sender, source.date) == (
-        "Quarterly report",
-        "author@example.test",
-        "Mon, 01 Jul 2026 09:00:00 +0000",
-    )
-    assert source.recipients == ("team@example.test", "cc@example.test")
+    assert source.subject == "Quarterly report"
     assert source.body_text.endswith("original body")
     # The provider decides what to retain; the adapter reports exactly what it returned.
-    assert [(item.content_type, item.filename, item.byte_size) for item in source.parts] == [
-        ("application/pdf", "report.pdf", len(part.as_bytes()))
-    ]
+    assert [item.byte_size for item in source.parts] == [len(part.as_bytes())]
     assert source.parts[0].raw_part is part
 
 
@@ -337,9 +330,7 @@ async def test_mutation_adapter_rejects_forward_without_smtp() -> None:
     handler.outgoing_client = None
 
     with pytest.raises(MutationProviderError, match="capability_unavailable: SMTP is not configured"):
-        await ClassicMutationProvider(handler).forward(
-            _forward_command(), ForwardSource("s", "f", (), "d", "block", ()), _account()
-        )
+        await ClassicMutationProvider(handler).forward(_forward_command(), ForwardSource("s", "block", ()), _account())
 
 
 @pytest.mark.asyncio
@@ -347,11 +338,8 @@ async def test_mutation_adapter_submits_forward_body_verbatim_with_reattached_pa
     part = _forward_part()
     source = ForwardSource(
         "Quarterly report",
-        "author@example.test",
-        ("team@example.test",),
-        "Mon, 01 Jul 2026 09:00:00 +0000",
         "---------- Forwarded message ----------\n\noriginal body",
-        (ForwardSourcePart("application/pdf", "report.pdf", len(part.as_bytes()), part),),
+        (ForwardSourcePart(len(part.as_bytes()), part),),
     )
     outcome = MagicMock()
     handler = MagicMock()
@@ -380,11 +368,8 @@ async def test_mutation_adapter_rejects_invalid_forward_part_evidence() -> None:
     handler = MagicMock()
     source = ForwardSource(
         "Quarterly report",
-        "author@example.test",
-        (),
-        "Mon, 01 Jul 2026 09:00:00 +0000",
         "block",
-        (ForwardSourcePart("application/pdf", "report.pdf", 10, object()),),
+        (ForwardSourcePart(10, object()),),
     )
 
     with pytest.raises(MutationProviderError, match="forwarded part evidence is invalid"):
@@ -402,9 +387,7 @@ async def test_mutation_adapter_sanitizes_unexpected_forward_delivery_failure() 
         MutationProviderError,
         match=r"^provider_failure: mutation provider request failed$",
     ) as caught:
-        await ClassicMutationProvider(handler).forward(
-            _forward_command(), ForwardSource("s", "f", (), "d", "block", ()), _account()
-        )
+        await ClassicMutationProvider(handler).forward(_forward_command(), ForwardSource("s", "block", ()), _account())
 
     assert provider_detail not in str(caught.value)
 
@@ -449,4 +432,4 @@ def test_managed_snapshot_never_enables_folder_management(monkeypatch, configure
 
 
 def test_mutation_account_snapshot_defaults_folder_management_to_false() -> None:
-    assert MutationAccountSnapshot("primary", "managed", (), (), False).enable_folder_management is False
+    assert MutationAccountSnapshot("primary", "managed", (), (), False, can_send=True).enable_folder_management is False

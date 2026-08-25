@@ -87,6 +87,7 @@ def _mutation_account() -> MutationAccountSnapshot:
         allowed_senders=("allowed@example.test",),
         allowed_recipients=(),
         report_blocked_mutations=False,
+        can_send=True,
     )
 
 
@@ -487,6 +488,7 @@ async def test_mutation_adapter_forwards_the_derived_label_mailbox_and_policy() 
         allowed_senders=("allowed@example.test",),
         allowed_recipients=(),
         report_blocked_mutations=True,
+        can_send=True,
     )
 
     await provider.remove_label(_remove_command(source_mailbox="Archive"), account)

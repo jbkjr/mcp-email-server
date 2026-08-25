@@ -45,6 +45,7 @@ def _account(**changes: object) -> MutationAccountSnapshot:
         allowed_senders=(),
         allowed_recipients=(),
         report_blocked_mutations=False,
+        can_send=True,
     )
     return replace(account, **changes)
 
@@ -410,7 +411,7 @@ async def test_copy_adapter_threads_the_sender_policy_into_the_provider() -> Non
     outcome = BatchMutationOutcome((TargetMutationOutcome("1", "succeeded"),))
     handler = MagicMock()
     handler.incoming_client.copy_emails_with_outcome = AsyncMock(return_value=outcome)
-    account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), True)
+    account = MutationAccountSnapshot("primary", "managed", ("*@allowed.test",), (), True, can_send=True)
 
     result = await ClassicMutationProvider(handler).copy(
         CopyCommand("primary", ("1", "2"), "INBOX", "Archive"), account

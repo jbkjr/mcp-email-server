@@ -54,13 +54,15 @@ class MutationAccountSnapshot:
     allowed_senders: tuple[str, ...]
     allowed_recipients: tuple[str, ...]
     report_blocked_mutations: bool
-    # Legacy-mode-only gate for mailbox-shape mutations. Managed mode has no policy
-    # column for it, so the managed authority path always resolves it to False.
-    enable_folder_management: bool = False
     # Non-secret capability evidence: whether the account has an outgoing binding.
     # Lets submission workflows refuse before any provider I/O without resolving
     # the outgoing secret; opening the outgoing provider remains the enforcement.
-    can_send: bool = True
+    # Required, not defaulted: an authority that forgets to state the capability
+    # must fail loudly instead of silently opting into send.
+    can_send: bool
+    # Legacy-mode-only gate for mailbox-shape mutations. Managed mode has no policy
+    # column for it, so the managed authority path always resolves it to False.
+    enable_folder_management: bool = False
 
 
 @dataclass(frozen=True)
@@ -379,8 +381,6 @@ class ForwardSourcePart:
     the provider adapter, while the application only bounds declared sizes.
     """
 
-    content_type: str
-    filename: str | None
     byte_size: int
     raw_part: object
 
@@ -391,13 +391,11 @@ class ForwardSource:
 
     ``body_text`` is the provider-composed forwarded block (its own quoting
     header plus the original text); the application only prefixes the caller's
-    note and never formats the block itself.
+    note and never formats the block itself. Only the fields the application
+    actually bounds or derives from are carried — no write-only evidence.
     """
 
     subject: str
-    sender: str
-    recipients: tuple[str, ...]
-    date: str
     body_text: str
     parts: tuple[ForwardSourcePart, ...]
 
@@ -412,6 +410,16 @@ class ForwardCommand(ComposeCommand):
         super().validate()
         validate_imap_uid(self.source_email_id, field_name="email_id")
         validate_mailbox_name(self.source_mailbox)
+        # Lock the compose fields the forward workflow derives or does not
+        # support, so a caller-supplied value is rejected instead of silently
+        # overwritten (subject), mislabeling the plain-text block (html), or
+        # sharing the attachment budget with forwarded parts (attachments).
+        if self.subject:
+            raise ValueError("forward subject is derived from the source message and must be empty")
+        if self.html:
+            raise ValueError("forwarded content is composed as plain text; html is not supported")
+        if self.attachments:
+            raise ValueError("forward does not accept caller attachments; the source's parts are re-attached")
 
 
 # Port-slot B1 commands: label reads. New commands from other clusters belong in
@@ -745,16 +753,20 @@ def _quoted_body(body: str, quote_html: str) -> str:
     return f"{body}\n\n{quote_html}" if body else quote_html
 
 
-def _validate_forward_source(source: ForwardSource) -> ForwardSource:
-    """Bound in-memory forwarded parts and derived content before any delivery.
+def _validate_forward_source(source: ForwardSource) -> None:
+    """Bound in-memory forwarded parts before any delivery.
 
     ``_validate_attachments`` bounds caller-supplied filesystem paths; forwarded
     parts never touch the filesystem, so their declared sizes are bounded here
-    against the same limits.
+    against the same limits. The derived subject and body are validated once,
+    by ``ComposeCommand.validate`` on the derived command — not duplicated here.
     """
 
     if len(source.parts) > APPLICATION_LIMITS.attachments:
-        raise ValueError(f"forwarded message must contain at most {APPLICATION_LIMITS.attachments} parts")
+        raise ValueError(
+            f"forwarded message must contain at most {APPLICATION_LIMITS.attachments} parts; "
+            "retry with include_attachments=false to forward the text without them"
+        )
     total_size = 0
     for part in source.parts:
         if not isinstance(part.byte_size, int) or isinstance(part.byte_size, bool) or part.byte_size < 0:
@@ -764,17 +776,10 @@ def _validate_forward_source(source: ForwardSource) -> ForwardSource:
         total_size += part.byte_size
         if total_size > APPLICATION_LIMITS.total_attachment_bytes:
             raise ValueError(f"forwarded parts exceed {APPLICATION_LIMITS.total_attachment_bytes} bytes in total")
-    validate_controlled_string(
-        _forwarded_subject(source.subject),
-        field_name="subject",
-        maximum_bytes=APPLICATION_LIMITS.subject_bytes,
-        allow_empty=True,
-    )
     if not isinstance(source.body_text, str):
         raise ValueError("body must be a string")  # noqa: TRY004 - stable validation contract
-    if len(source.body_text.encode("utf-8")) > APPLICATION_LIMITS.body_bytes:
-        raise ValueError(f"body exceeds {APPLICATION_LIMITS.body_bytes} bytes")
-    return source
+    if not isinstance(source.subject, str):
+        raise ValueError("subject must be a string")  # noqa: TRY004 - stable validation contract
 
 
 def _validate_optional_header(name: str, value: str | None) -> None:
@@ -1309,9 +1314,13 @@ class SendService(_MutationWorkflow):
     async def execute(self, command: SendCommand) -> SendMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        # In compatibility mode the outgoing open does not itself enforce role
+        # presence, so both submission workflows check the same non-secret flag.
+        self._require_send_capability(account)
         _validate_recipient_policy(command, account)
         submission = await self._quote_original(command, account)
         access = self._open(account, purpose="outgoing")
+        self._require_send_capability(access.account)
         _validate_recipient_policy(submission, access.account)
         try:
             delivery = _validate_delivery_result(
@@ -1377,9 +1386,13 @@ class ForwardService(_MutationWorkflow):
             subject=_forwarded_subject(source.subject),
             body=_forwarded_body(command.body, source.body_text),
         )
-        forwarded.validate()
+        # The derived command carries the derived subject, so it revalidates
+        # through the shared compose contract; ForwardCommand.validate's input
+        # locks (empty subject) applied to the caller's own input above.
+        ComposeCommand.validate(forwarded)
         # Re-resolve authority immediately before the outgoing submission effect.
         access = self._open(account, purpose="outgoing")
+        self._require_send_capability(access.account)
         _validate_recipient_policy(forwarded, access.account)
         try:
             delivery = _validate_delivery_result(

@@ -252,7 +252,10 @@ exactly-once guarantees.
 
 Forwarding an existing message is a send workflow with one additional preceding
 provider effect. It performs three independent effects, each preceded by a fresh
-read and validation of current account lifecycle, capability, and policy:
+resolution of current account authority. Send capability and recipient policy
+are revalidated before the source read and again before SMTP delivery; the
+sent copy follows the pre-existing authority-change rules below, which skip it
+on lifecycle loss while never erasing reported SMTP success:
 
 1. a bounded IMAP read of the source message in the requested source mailbox;
 2. SMTP delivery of the newly composed message;
@@ -287,7 +290,12 @@ transport classification owned by the send boundary above.
 
 The source read is a mail read and is subject to the sender allowlist under the
 same privacy rule as every other read path: a blocked source is not
-distinguishable from a missing one. The forward's own recipients are subject to
+distinguishable from a missing one. A source whose top-level entity is itself
+the attachment is re-attached stripped to its MIME content headers, so the
+source's envelope header block (Received chain, Message-ID, and any Bcc a Sent
+copy carries) never rides into the outgoing message. The quoting block carries
+only provenance the source itself asserts; an absent Date header is omitted,
+never fabricated. The forward's own recipients are subject to
 the recipient allowlist before any provider effect. Delivery and sent-copy
 outcomes are represented independently under the rules above; an ambiguous SMTP
 outcome is `unknown`, sets `reconciliation_needed`, and is never automatically
@@ -368,9 +376,10 @@ enter public errors.
     send-incapable account performs no provider I/O, that a failed, denied, or
     allowlist-blocked source read aborts before any SMTP session opens, that a
     source body beyond the display parse window is forwarded in full or rejected
-    as over-limit rather than silently truncated, that re-attached parts preserve
-    source MIME type and parameters, and that an existing `Fwd:` subject prefix
-    is not duplicated.
+    as over-limit rather than silently truncated, that a root-as-attachment
+    source is re-attached without its envelope headers, that re-attached parts
+    preserve source MIME type and parameters, and that an existing `Fwd:`
+    subject prefix is not duplicated.
 14. Mailbox-shape mutations are separated from message mutations. Copy applies the
     sender allowlist exactly as move does, never flags `\Deleted` or expunges, and
     invalidates only the destination projection. Create, delete, and rename are

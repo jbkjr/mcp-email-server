@@ -56,6 +56,7 @@ def _account(**changes: object) -> MutationAccountSnapshot:
         allowed_senders=(),
         allowed_recipients=(),
         report_blocked_mutations=False,
+        can_send=True,
     )
     return replace(account, **changes)
 

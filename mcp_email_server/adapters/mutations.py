@@ -15,6 +15,7 @@ from mcp_email_server.application.metadata import RuntimeMode
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
     BatchMutationOutcome,
+    ComposeCommand,
     CopyCommand,
     CreateFolderCommand,
     DeleteCommand,
@@ -239,12 +240,18 @@ class ClassicMutationProvider:
             return None
         return trash_mailbox
 
-    async def send(
+    async def _submit(
         self,
-        command: SendCommand,
-        account: MutationAccountSnapshot,
+        command: ComposeCommand,
+        *,
+        reply_to: str | None,
+        extra_parts: list[Message] | None = None,
     ) -> DeliveryMutationOutcome:
-        del account
+        """One SMTP submission shape shared by send and forward.
+
+        A change to the delivery call lands here once, so forwards can never
+        silently diverge from sends.
+        """
         client = self._handler.outgoing_client
         if client is None:
             raise MutationProviderError("capability_unavailable: SMTP is not configured for this account")
@@ -259,7 +266,8 @@ class ClassicMutationProvider:
                 list(command.attachments) or None,
                 command.in_reply_to,
                 command.references,
-                command.reply_to,
+                reply_to,
+                extra_parts=extra_parts,
             )
         )
 
@@ -286,6 +294,14 @@ class ClassicMutationProvider:
         # so the workflow aborts instead of sending without the quote it was asked for.
         return await _bounded_mutation_call(self._read_quote_source(command, account))
 
+    async def send(
+        self,
+        command: SendCommand,
+        account: MutationAccountSnapshot,
+    ) -> DeliveryMutationOutcome:
+        del account
+        return await self._submit(command, reply_to=command.reply_to)
+
     async def _read_forward_source(
         self,
         command: ForwardCommand,
@@ -299,14 +315,9 @@ class ClassicMutationProvider:
         )
         return ForwardSource(
             subject=source["subject"],
-            sender=source["from"],
-            recipients=tuple(source["recipients"]),
-            date=source["date"],
             body_text=source["body"],
             parts=tuple(
                 ForwardSourcePart(
-                    content_type=part.get_content_type(),
-                    filename=part.get_filename(),
                     # The serialized part is what the SMTP transaction actually carries,
                     # so it is the only honest size to bound the forward against.
                     byte_size=len(part.as_bytes()),
@@ -332,32 +343,15 @@ class ClassicMutationProvider:
         account: MutationAccountSnapshot,
     ) -> DeliveryMutationOutcome:
         del account
-        client = self._handler.outgoing_client
-        if client is None:
-            raise MutationProviderError("capability_unavailable: SMTP is not configured for this account")
         extra_parts: list[Message] = []
         for part in source.parts:
             raw_part = part.raw_part
             if not isinstance(raw_part, Message):
                 raise MutationProviderError("provider_failure: forwarded part evidence is invalid")
             extra_parts.append(raw_part)
-        return await _bounded_mutation_call(
-            client.send_email_with_outcome(
-                list(command.recipients),
-                # The application layer already derived the subject and prefixed the
-                # caller's note above the composed block: send both verbatim.
-                command.subject,
-                command.body,
-                list(command.cc) or None,
-                list(command.bcc) or None,
-                command.html,
-                list(command.attachments) or None,
-                command.in_reply_to,
-                command.references,
-                None,
-                extra_parts=extra_parts,
-            )
-        )
+        # The application layer already derived the subject and prefixed the
+        # caller's note above the composed block: submit both verbatim.
+        return await self._submit(command, reply_to=None, extra_parts=extra_parts)
 
     async def save_sent_copy(
         self,
