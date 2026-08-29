@@ -580,7 +580,7 @@ async def send_email(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.header_bytes,
-            description="Message-ID of the email being replied to. Enables proper threading in email clients.",
+            description="Message-ID of the email being replied to. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
         ),
     ] = None,
     references: Annotated[
@@ -588,7 +588,7 @@ async def send_email(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.header_bytes,
-            description="Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors.",
+            description="Space-separated Message-IDs for the thread chain. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition. Usually includes in_reply_to plus ancestors.",
         ),
     ] = None,
     reply_to: Annotated[
@@ -774,7 +774,7 @@ async def save_to_mailbox(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.header_bytes,
-            description="Message-ID of the email being replied to. Enables proper threading in email clients.",
+            description="Message-ID of the email being replied to. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
         ),
     ] = None,
     references: Annotated[
@@ -782,7 +782,7 @@ async def save_to_mailbox(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.header_bytes,
-            description="Space-separated Message-IDs for the thread chain.",
+            description="Space-separated Message-IDs for the thread chain. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
         ),
     ] = None,
     flags: Annotated[

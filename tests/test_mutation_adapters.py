@@ -4,6 +4,8 @@ from email import encoders
 from email.message import Message
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
+from email.policy import SMTP as SMTP_POLICY
+from email.policy import SMTPUTF8 as SMTPUTF8_POLICY
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -214,6 +216,10 @@ def _forward_part(payload: bytes = b"report bytes", filename: str = "report.pdf"
     return part
 
 
+def _forward_wire_size(part: Message) -> int:
+    return max(len(part.as_bytes(policy=SMTP_POLICY)), len(part.as_bytes(policy=SMTPUTF8_POLICY)))
+
+
 def _forward_source_payload(parts: list[Message] | None = None) -> dict[str, object]:
     return {
         "subject": "Quarterly report",
@@ -255,9 +261,10 @@ async def test_mutation_adapter_threads_allowlist_and_attachment_choice_into_for
         False,
     )
     assert source.subject == "Quarterly report"
+    assert source.sender == "author@example.test"
     assert source.body_text.endswith("original body")
     # The provider decides what to retain; the adapter reports exactly what it returned.
-    assert [item.byte_size for item in source.parts] == [len(part.as_bytes())]
+    assert [item.byte_size for item in source.parts] == [_forward_wire_size(part)]
     assert source.parts[0].raw_part is part
 
 
@@ -271,8 +278,21 @@ async def test_mutation_adapter_reports_serialized_forward_part_size() -> None:
 
     source = await ClassicMutationProvider(handler).fetch_forward_source(_forward_command(), _account())
 
-    assert source.parts[0].byte_size == len(part.as_bytes())
+    assert source.parts[0].byte_size == _forward_wire_size(part)
     assert source.parts[0].byte_size > len(payload)
+
+
+@pytest.mark.asyncio
+async def test_mutation_adapter_counts_smtp_crlf_expansion_in_forward_part_size() -> None:
+    part = MIMEText("x\n" * 1000, "plain", "us-ascii")
+    part.add_header("Content-Disposition", "attachment", filename="lines.txt")
+    handler = MagicMock()
+    handler.incoming_client.fetch_forward_source = AsyncMock(return_value=_forward_source_payload([part]))
+
+    source = await ClassicMutationProvider(handler).fetch_forward_source(_forward_command(), _account())
+
+    assert len(part.as_bytes()) < len(part.as_bytes(policy=SMTP_POLICY))
+    assert source.parts[0].byte_size == _forward_wire_size(part)
 
 
 @pytest.mark.asyncio
@@ -330,7 +350,9 @@ async def test_mutation_adapter_rejects_forward_without_smtp() -> None:
     handler.outgoing_client = None
 
     with pytest.raises(MutationProviderError, match="capability_unavailable: SMTP is not configured"):
-        await ClassicMutationProvider(handler).forward(_forward_command(), ForwardSource("s", "block", ()), _account())
+        await ClassicMutationProvider(handler).forward(
+            _forward_command(), ForwardSource("s", "author@example.test", "block", ()), _account()
+        )
 
 
 @pytest.mark.asyncio
@@ -338,8 +360,9 @@ async def test_mutation_adapter_submits_forward_body_verbatim_with_reattached_pa
     part = _forward_part()
     source = ForwardSource(
         "Quarterly report",
+        "author@example.test",
         "---------- Forwarded message ----------\n\noriginal body",
-        (ForwardSourcePart(len(part.as_bytes()), part),),
+        (ForwardSourcePart(_forward_wire_size(part), part),),
     )
     outcome = MagicMock()
     handler = MagicMock()
@@ -368,6 +391,7 @@ async def test_mutation_adapter_rejects_invalid_forward_part_evidence() -> None:
     handler = MagicMock()
     source = ForwardSource(
         "Quarterly report",
+        "author@example.test",
         "block",
         (ForwardSourcePart(10, object()),),
     )
@@ -387,7 +411,9 @@ async def test_mutation_adapter_sanitizes_unexpected_forward_delivery_failure() 
         MutationProviderError,
         match=r"^provider_failure: mutation provider request failed$",
     ) as caught:
-        await ClassicMutationProvider(handler).forward(_forward_command(), ForwardSource("s", "block", ()), _account())
+        await ClassicMutationProvider(handler).forward(
+            _forward_command(), ForwardSource("s", "author@example.test", "block", ()), _account()
+        )
 
     assert provider_detail not in str(caught.value)
 

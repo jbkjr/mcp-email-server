@@ -25,6 +25,7 @@ SentCopyStatus = Literal["skipped", "succeeded", "failed", "unknown"]
 FlagOperation = Literal["add", "remove"]
 MutableEmailFlag = Literal[r"\Seen", r"\Flagged", r"\Answered", r"\Draft"]
 MUTABLE_EMAIL_FLAGS: frozenset[str] = frozenset({r"\Seen", r"\Flagged", r"\Answered", r"\Draft"})
+_MESSAGE_ID_ATEXT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-/=?^_`{|}~")
 
 
 ProviderResultT = TypeVar("ProviderResultT")
@@ -302,6 +303,45 @@ class ArchiveCommand:
         validate_mailbox_name(self.source_mailbox)
 
 
+def _is_message_id_dot_atom(value: str) -> bool:
+    """Return whether value is conservative RFC 5322/RFC 6532 dot-atom text."""
+    return all(
+        part and all(character in _MESSAGE_ID_ATEXT or ord(character) > 0x7F for character in part)
+        for part in value.split(".")
+    )
+
+
+def _is_message_id_domain_literal(value: str) -> bool:
+    """Return whether value is one simple domain literal without quoting or folding."""
+    if len(value) < 3 or not value.startswith("[") or not value.endswith("]"):
+        return False
+    return all(
+        ord(character) > 0x7F or (0x21 <= ord(character) <= 0x7E and character not in "[]\\")
+        for character in value[1:-1]
+    )
+
+
+def _is_simple_message_id(value: str) -> bool:
+    """Recognize the unambiguous Message-ID subset that is safe to normalize."""
+    candidate = value[1:-1] if value.startswith("<") and value.endswith(">") else value
+    if "<" in candidate or ">" in candidate or candidate.count("@") != 1:
+        return False
+    left, right = candidate.split("@")
+    return _is_message_id_dot_atom(left) and (_is_message_id_dot_atom(right) or _is_message_id_domain_literal(right))
+
+
+def normalize_thread_message_ids(value: str) -> str:
+    """Add RFC delimiters when value is a simple bare or bracketed Message-ID list.
+
+    More complex historical syntax is preserved verbatim rather than partially
+    rewritten. Callers remain responsible for controlled-string validation.
+    """
+    message_ids = value.split()
+    if not message_ids or any(not _is_simple_message_id(message_id) for message_id in message_ids):
+        return value
+    return " ".join(message_id if message_id.startswith("<") else f"<{message_id}>" for message_id in message_ids)
+
+
 @dataclass(frozen=True)
 class ComposeCommand:
     account_name: str
@@ -321,6 +361,10 @@ class ComposeCommand:
         _validate_content(self.subject, self.body, self.attachments)
         _validate_optional_header("in_reply_to", self.in_reply_to)
         _validate_optional_header("references", self.references)
+        if self.in_reply_to is not None:
+            _validate_optional_header("in_reply_to", normalize_thread_message_ids(self.in_reply_to))
+        if self.references is not None:
+            _validate_optional_header("references", normalize_thread_message_ids(self.references))
 
 
 @dataclass(frozen=True)
@@ -391,11 +435,12 @@ class ForwardSource:
 
     ``body_text`` is the provider-composed forwarded block (its own quoting
     header plus the original text); the application only prefixes the caller's
-    note and never formats the block itself. Only the fields the application
-    actually bounds or derives from are carried — no write-only evidence.
+    note and never formats the block itself. ``sender`` is retained solely as
+    policy evidence so a fresh allowlist can be enforced before SMTP delivery.
     """
 
     subject: str
+    sender: str
     body_text: str
     parts: tuple[ForwardSourcePart, ...]
 
@@ -780,6 +825,21 @@ def _validate_forward_source(source: ForwardSource) -> None:
         raise ValueError("body must be a string")  # noqa: TRY004 - stable validation contract
     if not isinstance(source.subject, str):
         raise ValueError("subject must be a string")  # noqa: TRY004 - stable validation contract
+    if not isinstance(source.sender, str):
+        raise ValueError("source sender must be a string")  # noqa: TRY004 - stable validation contract
+
+
+def _validate_forward_sender_policy(
+    command: ForwardCommand,
+    source: ForwardSource,
+    account: MutationAccountSnapshot,
+) -> None:
+    """Apply the current sender policy without turning a blocked UID into an oracle."""
+
+    from mcp_email_server.config import sender_allowed
+
+    if not sender_allowed(source.sender, list(account.allowed_senders)):
+        raise ValueError(f"Failed to fetch email with UID {command.source_email_id}")
 
 
 def _validate_optional_header(name: str, value: str | None) -> None:
@@ -1381,6 +1441,10 @@ class ForwardService(_MutationWorkflow):
             # submitted without the content and parts it was meant to carry.
             raise MutationProviderError("forward source retrieval timed out") from None
         _validate_forward_source(source)
+        # The provider blocks disallowed sources before reading their body. Keep
+        # the application boundary fail-closed as well if a provider returns
+        # evidence that does not satisfy the snapshot used for that read.
+        _validate_forward_sender_policy(command, source, incoming.account)
         forwarded = replace(
             command,
             subject=_forwarded_subject(source.subject),
@@ -1392,6 +1456,10 @@ class ForwardService(_MutationWorkflow):
         ComposeCommand.validate(forwarded)
         # Re-resolve authority immediately before the outgoing submission effect.
         access = self._open(account, purpose="outgoing")
+        # Protect source privacy before reporting any independently tightened
+        # send capability or recipient policy. Otherwise those errors could
+        # distinguish a newly blocked retained source from a missing message.
+        _validate_forward_sender_policy(forwarded, source, access.account)
         self._require_send_capability(access.account)
         _validate_recipient_policy(forwarded, access.account)
         try:

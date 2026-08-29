@@ -56,6 +56,7 @@ from mcp_email_server.application.mutations import (
     MutationStatus,
     SentCopyMutationOutcome,
     TargetMutationOutcome,
+    normalize_thread_message_ids,
     validate_mailbox_name,
 )
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
@@ -824,6 +825,15 @@ def _normalize_search_uids(messages: Any) -> list[str]:  # noqa: C901 - bounded 
         text = payload
     else:
         raise MetadataProviderObservationError("Provider returned invalid UID search results")
+
+    # iCloud omits the untagged `* SEARCH` line when a search has no matches.
+    # aioimaplib then exposes only the tagged completion text in `lines`, while
+    # compliant empty responses contain an empty payload before that text.
+    # Recognize only the observed completion-only format; all other non-UID
+    # payloads remain provider observation failures.
+    if len(messages) == 1 and re.fullmatch(r"SEARCH completed \(took [0-9]+ ms\)", text, flags=re.IGNORECASE):
+        logger.debug("Provider omitted the empty UID SEARCH payload; treating the successful search as empty")
+        return []
 
     result: list[str] = []
     seen: set[str] = set()
@@ -2119,6 +2129,9 @@ class EmailClient:
                 return 0, []
 
             email_ids = _normalize_search_uids(messages)
+            if not email_ids:
+                logger.warning("No messages returned from search")
+                return 0, []
             logger.info(f"Found {len(email_ids)} email IDs")
             header_budget = _MetadataHeaderBudget()
 
@@ -2830,11 +2843,13 @@ class EmailClient:
         if bcc and include_bcc_header:
             msg["Bcc"] = ", ".join(bcc)
 
-        # Set threading headers for replies
+        # Set threading headers for replies. MCP callers may provide simple
+        # Message-IDs without angle brackets; emit the RFC 5322 msg-id form while
+        # preserving already-delimited and non-simple historical syntax.
         if in_reply_to:
-            msg["In-Reply-To"] = in_reply_to
+            msg["In-Reply-To"] = normalize_thread_message_ids(in_reply_to)
         if references:
-            msg["References"] = references
+            msg["References"] = normalize_thread_message_ids(references)
         if reply_to:
             msg["Reply-To"] = reply_to
 
