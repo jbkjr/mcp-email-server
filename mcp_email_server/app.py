@@ -1686,6 +1686,7 @@ _PUBLIC_LABEL_DETAILS = frozenset({
     "label-unavailable",
     "message-id-missing",
     "message-id-unsupported",
+    "mutation-policy",
     "not-attempted",
     "provider-timeout",
     "sender-policy",

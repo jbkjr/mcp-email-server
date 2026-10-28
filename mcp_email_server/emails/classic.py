@@ -4496,7 +4496,11 @@ class EmailClient:
                     permitted.append(email_id)
             for index, email_id in enumerate(permitted):
                 try:
+                    self._check_mutation_authority()
                     copy_response = await imap.uid("copy", email_id, _quote_mailbox(destination_mailbox))
+                except PermissionError:
+                    outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
+                    continue
                 except asyncio.CancelledError:
                     outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "copy-unknown")
                     for remaining_id in permitted[index + 1 :]:
@@ -4536,6 +4540,8 @@ class EmailClient:
         try:
             await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
             await _send_imap_id(imap)
+            # A revoked grant raises before the command, so nothing has changed.
+            self._check_mutation_authority()
             try:
                 response = await run(imap)
             except (asyncio.CancelledError, Exception):
@@ -4894,6 +4900,14 @@ class EmailClient:
                         targets.append((email_id, label_uids))
 
                 # Phase 3 (label mailbox): scoped STORE, then one scoped UID EXPUNGE.
+                # Authority is rechecked once before the first effect; a revoked grant
+                # fails every target with nothing flagged.
+                try:
+                    self._check_mutation_authority()
+                except PermissionError:
+                    for email_id, _ in targets:
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
+                    targets = []
                 pending_expunge: dict[str, list[str]] = {}
                 store_cancelled = False
                 for index, (email_id, label_uids) in enumerate(targets):
