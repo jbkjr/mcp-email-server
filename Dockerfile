@@ -11,7 +11,7 @@
 # de-facto interface of the previous image.
 
 ARG PYTHON_VERSION=3.13
-ARG UV_VERSION=0.11.29
+ARG UV_VERSION=0.13.6
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
