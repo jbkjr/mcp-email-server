@@ -68,6 +68,16 @@ are included with the same replacement/precedence rules used by legacy runtime.
 Credential values remain absent from preview and are read only during confirmed
 apply. Do not pass them through MCP or chat.
 
+### Upgrading an existing managed catalog
+
+Managed v3/v4/v5/v6 catalogs migrate to v7 on the first access by the new application.
+Existing configuration is preserved, and missing To-only cache fields are refreshed on demand;
+no account re-entry is required. Stop all older catalog users, keep a private
+consistent backup, and upgrade UI, CLI, and MCP together before restarting the
+clients. An older runtime cannot read v7, so a package-only downgrade is not a
+rollback. See the [managed upgrade steps](configuration.md#upgrading-a-managed-catalog-to-v7).
+Legacy TOML/environment users are not automatically switched to managed mode.
+
 ## Configure an account with the UI
 
 Run one of the V2 commands in [Version availability](#version-availability).
@@ -96,9 +106,16 @@ On first use:
    password. A failed save leaves the current password authority unchanged.
    Provider connectivity testing is intentionally not
    available in the Web UI;
-4. under **Settings & help**, add each allowed recipient needed for sending and
-   each optional allowed-sender pattern as an individual item. No recipients
-   disables sending; no senders leaves reading unrestricted;
+4. under **Settings & help**, add recipient addresses or glob patterns (for
+   example `*@example.com`) and optional sender patterns as individual items.
+   `*` explicitly allows every recipient for sending, forwarding, and drafts.
+   No recipients disables sending and general saves; recipientless `save_draft`
+   is still allowed by its mutation grant. No senders leaves reading unrestricted;
+   choose global mutation permissions in this panel and inheritance or an
+   explicit override in the account editor. Omitted settings retain all five
+   write classes; choose an empty list for read-only. Set the optional draft
+   mailbox on the account only if special-use Drafts discovery is unavailable
+   or ambiguous;
 5. saved complete accounts are immediately usable by managed runtime; there is
    no catalog activation or second save. Incomplete accounts remain visible in
    diagnostics but do not hide complete accounts;
@@ -106,9 +123,13 @@ On first use:
    required.
 
 The UI has only two primary destinations: **Email accounts** for ordinary setup
-and **Settings & help** for importing earlier settings, sending/attachment safety,
-and bounded troubleshooting checks. Ordinary labels and errors use task language;
-storage and concurrency terms are kept out of the primary workflow. Optional
+and per-account semantic tags, and **Settings & help** for importing earlier
+settings, sending/attachment safety, and bounded troubleshooting checks. The
+attachment settings distinguish saving files on the server from returning bytes
+through MCP for clients such as ChatGPT apps. Ordinary labels and errors use task language;
+storage and concurrency terms are kept out of the primary workflow. Account creation
+becomes available after the account list and inherited permissions finish loading.
+Optional
 settings are loaded only when their disclosure
 is opened. On Linux and Windows, managed credentials default to the private
 `managed_secret` table in the managed SQLite database. macOS uses the
@@ -116,6 +137,11 @@ operating-system keyring. Managed mode never falls back to TOML plaintext. The
 interface is not a mail
 client and never exposes message content. The same cleanup and headless
 operations remain available through the managed CLI below.
+
+Advanced protocol commands are disabled by default. Most users should leave
+**Allow advanced protocol commands** unchecked under **Account permissions**;
+ordinary tools do not require it. Review [advanced access](configuration.md#advanced-protocol-access)
+before enabling its broader raw mailbox, expunge and message capabilities.
 
 ## Configure an account with the managed CLI
 
@@ -226,6 +252,93 @@ a local fixed NTFS drive under a validated parent directory; do not place the
 catalog or configuration authority directly in the volume root or on a UNC path,
 mapped network drive, FAT/exFAT volume, device namespace, or alternate data
 stream.
+
+## Run the official container image
+
+Release 1.6.2 and later publish Linux `amd64` and `arm64` images to the current
+canonical registry path:
+
+```text
+ghcr.io/wh1isper/mcp-email-server
+```
+
+Use a version tag for a controlled deployment or `latest` to follow the newest
+release:
+
+```bash
+docker pull ghcr.io/wh1isper/mcp-email-server:1.6.2
+docker run --rm ghcr.io/wh1isper/mcp-email-server:1.6.2 --version
+```
+
+The former `ghcr.io/ai-zerolab/mcp-email-server` package is historical and is
+not updated by the current repository. The image entrypoint is
+`mcp-email-server` and its default command is `stdio`. Keep stdin attached when
+using it from an MCP client:
+
+```json
+{
+  "mcpServers": {
+    "mcp-email-server": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--env-file",
+        "/absolute/path/to/mcp-email-server.env",
+        "ghcr.io/wh1isper/mcp-email-server:1.6.2"
+      ]
+    }
+  }
+}
+```
+
+The env file uses the variables described in
+[Configure without the UI](#configure-without-the-ui). Keep it outside the
+source tree, restrict its permissions, and do not pass credentials as Docker
+build arguments. Environment-only accounts do not require persistent container
+storage.
+
+For managed CLI configuration on a POSIX Docker host, bind a private host
+directory, run with the host user's numeric identity, and select an explicit
+container configuration path. This preserves the owner-only storage contract
+instead of creating root-owned host files:
+
+```bash
+install -d -m 700 "$HOME/.config/mcp-email-server-container"
+docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
+  --env HOME=/config \
+  --env MCP_EMAIL_SERVER_CONFIG_PATH=/config/config.toml \
+  --mount "type=bind,src=$HOME/.config/mcp-email-server-container,dst=/config" \
+  ghcr.io/wh1isper/mcp-email-server:1.6.2 \
+  config init --database /config/managed.sqlite3
+```
+
+Reuse the same user, environment, and mount arguments for subsequent `account`
+and server commands. Do not bind a host directory owned by a different user;
+the managed storage preflight rejects it rather than weakening its ownership
+checks. The local management UI intentionally binds only to container loopback and is not made
+remote by publishing a Docker port; run the UI from a host installation or use
+the managed CLI inside the container.
+
+For Streamable HTTP, override the default command and configure the wildcard
+bind plus the exact external Host/Origin values:
+
+```bash
+docker run --rm -p 8000:8000 \
+  --env-file /absolute/path/to/mcp-email-server.env \
+  -e MCP_HOST=0.0.0.0 \
+  -e MCP_PORT=8000 \
+  -e MCP_ALLOWED_HOSTS='localhost:8000,127.0.0.1:8000' \
+  -e MCP_ALLOWED_ORIGINS='http://localhost:8000' \
+  ghcr.io/wh1isper/mcp-email-server:1.6.2 streamable-http
+```
+
+Review the reverse-proxy and authentication boundary in
+[Transports](transports.md#reverse-proxies) before exposing HTTP beyond the
+local machine. Maintainers can build and run the same image verification locally
+with `make container-check`.
 
 ## Configure without the UI
 

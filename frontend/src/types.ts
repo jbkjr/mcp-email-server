@@ -1,3 +1,5 @@
+export type MutationClass = 'draft' | 'organize' | 'delete' | 'send' | 'append'
+
 export type ManagementMode = 'legacy' | 'managed'
 
 export interface CatalogTarget {
@@ -47,7 +49,17 @@ export interface Endpoint {
   user_name: string
 }
 
+export interface AccountTag {
+  name: string
+  keyword: string
+  description: string
+  writable: boolean
+}
+
 export interface AccountSummary {
+  allowed_mutations?: MutationClass[] | null
+  drafts_mailbox?: string | null
+  allow_protocol_commands?: boolean
   name: string
   email_address: string
   enabled: boolean
@@ -63,9 +75,13 @@ export interface AccountDetails extends AccountSummary {
   sent_folder_name: string | null
   incoming: Endpoint
   outgoing: Endpoint | null
+  tags: AccountTag[]
 }
 
 export interface AccountInput {
+  allowed_mutations?: MutationClass[] | null
+  drafts_mailbox?: string | null
+  allow_protocol_commands?: boolean
   name: string
   full_name: string
   email_address: string
@@ -73,6 +89,7 @@ export interface AccountInput {
   sent_folder_name: string | null
   incoming: Endpoint
   outgoing: Endpoint | null
+  tags: AccountTag[]
 }
 
 export interface AccountUpdate extends AccountInput {
@@ -80,8 +97,10 @@ export interface AccountUpdate extends AccountInput {
 }
 
 export interface ManagedPolicy {
+  allowed_mutations: MutationClass[]
   revision: number
   enable_attachment_download: boolean
+  enable_attachment_content: boolean
   allowed_recipients: string[]
   allowed_senders: string[]
   report_blocked_mutations: boolean
@@ -95,12 +114,14 @@ export interface LegacyAccountSource {
   incoming_secret_source: 'plaintext' | 'keyring' | 'environment'
   outgoing: Endpoint | null
   outgoing_secret_source: 'plaintext' | 'keyring' | 'environment' | null
+  allow_protocol_commands?: boolean
   save_to_sent: boolean
   sent_folder_name: string | null
 }
 
 export interface LegacyPolicySource {
   enable_attachment_download: boolean
+  enable_attachment_content: boolean
   allowed_recipients: string[]
   allowed_senders: string[]
   report_blocked_mutations: boolean

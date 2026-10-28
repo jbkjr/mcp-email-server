@@ -15,6 +15,76 @@ MCP_EMAIL_SERVER_LOG_LEVEL=DEBUG mcp-email-server stdio
 
 Restart the server after changing configuration paths or environment variables.
 
+## Advanced protocol commands stop or are unavailable
+
+Call `email_command` with `commands=[{"command":"HELP"}]` without an account to
+inspect supported syntax locally. `protocol_disabled` means the account's
+user-operated opt-in is off; `policy_conflict` means the account's grants or
+sender/recipient/content policy is incompatible. Prefer an existing focused tool;
+do not ask the agent to change configuration or send credentials.
+
+`invalid_state` usually means SELECT/EXAMINE was missing from this call. Sessions
+are not retained between requests. Unsupported extensions or framing fail before
+any user command is sent. Server CAPABILITY does not promise executor support.
+
+On `stopped`, inspect each ordered result: earlier commands may already have
+succeeded. On `unknown`, verify remote state before deciding what to do; never
+replay the entire sequence automatically. Split large FETCH requests or use
+focused content/attachment tools when a receive or result limit is reached.
+A metadata-invalidation warning does not undo or disprove recorded remote
+success. See [protocol results](tools.md#access-scope-and-results).
+
+## A mail write is denied by mutation policy
+
+Check global `allowed_mutations` and the account override. Omission/null on an
+account inherits; an explicit list replaces the defaults; `[]` is read-only.
+Omitted global settings enable all five classes for existing and fresh setups.
+Choose only the needed classes in the policy/account editors. Adding SMTP does
+not grant `send`, and setting recipients does not grant any mutation class.
+Tools remain visible even when their calls are denied. See the
+[effect mapping](tools.md#mail-mutation-permissions). For a read-only account,
+read bodies without `mark_as_read=true`.
+
+## Draft mailbox is missing or ambiguous
+
+`save_draft` uses the account's `drafts_mailbox` or a unique special-use
+`\Drafts` mailbox. If none or several advertise that attribute, use
+`list_mailboxes` and set the exact existing name in account configuration. The
+tool does not guess `Drafts`, create a mailbox, or accept a caller destination
+or flag list. It requires `draft`; general `save_to_mailbox` requires `append`.
+For a draft without recipients, pass an explicit empty recipient list. If any
+To/CC/BCC addresses are supplied, all must match the recipient allowlist.
+
+## Recipient allowlist errors
+
+If sending or saving reports `Recipient(s) not in allowlist`, check that every
+To, CC, and BCC address matches an entry in `allowed_recipients`. An empty list
+blocks `send_email`, `forward_email`, and `save_to_mailbox`, even when SMTP or
+IMAP credentials work. Recipientless `save_draft` is permitted when the account
+has `draft`; supplied draft recipients still require a match. This applies in both managed and legacy mode. Earlier
+implementations incorrectly allowed any recipient for an empty list; see the
+[upgrade note](security.md#recipient-policy-upgrade-note).
+
+In managed mode, add the intended addresses or glob patterns in the Web UI policy panel, or run
+`mcp-email-server config policy` and then update using the displayed revision:
+
+```bash
+mcp-email-server config update-policy --expected-revision <revision> --allowed-recipients 'alice@example.com,bob@example.com'
+```
+
+This replaces the whole recipient list, so include any existing addresses that
+should remain allowed. Clearing the list disables these three operations; it
+never enables unrestricted sending. In legacy mode, configure `allowed_recipients`
+in TOML or `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS` in the server environment and
+restart. An explicitly empty environment value overrides a non-empty TOML list.
+`list_allowed_recipients` shows the effective policy without exposing credentials.
+
+For changing draft recipients, add `*@example.com` for an allowed domain, or
+explicitly use `*` (or `*@*`) for all valid recipients. For example, use
+`--allowed-recipients '*'` in the command above. Quote shell patterns. This also
+permits sending and forwarding to matching recipients; it is not a draft-only
+permission. Leaving the list empty is not an allow-all shortcut.
+
 ## The server reports `Missing command`
 
 The CLI requires a subcommand. Use one of:
@@ -114,13 +184,26 @@ sidecar itself is unparseable, repair or restore that sidecar manually; `reset`
 cannot safely infer its mode and therefore does not unlink the independent legacy
 source.
 
-There are no released managed-catalog users for this pre-release redesign, so
-older development catalog schemas are rejected rather than migrated. While
-legacy mode is selected, preserve the old file for rollback and initialize a
-fresh owner-only path with `mcp-email-server config init --database NEW_PATH`.
-Then re-enter accounts or use the reviewed legacy import flow. Fresh setup
-selects managed immediately; an existing v1 source remains selected until a
-complete import succeeds. Remove the obsolete development catalog only after verifying the
+Schemas v3, v4, v5, and v6 are supported managed-catalog migration sources for v7.
+The first new-version catalog access migrates transactionally, preserving account,
+policy, binding, secret rows, and revisions. All sources receive the nullable
+To-only cache field. Sources before v6 receive disabled protocol access. Sources before v5 receive full global mutation grants and inheriting
+account overrides; v3 also receives empty tag mappings and a disabled
+attachment-content policy. A failed migration leaves the source version intact.
+
+An older MCP process will reject the catalog after another new-version UI, CLI,
+or MCP process migrates it. Upgrade all catalog users together and restart every
+MCP client. If rolling back the package, restore the consistent pre-migration
+catalog backup too; do not edit the schema version manually, delete the catalog,
+or re-enter all accounts as a routine upgrade fix. Follow the
+[managed upgrade and rollback steps](configuration.md#upgrading-a-managed-catalog-to-v7).
+
+Other older development schemas are still rejected. For those versions, select
+legacy mode, preserve the old file for rollback, and initialize a fresh
+owner-only path with `mcp-email-server config init --database NEW_PATH`. Then
+re-enter accounts or use the reviewed legacy import flow. Fresh setup selects
+managed immediately; an existing v1 source remains selected until a complete
+import succeeds. Remove an obsolete development catalog only after verifying the
 replacement; on Linux and Windows, treat every old catalog copy as
 secret-bearing.
 
@@ -208,14 +291,78 @@ sender/INTERNALDATE evidence for every requested UID. The request is rejected
 rather than expanding a UID range or returning an incorrect page; retry after
 the mailbox is stable or report the provider issue.
 
+Some IMAP servers, including NetEase (`imap.163.com`, `imap.126.com`, and
+`imap.yeah.net`), accept `UID SEARCH` and then return no matches, including for
+ASCII text that is present in the mailbox. Their `STATUS` and `SELECT`
+responses can also omit `UIDNEXT` while still returning `MESSAGES` and
+`UIDVALIDITY`. The default `server` header-search mode still sends subject,
+from, and to to IMAP SEARCH, so those filters stay empty on that kind of
+server. Set `MCP_EMAIL_SERVER_IMAP_SEARCH_MODE` or the legacy account field
+`imap_search_mode` to `local` to filter subject, from, and to from mailbox
+headers instead. `local` uses a complete cached projection only when the server
+supplied both `UIDVALIDITY` and `UIDNEXT`. Otherwise it reads `UID FETCH 1:*
+(UID)` and the headers. Gaps in that UID list are kept as coverage evidence,
+and the omitted `UIDNEXT` stays unknown. If the server also omits
+`UIDVALIDITY`, each request reads the mailbox again, so a reset that issues
+the same UID numbers returns the headers from that read. If `STATUS` and
+`SELECT` return conflicting `UIDVALIDITY` values, the request fails rather
+than reuse cached headers across the reset; retry once the mailbox is stable.
+A mailbox that does not fit the snapshot bounds, or a
+read that cannot prove every message was seen, fails with `query_too_broad`
+instead of an empty page. Body, text, date, flag, tag, and attachment filters
+stay on IMAP SEARCH. A `local` query that mixes those filters with subject,
+from, or to is rejected; run the header filter and the other filter as
+separate requests. To matches the To header only, not Cc. The cache stores To
+addresses separately from display recipients. Older cache rows without that
+field are refreshed automatically on a To search; no manual cache deletion is
+needed. Repeated searches and incremental updates preserve the distinction.
+
+A metadata refresh logs its progress at INFO: a partial snapshot reports how
+many rows it kept out of the server message count, a complete snapshot reports
+that count, and an append-only sync reports how many UIDs it added.
+
 Non-ASCII subject, body, text, sender, or recipient filters are sent as
-synchronizing UTF-8 IMAP literals with `CHARSET UTF-8`. If a provider rejects the
-charset, the search fails without rewriting or dropping the filter. Use the
+synchronizing UTF-8 IMAP literals with `CHARSET UTF-8`, except for `imap.qq.com`.
+QQ Mail mis-parses `UID SEARCH CHARSET UTF-8 SUBJECT {n}` and can return the
+wrong messages, so the default `auto` mode sends `CHARSET UTF-8 SUBJECT "…"`.
+Force `literal` or `quoted` for every account with
+`MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH`, or set `imap_non_ascii_search` on one
+legacy account. Quoted keywords cannot contain CR or LF. If a provider rejects
+the charset, the search fails without rewriting or dropping the filter. Use the
 provider's supported search syntax or an ASCII/narrower criterion; do not assume
 that changing the process locale will help, because IMAP date months are always
 protocol-defined English tokens.
 
+A mailbox larger than the metadata snapshot ceiling stays a partial projection,
+so every unfiltered list fetches from IMAP again. The default ceiling is 1,000
+rows. `MCP_EMAIL_SERVER_METADATA_SNAPSHOT_ROWS` accepts 1 through 100,000. A
+refresh of a mailbox that fits the ceiling fetches newest UIDs first, in batches
+of `MCP_EMAIL_SERVER_METADATA_REFRESH_BATCH_SIZE` (default 100, capped so one
+batch of maximum-size headers fits the budget). Each batch has its own
+`MCP_EMAIL_SERVER_METADATA_REFRESH_TIMEOUT_SECONDS` deadline (default 60) and
+its own `MCP_EMAIL_SERVER_METADATA_HEADER_BUDGET_BYTES` budget (default 4 MiB,
+65536 through 67108864). Those limits do not accumulate across the whole
+mailbox, and they do not change the deadline for other IMAP or SMTP commands.
+If a batch fails, the newest rows already fetched are stored as a partial
+snapshot. That partial result is not a complete cache: the list still falls
+back to a bounded live search, and a later refresh continues at the UIDs that
+are still missing. After a complete snapshot exists, later mail is fetched by
+UID above the highest cached UID when the count proves append-only growth and
+UIDVALIDITY, UIDNEXT, and message count stay stable during the fetch. Concurrent
+changes rebuild the bounded snapshot; retained rows are reused only after their
+UIDVALIDITY matches the refresh's initial state. Connection establishment uses
+the refresh timeout too. A refresh that fails before any row is stored logs
+`Metadata projection refresh failed` with the exception class and value-free
+traceback locations, without exception text, source lines, or frame locals.
+
 ## The UI cannot load or authenticate
+
+On Windows, the UI claims its listening port exclusively. When using an explicit
+`--port`, restarting immediately can fail to bind while connections from the
+previous process remain active. Use the default `--port 0` to let the OS choose
+an available port, or wait for the previous connections to close before retrying
+the fixed port. If another process owns that port, choose a different one; do
+not disable exclusive binding to work around the error.
 
 Run `mcp-email-server ui` in a visible terminal and keep that foreground process
 running. Open only the fresh browser link launched by that process. If browser
@@ -406,6 +553,27 @@ have succeeded. Do not resend; inspect the provider-managed Sent folder, disable
 the extra copy when the provider already saves one, or use an IMAP endpoint that
 supports `ENABLE` with `UTF8=ACCEPT`/`UTF8=ONLY`.
 
+## Chinese text shows replacement characters
+
+The server decodes GB2312 labels with GB18030 and falls back from strict GBK
+and Big5 to GB18030 and Big5-HKSCS for message bodies; see
+[MIME body extraction in MCP Tools](tools.md). These cases still show
+replacement characters:
+
+- an RFC 2047 encoded word labelled `gbk` that contains a GB18030-only character,
+  or one labelled `big5` that contains an HKSCS character, because only bodies
+  get the superset fallback;
+- a body labelled `cp950` that contains an HKSCS character;
+- a part whose bytes are invalid in the declared charset and its superset, for
+  example mail mislabelled as `utf-8`, or a Windows code page 936 euro sign
+  (byte 0x80), which Python's GBK and GB18030 codecs reject.
+
+The GB2312-to-GB18030 mapping is a process-wide codec alias. It changes how
+anything in the server process decodes or encodes the `gb2312` label. The
+previously unknown WHATWG labels `x-gbk`, `cn-big5`, and `x-x-big5` now resolve
+to the strict `gbk` and `big5` codecs, which, like `cp936`, are otherwise
+unchanged. Outgoing mail is always encoded as UTF-8.
+
 ## IMAP reports a malformed `ID` command
 
 `mcp-email-server` sends at most one compact RFC 2971 `ID` command after login,
@@ -436,6 +604,26 @@ only for a trusted local endpoint with a known self-signed certificate.
 
 For ProtonMail Bridge, copy the host, ports, username, and password shown by the
 bridge rather than using the normal account password.
+
+## Attachment content is unavailable to a remote MCP client
+
+`download_attachment` returns a path on the server machine. A ChatGPT app or
+other remote MCP client cannot read that path because it does not share the
+server filesystem. Enable the independent content-transfer mode instead:
+
+```toml
+enable_attachment_content = true
+```
+
+In legacy mode, you can also set
+`MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT=true`. In managed mode, use
+the **Allow attachments to be returned through MCP** checkbox or run
+`mcp-email-server config update-policy --enable-attachment-content`; confirm the
+stored value with `mcp-email-server config policy`. Managed runtime reads use
+this policy rather than legacy TOML or environment overrides. Then call
+`get_attachment_content`. If the encoded resource exceeds the existing global
+serialized-result ceiling, use a smaller attachment; the server does not create
+a temporary URL or split the blob into chunks.
 
 ## Attachment download is denied
 

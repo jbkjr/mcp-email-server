@@ -3,6 +3,7 @@ import { Plus, Save, Trash2 } from 'lucide-react'
 
 import type { ManagementApi } from '../api'
 import type { CatalogTarget, ManagedPolicy } from '../types'
+import { grantSummary, MutationGrants } from './MutationGrants'
 import { ConflictNotice, errorMessage, StatusMessage } from './Feedback'
 
 function ItemEditor({
@@ -115,13 +116,16 @@ export function PolicyPanel({ api, target, onRevision }: { api: ManagementApi; t
           } catch (caught) { setError(caught) } finally { setBusy(false) }
         })()
       }}>
+        <MutationGrants id="global-grants" value={policy.allowed_mutations} onChange={(grants) => setPolicy({ ...policy, allowed_mutations: grants })} />
+        <p className="hint">Global permissions: {grantSummary(policy.allowed_mutations)}.</p>
+        <p className="hint">Global defaults apply to accounts that inherit. Account overrides replace this list; an explicit empty account list remains read-only regardless of global defaults.</p>
         <div className="item-editor-grid">
           <ItemEditor
             id="allowed-recipients"
             title="Allowed recipients"
             itemLabel="Recipient"
             addLabel="Add recipient"
-            help="Add addresses this server may send to. Empty means sending is disabled."
+            help="Add addresses or glob patterns such as *@example.com. * allows all recipients for sending, forwarding, and drafts. Empty blocks sending and any supplied draft recipients; recipientless drafts remain allowed."
             values={recipients}
             onChange={setRecipients}
           />
@@ -137,6 +141,7 @@ export function PolicyPanel({ api, target, onRevision }: { api: ManagementApi; t
         </div>
         <div className="checkbox-column">
           <label><input type="checkbox" checked={policy.enable_attachment_download} onChange={(event) => setPolicy({ ...policy, enable_attachment_download: event.target.checked })} /> Allow attachments to be saved as files</label>
+          <label><input type="checkbox" checked={policy.enable_attachment_content} onChange={(event) => setPolicy({ ...policy, enable_attachment_content: event.target.checked })} /> Allow attachments to be returned through MCP</label>
           <label><input type="checkbox" checked={policy.report_blocked_mutations} onChange={(event) => setPolicy({ ...policy, report_blocked_mutations: event.target.checked })} /> Show when an email action is blocked by these settings</label>
         </div>
         <button className="with-icon" disabled={busy}><Save size={17} aria-hidden="true" />{busy ? 'Saving…' : 'Save safety settings'}</button>

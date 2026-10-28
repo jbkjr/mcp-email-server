@@ -10,6 +10,8 @@ from mcp_email_server.application.management import (
     ManagedPolicy,
     UpdateAccountCommand,
 )
+from mcp_email_server.application.mutation_policy import DEFAULT_ALLOWED_MUTATIONS, MutationClass
+from mcp_email_server.imap_keywords import ImapKeywordTag
 
 
 class RequestModel(BaseModel):
@@ -78,6 +80,10 @@ class CreateAccountRequest(CatalogTargetRequest):
     incoming: EndpointInput
     outgoing: EndpointInput | None
     credentials: CredentialInput
+    tags: tuple[ImapKeywordTag, ...] = ()
+    allowed_mutations: tuple[MutationClass, ...] | None = None
+    drafts_mailbox: str | None = Field(default=None, max_length=65535)
+    allow_protocol_commands: bool = False
 
     @model_validator(mode="after")
     def validate_outgoing_credential(self) -> CreateAccountRequest:
@@ -99,6 +105,10 @@ class UpdateAccountRequest(CatalogTargetRequest):
     sent_folder_name: str | None = Field(default=None, max_length=65535)
     incoming: EndpointInput
     outgoing: EndpointInput | None
+    tags: tuple[ImapKeywordTag, ...] = ()
+    allowed_mutations: tuple[MutationClass, ...] | None = None
+    drafts_mailbox: str | None = Field(default=None, max_length=65535)
+    allow_protocol_commands: bool | None = None
 
     def command(self, current_name: str, *, had_outgoing: bool) -> UpdateAccountCommand:
         return UpdateAccountCommand(
@@ -113,6 +123,12 @@ class UpdateAccountRequest(CatalogTargetRequest):
             save_to_sent=self.save_to_sent,
             sent_folder_name=self.sent_folder_name,
             update_sent_folder=True,
+            update_allowed_mutations=True,
+            update_drafts_mailbox=True,
+            tags=self.tags,
+            allowed_mutations=self.allowed_mutations,
+            drafts_mailbox=self.drafts_mailbox,
+            allow_protocol_commands=self.allow_protocol_commands,
         )
 
 
@@ -141,6 +157,8 @@ class CleanupCredentialsRequest(ExpectedRevisionRequest):
 class UpdatePolicyRequest(CatalogTargetRequest):
     expected_revision: int = Field(ge=1)
     enable_attachment_download: bool
+    enable_attachment_content: bool
+    allowed_mutations: tuple[MutationClass, ...] = DEFAULT_ALLOWED_MUTATIONS
     allowed_recipients: tuple[str, ...]
     allowed_senders: tuple[str, ...]
     report_blocked_mutations: bool
@@ -149,7 +167,9 @@ class UpdatePolicyRequest(CatalogTargetRequest):
         return ManagedPolicy(
             revision=self.expected_revision,
             enable_attachment_download=self.enable_attachment_download,
+            enable_attachment_content=self.enable_attachment_content,
             allowed_recipients=self.allowed_recipients,
+            allowed_mutations=self.allowed_mutations,
             allowed_senders=self.allowed_senders,
             report_blocked_mutations=self.report_blocked_mutations,
         )

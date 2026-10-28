@@ -431,3 +431,34 @@ async def test_an_invalid_command_is_rejected_before_any_discovery() -> None:
 
     factory.open.assert_not_called()
     provider.find_trash_mailbox.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Mutation grants (upstream #261)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trash_first_move_is_authorized_by_the_delete_grant() -> None:
+    """An account granted delete but not organize can still delete into Trash."""
+    provider = _provider("Trash")
+    services, _, _ = _services(provider, account=_account(allowed_mutations=("delete",)))
+
+    await services.delete.execute(DeleteCommand("primary", ("7",)))
+
+    provider.move.assert_awaited_once()
+    assert provider.move.await_args.kwargs == {"grant": "delete"}
+
+
+@pytest.mark.asyncio
+async def test_delete_without_the_delete_grant_touches_nothing() -> None:
+    provider = _provider("Trash")
+    services, factory, _ = _services(provider, account=_account(allowed_mutations=("organize",)))
+
+    with pytest.raises(PermissionError, match="'delete' is not allowed"):
+        await services.delete.execute(DeleteCommand("primary", ("7",)))
+
+    factory.open.assert_not_called()
+    provider.find_trash_mailbox.assert_not_awaited()
+    provider.move.assert_not_awaited()
+    provider.delete.assert_not_awaited()

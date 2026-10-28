@@ -25,7 +25,7 @@ The UI MUST provide the managed management plane:
 - list/show/create/edit managed accounts;
 - disable, re-enable, and soft-remove accounts with confirmation;
 - set/rotate/remove credentials and perform explicit bounded cleanup;
-- view/edit catalog and account policy;
+- view/edit catalog policy and account-scoped semantic IMAP tag definitions;
 - automatically preview effective TOML/environment legacy import on entry and
   explicitly apply only a changed, conflict-free plan;
 - run bounded doctor and index-health checks;
@@ -49,6 +49,9 @@ mcp-email-server ui [--no-open] [--port PORT]
   option exists.
 - Default port is `0` (OS-assigned ephemeral). A fixed valid port may be chosen
   explicitly.
+- On Windows the listener sets `SO_EXCLUSIVEADDRUSE` and never `SO_REUSEADDR`,
+  so no other socket can bind the same address and port; POSIX keeps
+  `SO_REUSEADDR` for fixed-port restart.
 - The process freezes bootstrap mode and selected catalog before constructing UI
   state or binding its listener. Freezing does not open the catalog, so a missing
   or corrupt selected catalog remains recoverable through explicit legacy
@@ -249,6 +252,14 @@ Allowed-recipient and allowed-sender policy values are presented as individual
 items with add, edit, and remove actions. The empty states are explicit and must
 not be conflated: no allowed recipients disables sending, while no allowed
 senders means reading is unrestricted by sender.
+
+The global policy editor exposes the five mutation classes defined by spec 04.
+The account editor exposes an inheritance choice versus an explicit class list
+(including read-only), plus optional `drafts_mailbox`. Summaries distinguish
+inherited from overridden grants and make effective read/write access clear.
+The fixed-five default applies to old and new configurations; no automatic
+read-only conversion or approval workflow is added. Mail operation semantics
+remain owned by spec 07; this is configuration, not a draft composer.
 
 Secret input state exists only in the active account editor or selected account
 **Password** component. It is cleared after every success, failure, or conflict;

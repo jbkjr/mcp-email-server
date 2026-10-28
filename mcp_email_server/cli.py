@@ -26,6 +26,8 @@ from mcp_email_server.application.management import (
     UpdateAccountCommand,
     validate_endpoint,
 )
+from mcp_email_server.application.mutation_policy import parse_mutations
+from mcp_email_server.imap_keywords import ImapKeywordTag
 from mcp_email_server.runtime import get_application_runtime
 from mcp_email_server.stdio import run_bounded_stdio
 
@@ -340,9 +342,20 @@ def _policy_data(policy: ManagedPolicy) -> dict[str, object]:
     return {
         "revision": policy.revision,
         "enable_attachment_download": policy.enable_attachment_download,
+        "enable_attachment_content": policy.enable_attachment_content,
         "allowed_recipients": list(policy.allowed_recipients),
+        "allowed_mutations": list(policy.allowed_mutations),
         "allowed_senders": list(policy.allowed_senders),
         "report_blocked_mutations": policy.report_blocked_mutations,
+    }
+
+
+def _tag_data(tag: ImapKeywordTag) -> dict[str, object]:
+    return {
+        "name": tag.name,
+        "keyword": tag.keyword,
+        "description": tag.description,
+        "writable": tag.writable,
     }
 
 
@@ -360,6 +373,10 @@ def _legacy_import_plan_data(plan: LegacyImportPlan) -> dict[str, object]:
                 "email_address": source.email_address,
                 "save_to_sent": source.save_to_sent,
                 "sent_folder_name": source.sent_folder_name,
+                "tags": [_tag_data(tag) for tag in source.tags],
+                "allowed_mutations": list(source.allowed_mutations) if source.allowed_mutations is not None else None,
+                "drafts_mailbox": source.drafts_mailbox,
+                "allow_protocol_commands": source.allow_protocol_commands,
             },
             "incoming": {
                 **_endpoint_data(source.incoming),
@@ -383,9 +400,11 @@ def _legacy_import_plan_data(plan: LegacyImportPlan) -> dict[str, object]:
         "policy": {
             "action": plan.policy_action,
             "enable_attachment_download": plan.source_policy.enable_attachment_download,
+            "enable_attachment_content": plan.source_policy.enable_attachment_content,
             "allowed_recipients": list(plan.source_policy.allowed_recipients),
             "allowed_senders": list(plan.source_policy.allowed_senders),
             "report_blocked_mutations": plan.source_policy.report_blocked_mutations,
+            "allowed_mutations": list(plan.source_policy.allowed_mutations),
         },
         "unsupported_provider_names": list(plan.unsupported_provider_names),
     }
@@ -568,6 +587,8 @@ def config_policy(json_output: JsonOutput = False) -> None:
         return
     typer.echo(f"revision={policy.revision}")
     typer.echo(f"enable_attachment_download={str(policy.enable_attachment_download).lower()}")
+    typer.echo(f"enable_attachment_content={str(policy.enable_attachment_content).lower()}")
+    typer.echo("allowed_mutations=" + (",".join(policy.allowed_mutations) or "none"))
     typer.echo("allowed_recipients=" + (",".join(policy.allowed_recipients) or "none"))
     typer.echo("allowed_senders=" + (",".join(policy.allowed_senders) or "none"))
     typer.echo(f"report_blocked_mutations={str(policy.report_blocked_mutations).lower()}")
@@ -580,10 +601,17 @@ def config_update_policy(
         None,
         "--enable-attachment-download/--disable-attachment-download",
     ),
+    enable_attachment_content: bool | None = typer.Option(
+        None,
+        "--enable-attachment-content/--disable-attachment-content",
+    ),
+    allowed_mutations: str | None = typer.Option(
+        None, "--allowed-mutations", help="Comma-separated draft,organize,delete,send,append; empty makes read-only."
+    ),
     allowed_recipients: str | None = typer.Option(
         None,
         "--allowed-recipients",
-        help="Comma-separated addresses; pass an empty value to clear.",
+        help="Comma-separated addresses or glob patterns; '*' allows all, an empty value denies all.",
     ),
     allowed_senders: str | None = typer.Option(
         None,
@@ -609,6 +637,14 @@ def config_update_policy(
                     if enable_attachment_download is None
                     else enable_attachment_download
                 ),
+                enable_attachment_content=(
+                    current.enable_attachment_content
+                    if enable_attachment_content is None
+                    else enable_attachment_content
+                ),
+                allowed_mutations=current.allowed_mutations
+                if allowed_mutations is None
+                else parse_mutations(_split_csv(allowed_mutations)),
                 allowed_recipients=(
                     current.allowed_recipients if allowed_recipients is None else tuple(_split_csv(allowed_recipients))
                 ),
@@ -669,6 +705,8 @@ def _echo_legacy_import_plan(plan: LegacyImportPlan) -> None:
             f"  identity={source.email_address} full_name={source.full_name!r} "
             f"save_to_sent={str(source.save_to_sent).lower()} sent_folder={source.sent_folder_name or 'default'}"
         )
+        typer.echo(f"  allow_protocol_commands={str(source.allow_protocol_commands).lower()}")
+        typer.echo(f"  tags={json.dumps([_tag_data(tag) for tag in source.tags], separators=(',', ':'))}")
         incoming = source.incoming
         typer.echo(
             f"  incoming={incoming.host}:{incoming.port} user={incoming.user_name} "
@@ -687,6 +725,7 @@ def _echo_legacy_import_plan(plan: LegacyImportPlan) -> None:
     policy = plan.source_policy
     typer.echo(f"policy={plan.policy_action} target_revision={plan.target_policy_revision}")
     typer.echo(f"  attachment_download={str(policy.enable_attachment_download).lower()}")
+    typer.echo(f"  attachment_content={str(policy.enable_attachment_content).lower()}")
     typer.echo("  allowed_recipients=" + (",".join(policy.allowed_recipients) or "none"))
     typer.echo("  allowed_senders=" + (",".join(policy.allowed_senders) or "none"))
     typer.echo(f"  report_blocked_mutations={str(policy.report_blocked_mutations).lower()}")
@@ -786,6 +825,15 @@ def account_add(
         help="Read secret lines from user-controlled stdin; never place credentials in argv.",
     ),
     save_to_sent: bool = typer.Option(True, "--save-to-sent/--no-save-to-sent"),
+    allow_protocol_commands: bool = typer.Option(
+        False,
+        "--allow-protocol-commands/--no-allow-protocol-commands",
+        help="Advanced raw protocol access, including mailbox deletion, expunge and arbitrary flags. Requires compatible policy.",
+    ),
+    allowed_mutations: str | None = typer.Option(
+        None, "--allowed-mutations", help="Comma-separated grants; empty read-only; inherit resets to global."
+    ),
+    drafts_mailbox: str | None = typer.Option(None, "--drafts-mailbox"),
     sent_folder: str | None = typer.Option(None, "--sent-folder"),
     json_output: JsonOutput = False,
 ) -> None:
@@ -856,6 +904,11 @@ def account_add(
                 outgoing_secret=SecretStr(outgoing_password) if outgoing_password is not None else None,
                 save_to_sent=save_to_sent,
                 sent_folder_name=sent_folder,
+                allowed_mutations=None
+                if allowed_mutations in (None, "inherit")
+                else parse_mutations(_split_csv(allowed_mutations)),
+                drafts_mailbox=drafts_mailbox or None,
+                allow_protocol_commands=allow_protocol_commands,
             )
         )
     except (ManagementError, ValueError) as exc:
@@ -995,10 +1048,14 @@ def account_show(name: str, json_output: JsonOutput = False) -> None:
                 "revision": account.revision,
                 "save_to_sent": account.save_to_sent,
                 "sent_folder_name": account.sent_folder_name,
+                "allowed_mutations": list(account.allowed_mutations) if account.allowed_mutations is not None else None,
+                "drafts_mailbox": account.drafts_mailbox,
+                "allow_protocol_commands": account.allow_protocol_commands,
                 "incoming": _endpoint_data(account.incoming),
                 "outgoing": _endpoint_data(account.outgoing) if account.outgoing is not None else None,
                 "incoming_binding": account.incoming_binding,
                 "outgoing_binding": account.outgoing_binding,
+                "tags": [_tag_data(tag) for tag in account.tags],
             },
         )
         return
@@ -1008,7 +1065,9 @@ def account_show(name: str, json_output: JsonOutput = False) -> None:
     typer.echo(f"enabled={str(account.enabled).lower()}")
     typer.echo(f"revision={account.revision}")
     typer.echo(f"save_to_sent={str(account.save_to_sent).lower()}")
+    typer.echo(f"allow_protocol_commands={str(account.allow_protocol_commands).lower()}")
     typer.echo(f"sent_folder={account.sent_folder_name or 'default'}")
+    typer.echo(f"tags={json.dumps([_tag_data(tag) for tag in account.tags], separators=(',', ':'))}")
     typer.echo(f"incoming_host={account.incoming.host}")
     typer.echo(f"incoming_port={account.incoming.port}")
     typer.echo(f"incoming_user={account.incoming.user_name}")
@@ -1047,6 +1106,15 @@ def account_update(
     smtp_verify_ssl: bool | None = typer.Option(None, "--smtp-verify-ssl/--no-smtp-verify-ssl"),
     remove_outgoing: bool = typer.Option(False, "--remove-outgoing"),
     save_to_sent: bool | None = typer.Option(None, "--save-to-sent/--no-save-to-sent"),
+    allow_protocol_commands: bool | None = typer.Option(
+        None,
+        "--allow-protocol-commands/--no-allow-protocol-commands",
+        help="Advanced raw protocol access, including mailbox deletion, expunge and arbitrary flags. Requires compatible policy.",
+    ),
+    allowed_mutations: str | None = typer.Option(
+        None, "--allowed-mutations", help="Comma-separated grants; empty read-only; inherit resets to global."
+    ),
+    drafts_mailbox: str | None = typer.Option(None, "--drafts-mailbox"),
     sent_folder: str | None = typer.Option(None, "--sent-folder"),
     clear_sent_folder: bool = typer.Option(False, "--clear-sent-folder"),
     json_output: JsonOutput = False,
@@ -1083,6 +1151,13 @@ def account_update(
                 remove_outgoing=remove_outgoing,
                 save_to_sent=save_to_sent,
                 sent_folder_name=sent_folder,
+                allowed_mutations=None
+                if allowed_mutations in (None, "inherit")
+                else parse_mutations(_split_csv(allowed_mutations)),
+                drafts_mailbox=drafts_mailbox or None,
+                allow_protocol_commands=allow_protocol_commands,
+                update_allowed_mutations=allowed_mutations is not None,
+                update_drafts_mailbox=drafts_mailbox is not None,
                 update_sent_folder=sent_folder is not None or clear_sent_folder,
             )
         )

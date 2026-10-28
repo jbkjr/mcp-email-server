@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -35,9 +37,11 @@ from mcp_email_server.application.mutations import (
     SendMutationOutcome,
     SentCopyMutationOutcome,
     SetEmailFlagsCommand,
+    SetEmailTagsCommand,
     TargetMutationOutcome,
 )
 from mcp_email_server.emails.classic import ClassicEmailHandler
+from mcp_email_server.imap_keywords import ImapKeywordRegistry, ImapKeywordTag
 
 
 def _account(**changes: object) -> MutationAccountSnapshot:
@@ -45,7 +49,13 @@ def _account(**changes: object) -> MutationAccountSnapshot:
         account_name="primary",
         mode="managed",
         allowed_senders=(),
-        allowed_recipients=(),
+        allowed_recipients=(
+            "recipient@example.test",
+            "accepted@example.test",
+            "rejected@example.test",
+            "secret@example.test",
+            "copied@example.test",
+        ),
         report_blocked_mutations=False,
         can_send=True,
     )
@@ -91,6 +101,141 @@ def _services(
         factory,
         selected_projection,
     )
+
+
+@pytest.mark.parametrize(
+    ("recipient", "allowed", "expected"),
+    [
+        ("recipient@example.test", (), False),
+        ("recipient@example.test", ("recipient@example.test",), True),
+        ("Recipient <RECIPIENT@Example.Test>", ("recipient@example.test",), True),
+        ("other@example.test", ("recipient@example.test",), False),
+        ("recipient@example.test", ("*",), True),
+        ("recipient@example.test", ("*@*",), True),
+        ("Recipient <RECIPIENT@Example.Test>", ("*@EXAMPLE.TEST",), True),
+        ("user7@example.test", ("user?@example.test",), True),
+        ("user7@example.test", ("user[0-9]@example.test",), True),
+        ("userx@example.test", ("user[0-9]@example.test",), False),
+        ("recipient@example.test.evil", ("*@example.test",), False),
+        ("recipient@other.test", ("*@example.test",), False),
+        ("", ("*",), False),
+    ],
+)
+def test_recipient_policy_requires_explicit_pattern_match(
+    recipient: str, allowed: tuple[str, ...], expected: bool
+) -> None:
+    assert mutations_module._recipient_policy_allows(recipient, allowed) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["managed", "legacy"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        SendCommand("primary", ("recipient@example.test",), "Subject", "body"),
+        SaveToMailboxCommand("primary", ("recipient@example.test",), "Subject", "body"),
+        ForwardCommand("primary", ("recipient@example.test",), "", "", source_email_id="42"),
+    ],
+    ids=["send", "save", "forward"],
+)
+@pytest.mark.parametrize("stage", ["resolve", "open"])
+async def test_empty_recipient_policy_denies_before_provider_effect(
+    mode: str, command: SendCommand | SaveToMailboxCommand | ForwardCommand, stage: str
+) -> None:
+    account = _account(mode=mode, allowed_recipients=() if stage == "resolve" else ("recipient@example.test",))
+    provider = MagicMock()
+    services, _, factory, projection = _services(account=account, provider=provider)
+    factory.open.return_value = MutationProviderAccess(replace(account, allowed_recipients=()), provider)
+    if isinstance(command, ForwardCommand):
+        operation = services.forward.execute(command)
+    elif isinstance(command, SaveToMailboxCommand):
+        operation = services.save_to_mailbox.execute(command)
+    else:
+        operation = services.send.execute(command)
+
+    with pytest.raises(RecipientPolicyDeniedError):
+        await operation
+
+    assert factory.open.call_count == (0 if stage == "resolve" else 1)
+    assert provider.mock_calls == []
+    projection.invalidate.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["recipients", "cc", "bcc"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        SendCommand("primary", ("recipient@example.test",), "Subject", "body"),
+        SaveToMailboxCommand("primary", ("recipient@example.test",), "Subject", "body"),
+        ForwardCommand("primary", ("recipient@example.test",), "", "", source_email_id="42"),
+    ],
+    ids=["send", "save", "forward"],
+)
+async def test_recipient_policy_checks_every_address_before_provider_access(
+    field: str, command: SendCommand | SaveToMailboxCommand | ForwardCommand
+) -> None:
+    services, _, factory, _ = _services(account=_account(allowed_recipients=("*@example.test",)))
+    command = replace(command, **{field: ("recipient@example.test", "blocked@other.test")})
+    if isinstance(command, ForwardCommand):
+        operation = services.forward.execute(command)
+    elif isinstance(command, SaveToMailboxCommand):
+        operation = services.save_to_mailbox.execute(command)
+    else:
+        operation = services.send.execute(command)
+
+    with pytest.raises(RecipientPolicyDeniedError):
+        await operation
+
+    factory.open.assert_not_called()
+
+
+def _tag_registry() -> ImapKeywordRegistry:
+    return ImapKeywordRegistry.from_tags((
+        ImapKeywordTag(name="todo", keyword="$label4", writable=True),
+        ImapKeywordTag(name="important", keyword="$label1", writable=False),
+    ))
+
+
+@pytest.mark.asyncio
+async def test_set_email_tags_resolves_writable_names_and_invalidates_projection() -> None:
+    provider = MagicMock()
+    provider.set_tags = AsyncMock(return_value=_batch(TargetMutationOutcome("1", "succeeded")))
+    services, _authority, _factory, projection = _services(
+        account=_account(tag_registry=_tag_registry()),
+        provider=provider,
+    )
+
+    result = await services.set_tags.execute(SetEmailTagsCommand("primary", ("1",), "add", ("todo",), "Archive"))
+
+    assert result.targets("succeeded") == ["1"]
+    dispatched = provider.set_tags.await_args.args[0]
+    assert dispatched.operation == "add"
+    assert dispatched.tags == ("$label4",)
+    assert dispatched.mailbox == "Archive"
+    projection.invalidate.assert_awaited_once_with(("Archive",))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tag", "expected_error"),
+    [("missing", ValueError), ("important", PermissionError)],
+)
+async def test_set_email_tags_rejects_unknown_or_read_only_before_provider(
+    tag: str,
+    expected_error: type[Exception],
+) -> None:
+    services, _authority, factory, _projection = _services(account=_account(tag_registry=_tag_registry()))
+
+    with pytest.raises(expected_error):
+        await services.set_tags.execute(SetEmailTagsCommand("primary", ("1",), "remove", (tag,), "INBOX"))
+
+    factory.open.assert_not_called()
+
+
+def test_set_email_tags_command_requires_non_empty_tags() -> None:
+    with pytest.raises(ValueError, match="tags must not be empty"):
+        SetEmailTagsCommand("primary", ("1",), "add", (), "INBOX").validate()
 
 
 @pytest.mark.parametrize(
@@ -438,8 +583,9 @@ async def test_send_delivery_survives_untyped_sent_copy_failure_as_unknown() -> 
 
 
 @pytest.mark.asyncio
-async def test_direct_application_call_rejects_packed_recipient_values() -> None:
-    services, _, factory, _ = _services(account=_account(allowed_recipients=("allowed@example.test",)))
+@pytest.mark.parametrize("allowed", [("allowed@example.test",), ("*",)])
+async def test_direct_application_call_rejects_packed_recipient_values(allowed: tuple[str, ...]) -> None:
+    services, _, factory, _ = _services(account=_account(allowed_recipients=allowed))
 
     with pytest.raises(ValueError, match="exactly one email address"):
         await services.send.execute(
@@ -665,6 +811,83 @@ async def test_mutation_timeout_is_unknown_and_never_replayed(monkeypatch, workf
         assert result.sent_copy.status == "skipped"
         assert result.reconciliation_needed is True
         provider.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_carries_the_delivered_message_id_through_a_failed_sent_copy() -> None:
+    """The identifier belongs to authoritative SMTP delivery, not to the independent Sent copy."""
+    provider = MagicMock()
+    provider.send = AsyncMock(
+        return_value=DeliveryMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "succeeded"),),
+            object(),
+            message_id="<delivered@example.test>",
+        )
+    )
+    provider.save_sent_copy = AsyncMock(return_value=SentCopyMutationOutcome("failed", "Sent", "append"))
+    services, _, _, _ = _services(provider=provider)
+
+    result = await services.send.execute(
+        SendCommand(
+            account_name="primary",
+            recipients=("recipient@example.test",),
+            subject="Message",
+            body="body",
+        )
+    )
+
+    assert result.message_id == "<delivered@example.test>"
+    assert result.sent_copy.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_send_timeout_reports_no_message_id(monkeypatch) -> None:
+    """A submission that timed out before any provider evidence has no identifier to report."""
+    monkeypatch.setattr(
+        mutations_module,
+        "APPLICATION_LIMITS",
+        replace(APPLICATION_LIMITS, provider_timeout_seconds=0.001),
+    )
+    provider = MagicMock()
+    provider.send = AsyncMock(side_effect=_hang_provider)
+    services, _, _, _ = _services(provider=provider)
+
+    result = await services.send.execute(
+        SendCommand(
+            account_name="primary",
+            recipients=("recipient@example.test",),
+            subject="Message",
+            body="body",
+        )
+    )
+
+    assert result.recipients("unknown") == ["recipient@example.test"]
+    assert result.message_id is None
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_report_a_message_id_the_provider_withheld() -> None:
+    """An ambiguous DATA phase yields no accepted message, so the workflow must not invent one."""
+    provider = MagicMock()
+    provider.send = AsyncMock(
+        return_value=DeliveryMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "unknown", "smtp-data-unknown"),),
+            None,
+        )
+    )
+    services, _, _, _ = _services(provider=provider)
+
+    result = await services.send.execute(
+        SendCommand(
+            account_name="primary",
+            recipients=("recipient@example.test",),
+            subject="Message",
+            body="body",
+        )
+    )
+
+    assert result.reconciliation_needed is True
+    assert result.message_id is None
 
 
 @pytest.mark.asyncio
@@ -990,7 +1213,9 @@ async def test_forward_recipient_policy_denial_fails_before_provider_access() ->
 @pytest.mark.asyncio
 async def test_forward_recipient_policy_denial_after_open_fails_before_retrieval() -> None:
     provider = _forward_provider()
-    services, _, factory, _ = _services(provider=provider)
+    services, _, factory, _ = _services(
+        account=_account(allowed_recipients=("blocked@example.test",)), provider=provider
+    )
     factory.open.return_value = MutationProviderAccess(
         _account(allowed_recipients=("allowed@example.test",)),
         provider,
@@ -1120,12 +1345,17 @@ async def test_forward_send_capability_loss_after_open_fails_before_retrieval() 
 
 
 @pytest.mark.asyncio
-async def test_forward_recipient_policy_denial_before_delivery_fails_after_retrieval() -> None:
+@pytest.mark.parametrize("allowed", [(), ("allowed@example.test",)])
+async def test_forward_recipient_policy_denial_before_delivery_fails_after_retrieval(
+    allowed: tuple[str, ...],
+) -> None:
     provider = _forward_provider()
-    services, _, factory, _ = _services(provider=provider)
+    services, _, factory, _ = _services(
+        account=_account(allowed_recipients=("blocked@example.test",)), provider=provider
+    )
     factory.open.side_effect = [
         factory.open.return_value,
-        MutationProviderAccess(_account(allowed_recipients=("allowed@example.test",)), provider),
+        MutationProviderAccess(_account(allowed_recipients=allowed), provider),
     ]
 
     with pytest.raises(RecipientPolicyDeniedError):
@@ -1184,6 +1414,22 @@ async def test_forward_preserves_partial_delivery_and_skips_sent_copy_without_ev
 
 
 @pytest.mark.asyncio
+async def test_forward_carries_the_delivered_message_id() -> None:
+    provider = _forward_provider(
+        delivery=DeliveryMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "succeeded"),),
+            object(),
+            message_id="<forwarded@example.test>",
+        )
+    )
+    services, _, _, _ = _services(provider=provider)
+
+    result = await services.forward.execute(_forward_command())
+
+    assert result.message_id == "<forwarded@example.test>"
+
+
+@pytest.mark.asyncio
 async def test_forward_sent_copy_failure_does_not_downgrade_delivery() -> None:
     provider = _forward_provider()
     provider.save_sent_copy = AsyncMock(side_effect=MutationProviderError("provider_failure: append failed"))
@@ -1237,3 +1483,188 @@ async def test_forward_threads_include_attachments_to_the_provider() -> None:
 
     assert provider.fetch_forward_source.await_args.args[0].include_attachments is False
     assert provider.forward.await_args.args[0].include_attachments is False
+
+
+_UNC_ATTACHMENT = r"\\attacker.example.test\share\payload.bin"
+
+
+def _record_attachment_stats(monkeypatch: pytest.MonkeyPatch, *paths: str) -> list[str]:
+    """Record every ``os.stat`` of the given paths; ``Path.stat``/``is_file`` route through it."""
+
+    watched = set(paths)
+    touched: list[str] = []
+    real_stat = os.stat
+
+    def recording_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) in watched:
+            touched.append(os.fspath(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", recording_stat)
+    return touched
+
+
+def _attachment_file(tmp_path: Path, size: int = 4) -> str:
+    attachment = tmp_path / "attachment.bin"
+    attachment.write_bytes(b"x" * size)
+    return str(attachment)
+
+
+def _send_provider() -> MagicMock:
+    provider = MagicMock()
+    provider.send = AsyncMock(
+        return_value=DeliveryMutationOutcome(
+            (TargetMutationOutcome("recipient@example.test", "succeeded"),),
+            object(),
+        )
+    )
+    provider.save_sent_copy = AsyncMock(return_value=SentCopyMutationOutcome("succeeded", "Sent"))
+    provider.save_to_mailbox = AsyncMock(
+        return_value=AppendMutationOutcome("succeeded", "<draft@example.test>", mailbox="Drafts")
+    )
+    return provider
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["resolve", "open"])
+async def test_send_incapable_account_never_touches_attachment_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stage: str
+) -> None:
+    local = _attachment_file(tmp_path)
+    touched = _record_attachment_stats(monkeypatch, local, _UNC_ATTACHMENT)
+    provider = _send_provider()
+    services, _, factory, _ = _services(
+        account=_account(can_send=stage != "resolve"),
+        provider=provider,
+    )
+    factory.open.return_value = MutationProviderAccess(_account(can_send=False), provider)
+
+    with pytest.raises(MutationProviderError, match="SMTP is not configured"):
+        await services.send.execute(
+            SendCommand(
+                "primary",
+                ("recipient@example.test",),
+                "Subject",
+                "body",
+                attachments=(local, _UNC_ATTACHMENT),
+            )
+        )
+
+    assert touched == []
+    assert factory.open.call_count == (0 if stage == "resolve" else 1)
+    provider.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["resolve", "open"])
+@pytest.mark.parametrize("workflow", ["send", "save"])
+async def test_recipient_policy_denial_never_touches_attachment_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stage: str, workflow: str
+) -> None:
+    local = _attachment_file(tmp_path)
+    touched = _record_attachment_stats(monkeypatch, local, _UNC_ATTACHMENT)
+    provider = _send_provider()
+    allowed = ("other@example.test",) if stage == "resolve" else ("recipient@example.test",)
+    services, _, factory, _ = _services(account=_account(allowed_recipients=allowed), provider=provider)
+    factory.open.return_value = MutationProviderAccess(_account(allowed_recipients=("other@example.test",)), provider)
+    fields = {
+        "account_name": "primary",
+        "recipients": ("recipient@example.test",),
+        "subject": "Subject",
+        "body": "body",
+        "attachments": (local, _UNC_ATTACHMENT),
+    }
+    operation = (
+        services.send.execute(SendCommand(**fields))
+        if workflow == "send"
+        else services.save_to_mailbox.execute(SaveToMailboxCommand(**fields))
+    )
+
+    with pytest.raises(RecipientPolicyDeniedError):
+        await operation
+
+    assert touched == []
+    assert factory.open.call_count == (0 if stage == "resolve" else 1)
+    provider.send.assert_not_awaited()
+    provider.save_to_mailbox.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forward_caller_attachments_are_rejected_without_touching_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    local = _attachment_file(tmp_path)
+    touched = _record_attachment_stats(monkeypatch, local, _UNC_ATTACHMENT)
+    provider = _forward_provider()
+    services, _, factory, _ = _services(provider=provider)
+
+    with pytest.raises(ValueError, match="does not accept caller attachments"):
+        await services.forward.execute(_forward_command(attachments=(local, _UNC_ATTACHMENT)))
+
+    assert touched == []
+    factory.open.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow", ["send", "save"])
+async def test_authorized_attachment_is_size_checked_before_the_provider_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workflow: str
+) -> None:
+    local = _attachment_file(tmp_path)
+    touched = _record_attachment_stats(monkeypatch, local)
+    provider = _send_provider()
+    services, _, _, _ = _services(provider=provider)
+    fields = {
+        "account_name": "primary",
+        "recipients": ("recipient@example.test",),
+        "subject": "Subject",
+        "body": "body",
+        "attachments": (local,),
+    }
+    if workflow == "send":
+        await services.send.execute(SendCommand(**fields))
+        provider.send.assert_awaited_once()
+    else:
+        await services.save_to_mailbox.execute(SaveToMailboxCommand(**fields))
+        provider.save_to_mailbox.assert_awaited_once()
+
+    assert local in touched
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        ({"attachment_bytes": 3}, "an attachment exceeds 3 bytes"),
+        ({"total_attachment_bytes": 7}, "attachments exceed 7 bytes in total"),
+    ],
+)
+@pytest.mark.parametrize("workflow", ["send", "save"])
+async def test_authorized_oversized_attachments_fail_before_the_provider_effect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, limits: dict[str, int], message: str, workflow: str
+) -> None:
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"1234")
+    second.write_bytes(b"5678")
+    monkeypatch.setattr(mutations_module, "APPLICATION_LIMITS", replace(APPLICATION_LIMITS, **limits))
+    provider = _send_provider()
+    services, _, _, _ = _services(provider=provider)
+    fields = {
+        "account_name": "primary",
+        "recipients": ("recipient@example.test",),
+        "subject": "Subject",
+        "body": "body",
+        "attachments": (str(first), str(second)),
+    }
+    operation = (
+        services.send.execute(SendCommand(**fields))
+        if workflow == "send"
+        else services.save_to_mailbox.execute(SaveToMailboxCommand(**fields))
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await operation
+
+    provider.send.assert_not_awaited()
+    provider.save_to_mailbox.assert_not_awaited()

@@ -8,15 +8,60 @@ independent provider effects, revalidates authority before each, records the
 available protocol evidence, and returns per-target success, failure, unknown,
 or success-with-warning.
 
-Mutation policy is deny-by-default for protected effect classes. The management
-UI in this delivery exposes no mail mutation route.
+Mutation grants default to the fixed five read/write classes, not deny-by-default;
+configuration inheritance is owned by spec 04. The management UI exposes no mail
+mutation route. The static MCP catalog does not change with effective grants.
+
+| Class      | Effects authorized                                                                             |
+| ---------- | ---------------------------------------------------------------------------------------------- |
+| `draft`    | `save_draft` only: append composed MIME to the resolved draft mailbox with fixed `\Draft` flag |
+| `organize` | mark-read/unread, approved flags and semantic tags, move, archive, and mailbox creation        |
+| `delete`   | explicit delete and its UID-scoped deletion/expunge effects                                    |
+| `send`     | send/forward SMTP submission and narrowly their successful-message Sent copy                   |
+| `append`   | general `save_to_mailbox`, including caller-selected mailbox and flags                         |
+
+Organization may use deletion only as a scoped move fallback; it MUST NOT
+perform unrestricted expunge or expose generic delete capability. A compose
+request cannot turn `draft` into arbitrary APPEND by naming a mailbox or flags.
+Read-only (`[]`) blocks all these effects, including `mark_as_read=true` on body
+reads; ordinary reads remain available under the existing sender constraints.
+
+## Explicit Protocol Execution
+
+The separately enabled protocol channel (admission in spec 04, MCP interface in
+spec 10) supplements rather than changes the focused workflows below. It owns
+one authenticated IMAP or SMTP connection per call and executes commands in
+order. No sessions, mailbox selection, or SMTP transactions persist across
+calls. Authentication, TLS negotiation, and cleanup remain server-owned.
+
+The executor preserves native protocol semantics, including broader destructive
+effects explicitly authorized by the advanced-access flag. It does not create
+mailboxes implicitly, compose MIME, save Sent copies, invent per-UID outcomes,
+or implement MOVE fallbacks. It uses supported protocol-library commands with
+small state/response/literal adapters, not arbitrary Python dispatch or a new
+scripting runtime. HELP performs no provider work.
+
+Recheck admission and account connection identity before each command and before
+DATA/APPEND payload submission. Stop at the first rejection, policy change,
+timeout, cancellation, unexpected continuation, or receive/result limit. Retain
+earlier command evidence and mark subsequent commands not attempted. Never
+retry automatically or claim rollback. Discard interrupted/unsynchronized
+connections. Cleanup never issues CLOSE or EXPUNGE implicitly; an explicit
+caller CLOSE retains its destructive protocol semantics.
+
+Invalidate the selected account's metadata coverage before sending user commands
+and again after execution/interruption. Initial invalidation failure prevents
+execution; final invalidation failure adds a warning without changing acknowledged
+provider outcomes. This conservative approach avoids guessing affected mailbox
+sets and does not claim isolation from concurrent readers.
 
 ## Common Mutation Pipeline
 
 For each target, in caller order:
 
 1. validate all request and aggregate limits;
-2. read and validate the current account, mailbox, and effective policy;
+2. read and validate the current account, mailbox, effective mutation grant, and
+   other policy; repeat these checks freshly at each independent effect boundary;
 3. qualify current provider state and required capability;
 4. check cancellation before the effect begins;
 5. resolve only the required selected-account secret and construct the provider;
@@ -60,15 +105,56 @@ separate `mark_as_read` option requests the focused workflow. Tagged protocol
 completion produces individual success, failure, or unknown outcomes, and an
 ambiguous effect is not retried automatically.
 
+`set_email_tags` is the separate provider-keyword workflow. Inputs use
+configured semantic names only; every requested tag must exist in the current
+account configuration and have `writable=true`. Name matching is
+ASCII-case-insensitive and non-writable is the safe per-tag default. The request
+selects exactly one idempotent operation, `add` or `remove`, and a non-empty
+unique semantic-tag list. The provider issues one UID-scoped `+FLAGS.SILENT` or
+`-FLAGS.SILENT` command per target with only the resolved provider keywords.
+Unknown provider keywords, read-only configured tags, and all standard system
+flags are untouched. The workflow retains input-aligned per-UID outcomes,
+sender-policy behavior, timeout/ambiguity evidence, current-authority checks,
+and projection invalidation. It makes no mailbox-wide or multi-target atomicity
+claim.
+
+## Save Draft
+
+`save_draft` is an independent MCP tool sharing the common MIME composition and
+APPEND implementation with `save_to_mailbox` and Sent-copy saving. It requires
+`draft`, not `append` or SMTP capability. Its compose fields allow an explicit
+empty recipient list and optional CC/BCC, subject, body, attachments, and threading
+headers. All supplied recipients require the existing recipient policy; no
+recipients is a valid draft even with an empty allowlist. Attachment preflight
+and reads occur only after account and policy authorization.
+
+It exposes no target mailbox or flags. Resolve the account's optional
+`drafts_mailbox` or exactly one special-use `\Drafts` mailbox (spec 04); apply
+only the fixed `\Draft` flag. Do not guess `Drafts`, create a mailbox, or use
+general APPEND grants as a fallback. Revalidate the effective `draft` grant and
+current account/destination authority before APPEND. Return the same APPEND
+success, assigned-UID/unknown-placement, and ambiguity semantics as the shared
+append implementation. No operation journal or approval token is required.
+
 ## Save or Append
 
-Saving a message to a mailbox is an IMAP APPEND effect. The request bounds
+`save_to_mailbox` requires `append`, even when its destination happens to be a
+draft mailbox. Saving a message to a mailbox is an IMAP APPEND effect. The request bounds
 headers, recipients, subject, body, encoded message bytes, attachments, and
 destination. File attachments preserve their inferred MIME main type and subtype
-rather than being coerced into `application/*`. APPEND flags accept system flags
+rather than being coerced into `application/*`. Caller-supplied attachment paths,
+here and for SMTP submission, are validated syntactically with the rest of the
+request, but no filesystem access to them (size preflight or read) happens until
+account resolution, send capability where applicable, and recipient policy have
+accepted the request against the opened authority snapshot. APPEND flags accept system flags
 and provider keywords only when each is one complete IMAP atom; legal keyword
 forms such as `$Forwarded`, dotted names, and leading digits are not narrowed by
 a local identifier grammar, while controls and protocol specials are rejected.
+General APPEND with a case-insensitive `\Deleted` flag additionally requires
+`delete`, checked before provider access and freshly before APPEND. Full-grant
+accounts retain their historical ability to append messages with this flag;
+`append` alone does not authorize it. The flag applies only to the new message:
+modifying or expunging existing UIDs remains owned by the scoped delete workflow.
 Every APPEND path serializes the complete MIME message with CRLF line endings and
 does not emit bare LF or CR line breaks, including draft and sent-copy placement.
 When composing `In-Reply-To` or `References`, a simple whitespace-separated list
@@ -102,6 +188,26 @@ placement/projection warning rather than resubmitting.
 A move uses native UID MOVE when the provider advertises and supports it. A
 fallback may use UID COPY followed by a deletion/expunge sequence only when the
 provider offers a scoped primitive that cannot expunge unrelated messages.
+
+`move_emails` accepts exactly one of an explicit `destination_mailbox` or
+`destination_role="junk"`. Existing explicit-destination calls retain their
+success and partial-result literals. Role-based moves return the resolved
+mailbox even in partial/unknown results. Only the destination is discovered;
+the source remains caller-selected and the supplied UIDs must have been listed
+in that source mailbox. Restoring from Junk uses newly listed Junk UIDs and an
+explicit move to INBOX, never the original pre-move UID.
+
+Junk discovery prefers exactly one selectable special-use `\Junk` mailbox,
+then exactly one selectable common-name match (`Junk`, `Spam`, `[Gmail]/Spam`,
+`Junk E-mail`, `Junk Email`). Exclude `\Noselect`, preserve the server's actual
+name, reject missing/ambiguous discovery or a source-equal destination, and
+never create a mailbox. Explicit destinations remain available when discovery
+cannot decide. Require `organize` before discovery and reopen current
+selected-mode authority before moving; reuse the same scoped MOVE pipeline,
+per-target evidence, timeout handling, and projection invalidation. A discovery
+timeout fails before mutation; a move-effect timeout remains unknown and is
+not replayed. This requests a mailbox move, not guaranteed provider-side spam
+training or reporting. No separate spam/ham tool or rule engine is introduced.
 
 Archive resolves an explicit destination policy and then follows the same move
 contract. Destination creation, if supported, is a separate effect with its own
@@ -143,6 +249,44 @@ mailbox bound, and results name the label rather than the mailbox derived from
 it. Reusing the existing effects is normative rather than incidental — a second
 implementation could drift from the gate, the allowlist, or the invalidation
 rules those effects already carry.
+
+## Mailbox Creation
+
+`create_mailbox` is the upstream workflow that creates a mailbox. It is an explicit,
+caller-requested effect under `organize`; move, archive, Junk discovery, draft
+resolution, and append never create a mailbox implicitly. In this fork the
+mailbox-shape `create_folder` (and `create_label`, which delegates to it) is the
+other explicit CREATE path; it additionally requires `enable_folder_management`.
+
+The caller supplies the exact server mailbox name, including any hierarchy
+delimiter and namespace prefix as reported by `list_mailboxes`. The service does
+not split, join, or guess hierarchy; intermediate levels are created only as the
+server's own CREATE semantics allow. Names are bounded like other mailbox names
+and reject empty values and the LIST wildcards `*` and `%`. Names are sent in
+RFC 3501 modified UTF-7.
+
+The workflow validates the request, requires `organize`, opens the provider, and
+requires `organize` again. In the same session, `LIST <name> ""` discovers the
+requested namespace's hierarchy delimiter, including for a nonexistent mailbox.
+A name ending in that delimiter is rejected before CREATE, not silently trimmed;
+a NIL delimiter denotes a flat namespace and imposes no suffix restriction.
+Failure to discover a unique delimiter fails before CREATE. The workflow then
+checks existence with an exact `LIST "" <name>`; a returned entry with the same name (case-insensitive only for
+`INBOX`) yields `already_exists` without any write. Entries flagged `\Noselect`
+or `\NonExistent` are hierarchy placeholders, not mailboxes, and do not count. Otherwise the grant is
+revalidated immediately before a single `CREATE`. Evidence maps as follows:
+
+| Provider evidence                    | Result                                    |
+| ------------------------------------ | ----------------------------------------- |
+| `OK`                                 | `created`                                 |
+| `NO` with RFC 5530 `[ALREADYEXISTS]` | `already_exists`                          |
+| other `NO` or `BAD`                  | bounded provider failure, no raw response |
+| timeout or interrupted connection    | `unknown`, `reconciliation_needed=true`   |
+
+The tool is idempotent by contract: repeating it for an existing mailbox reports
+`already_exists`. An `unknown` CREATE is not replayed automatically; the caller
+reconciles with `list_mailboxes`. Creation does not SUBSCRIBE the mailbox. The
+mailbox list is not projected, so creation requires no metadata invalidation.
 
 ## Delete and Scoped Expunge
 
@@ -219,6 +363,15 @@ RFC 5321 limit, requires a binary submission path. This client does not implemen
 advertises those capabilities. The preflight does not silently rewrite MIME
 parts or attempt a recursive base64/quoted-printable downgrade.
 
+SMTP delivery requires `send`. Its IMAP Sent-copy APPEND is a narrow part of
+that same grant, not a use of generic `append`: only the successfully submitted
+message may be copied to the configured/resolved Sent destination, under the
+existing Sent-copy flags and behavior. It cannot authorize caller-selected
+APPEND, save a failed/unknown submission, or bypass freshly checked effective
+`send`, lifecycle, endpoint, recipient, or other policy at the copy boundary.
+Revocation after SMTP success skips the copy with a warning while preserving
+SMTP success; it never triggers resubmission.
+
 SMTP delivery and IMAP sent-copy APPEND are independent effects:
 
 ```mermaid
@@ -250,7 +403,13 @@ reports delivery and sent-copy outcomes. If SMTP is unknown, automated replay is
 forbidden; operator reconciliation is required.
 
 Message-ID or other local identifiers can aid reconciliation but do not create
-exactly-once guarantees.
+exactly-once guarantees. The delivery result carries the composed `Message-ID`
+only once the provider has accepted the message data; a rejected or ambiguous
+submission MUST report no identifier. A caller keeping its own record of what was
+sent can therefore cite an identifier exactly when the server can vouch for it,
+rather than choosing between an empty record and an invented one. The sent-copy
+APPEND reports its own identifier independently and never substitutes for
+delivery evidence.
 
 ### Forward
 
@@ -348,8 +507,30 @@ enter public errors.
 
 ## Acceptance Criteria
 
+- **07-P1:** Protocol calls use isolated authenticated sessions and native primitives;
+  SELECT/EXAMINE, FETCH literals, APPEND and SMTP DATA preserve protocol state
+  and evidence. First failure stops later commands without replay or implicit
+  expunge. Receive limits precede buffering; revocation before payload blocks it.
+  Account coverage invalidation precedes commands and follows effects; final
+  invalidation failure cannot replace remote evidence.
+
+- Each effect maps to the class above, including explicit/implicit mark-read,
+  scoped organize fallback, delete, general append, recipientless draft, forward,
+  and the successful-message-only Sent-copy exception. Missing grants fail
+  before effects and freshly revoked grants stop subsequent independent effects.
+- Draft-only authority exposes no caller mailbox/flags, chooses only configured
+  or unique special-use Drafts, never creates/guesses a mailbox, and shares MIME
+  serialization/UTF-8/attachment/APPEND evidence with the existing append path.
+- Junk moves preserve explicit-destination compatibility, reject conflicting
+  selectors and non-selectable/ambiguous discovery, reopen authority before
+  moving, report resolved placement, and restore with newly listed source UIDs.
+  Tests cover missing/stale UIDs, discovery versus effect timeouts, revoked
+  organize permission, and projection failure without replay or bare EXPUNGE.
+
 1. Every mutation revalidates current authority before each independent provider
-   effect and resolves only the needed account/role secret.
+   effect and resolves only the needed account/role secret. Tests prove that a
+   send-incapable or recipient-denied submission or save never accesses
+   caller-supplied attachment paths.
 2. Per-target results preserve caller order and distinguish success, failure,
    unknown, cancelled-before-effect, and local projection warning.
 3. Body retrieval does not mark read by default; explicit mark-read and bounded
@@ -362,13 +543,17 @@ enter public errors.
    failure/unknown never causes SMTP replay. Tests prove display names are safely
    formatted while the SMTP reverse-path uses only the configured account
    address, including when the display name itself contains `@` and when the
-   account address requires SMTPUTF8/RFC 6532 serialization.
+   account address requires SMTPUTF8/RFC 6532 serialization. Submission results
+   report the delivered `Message-ID` when, and only when, the provider accepted
+   the message data. Tests prove a send and a forward name the identifier the
+   recipient actually received, that it survives an independent sent-copy
+   failure, and that a rejected, timed-out, or ambiguous delivery reports none.
 7. Cancellation and timeout tests cover before-effect, known-after-effect, and
    ambiguous boundaries for IMAP and SMTP.
 8. Public numeric IDs are documented and tested as current-mailbox compatibility
    IDs, not durable listing-epoch tokens.
 9. No management UI route can invoke mail mutations in this delivery.
-10. Byte-level tests prove every IMAP APPEND path serializes MIME messages with
+10. Byte-level tests prove every focused-tool IMAP APPEND path serializes MIME messages with
     CRLF line endings and emits no bare LF or CR line breaks. Composition tests
     also prove that bare simple Message-IDs gain RFC angle brackets, already
     bracketed IDs are not double-wrapped, mixed `References` lists normalize as
@@ -451,4 +636,19 @@ enter public errors.
     source and trash projections while permanent removal invalidates only the
     source, that special-use matching accepts the `\Trash` attribute ahead of
     case-insensitive common names and rejects lookalikes, and that the result
-    distinguishes a move to trash from a permanent deletion.
+    distinguishes a move to trash from a permanent deletion. The trash move is
+    authorized by the `delete` grant rather than `organize`.
+21. Tag mutation tests prove add, per-message replacement, empty replacement,
+    multiple UIDs, non-writable rejection, and preservation of system,
+    read-only, and unknown keywords with the same effect evidence and metadata
+    invalidation rules as other mailbox mutations.
+22. Mailbox creation tests prove exact-name CREATE with modified UTF-7 encoding,
+    `already_exists` from both the pre-effect LIST and `[ALREADYEXISTS]`
+    without a second write, bounded failure for other `NO`/`BAD`, `unknown`
+    with `reconciliation_needed` and no replay on timeout, wildcard/empty name
+    rejection before provider access, namespace-specific trailing-delimiter
+    rejection without CREATE or normalization, preservation of non-delimiter
+    suffixes and flat namespaces, `organize` denial before provider access,
+    revocation between existence check and CREATE, and that no workflow other
+    than `create_mailbox` and the gated mailbox-shape `create_folder` issues CREATE. The explicitly opted-in protocol executor is a separate native
+    primitive surface, not a focused workflow.

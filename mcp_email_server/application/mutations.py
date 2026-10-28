@@ -4,9 +4,9 @@ import asyncio
 import html
 import json
 from collections.abc import Awaitable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar, cast
 
 from mcp_email_server.application.labels import label_mailbox, validate_label_name
 from mcp_email_server.application.limits import (
@@ -17,9 +17,17 @@ from mcp_email_server.application.limits import (
     validate_serialized_result,
 )
 from mcp_email_server.application.metadata import RuntimeMode
+from mcp_email_server.application.mutation_policy import (
+    DEFAULT_ALLOWED_MUTATIONS,
+    MutationClass,
+    require_append_permissions,
+    require_mutation,
+)
+from mcp_email_server.imap_keywords import ImapKeywordRegistry
 from mcp_email_server.log import logger
 
 MutationStatus = Literal["succeeded", "failed", "unknown"]
+MailboxCreationStatus = Literal["created", "already_exists", "unknown"]
 MutationProviderPurpose = Literal["incoming", "outgoing", "sent-copy"]
 SentCopyStatus = Literal["skipped", "succeeded", "failed", "unknown"]
 FlagOperation = Literal["add", "remove"]
@@ -64,6 +72,9 @@ class MutationAccountSnapshot:
     # Legacy-mode-only gate for mailbox-shape mutations. Managed mode has no policy
     # column for it, so the managed authority path always resolves it to False.
     enable_folder_management: bool = False
+    tag_registry: ImapKeywordRegistry = field(default_factory=ImapKeywordRegistry)
+    allowed_mutations: tuple[MutationClass, ...] = DEFAULT_ALLOWED_MUTATIONS
+    drafts_mailbox: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,10 @@ class AppendMutationOutcome:
 class DeliveryMutationOutcome:
     outcomes: tuple[TargetMutationOutcome, ...]
     sent_message: object | None
+    # RFC 5322 Message-Id of the message the provider accepted, and None whenever
+    # delivery failed or stayed ambiguous. A caller's send journal may therefore
+    # cite an identifier only for a message that was demonstrably handed over.
+    message_id: str | None = None
 
     @property
     def has_accepted_recipient(self) -> bool:
@@ -157,6 +172,9 @@ class SendMutationOutcome:
     delivery: tuple[TargetMutationOutcome, ...]
     sent_copy: SentCopyMutationOutcome
     reconciliation_needed: bool = False
+    # Carried from the delivery effect, never from composition: an ambiguous or
+    # failed submission reports no identifier rather than one it cannot vouch for.
+    message_id: str | None = None
 
     def __post_init__(self) -> None:
         ambiguous = any(item.status == "unknown" for item in self.delivery) or self.sent_copy.status == "unknown"
@@ -194,6 +212,36 @@ class SetEmailFlagsCommand:
 
 
 @dataclass(frozen=True)
+class SetEmailTagsCommand:
+    account_name: str
+    email_ids: tuple[str, ...]
+    operation: FlagOperation
+    tags: tuple[str, ...]
+    mailbox: str = "INBOX"
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        _validate_email_ids(self.email_ids)
+        validate_mailbox_name(self.mailbox)
+        if self.operation not in ("add", "remove"):
+            raise ValueError("operation must be 'add' or 'remove'")
+        if not self.tags:
+            raise ValueError("tags must not be empty")
+        if len(self.tags) > APPLICATION_LIMITS.flags:
+            raise ValueError(f"tags must contain at most {APPLICATION_LIMITS.flags} values")
+        if any(not isinstance(tag, str) for tag in self.tags):
+            raise ValueError("tags must contain strings")
+        if len({tag.casefold() for tag in self.tags}) != len(self.tags):
+            raise ValueError("tags must not contain duplicates, ignoring case")
+        for tag in self.tags:
+            validate_controlled_string(
+                tag,
+                field_name="tags item",
+                maximum_bytes=APPLICATION_LIMITS.flag_bytes,
+            )
+
+
+@dataclass(frozen=True)
 class MarkReadCommand:
     account_name: str
     email_ids: tuple[str, ...]
@@ -222,18 +270,40 @@ class MoveCommand:
     account_name: str
     email_ids: tuple[str, ...]
     source_mailbox: str
-    destination_mailbox: str
+    destination_mailbox: str | None = None
+    destination_role: Literal["junk"] | None = None
 
     def validate(self) -> None:
         _validate_account_name(self.account_name)
         _validate_email_ids(self.email_ids)
         validate_mailbox_name(self.source_mailbox)
+        if (self.destination_mailbox is None) == (self.destination_role is None):
+            raise ValueError("Specify exactly one of destination_mailbox or destination_role")
+        if self.destination_mailbox is None:
+            if self.destination_role != "junk":
+                raise ValueError("destination_role must be 'junk'")
+            return
         validate_mailbox_name(self.destination_mailbox)
         same_reserved_inbox = (
             self.source_mailbox.casefold() == "inbox" and self.destination_mailbox.casefold() == "inbox"
         )
         if self.source_mailbox == self.destination_mailbox or same_reserved_inbox:
             raise ValueError("source_mailbox and destination_mailbox must differ")
+
+
+_MAILBOX_LIST_WILDCARDS = frozenset("*%")
+
+
+@dataclass(frozen=True)
+class CreateMailboxCommand:
+    account_name: str
+    mailbox: str
+
+    def validate(self) -> None:
+        _validate_account_name(self.account_name)
+        validate_mailbox_name(self.mailbox)
+        if _MAILBOX_LIST_WILDCARDS & set(self.mailbox):
+            raise ValueError("mailbox must not contain IMAP LIST wildcards '*' or '%'")
 
 
 @dataclass(frozen=True)
@@ -356,8 +426,11 @@ class ComposeCommand:
     references: str | None = None
 
     def validate(self) -> None:
+        self._validate_compose()
+
+    def _validate_compose(self, *, allow_recipientless: bool = False) -> None:
         _validate_account_name(self.account_name)
-        _validate_recipients((*self.recipients, *self.cc, *self.bcc))
+        _validate_recipients((*self.recipients, *self.cc, *self.bcc), allow_empty=allow_recipientless)
         _validate_content(self.subject, self.body, self.attachments)
         _validate_optional_header("in_reply_to", self.in_reply_to)
         _validate_optional_header("references", self.references)
@@ -387,6 +460,17 @@ class SaveToMailboxCommand(ComposeCommand):
                     maximum_bytes=APPLICATION_LIMITS.flag_bytes,
                     allow_empty=True,
                 )
+
+
+@dataclass(frozen=True)
+class DraftAppendCommand(SaveToMailboxCommand):
+    """Internal trusted draft APPEND, never accepted directly from MCP."""
+
+
+@dataclass(frozen=True)
+class SaveDraftCommand(ComposeCommand):
+    def validate(self) -> None:
+        self._validate_compose(allow_recipientless=True)
 
 
 @dataclass(frozen=True)
@@ -556,6 +640,12 @@ class MutationProvider(Protocol):
         account: MutationAccountSnapshot,
     ) -> BatchMutationOutcome: ...
 
+    async def set_tags(
+        self,
+        command: SetEmailTagsCommand,
+        account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome: ...
+
     async def save_to_mailbox(
         self,
         command: SaveToMailboxCommand,
@@ -572,11 +662,22 @@ class MutationProvider(Protocol):
         self,
         command: MoveCommand,
         account: MutationAccountSnapshot,
+        *,
+        grant: MutationClass = "organize",
     ) -> BatchMutationOutcome: ...
+
+    async def create_mailbox(
+        self,
+        command: CreateMailboxCommand,
+        account: MutationAccountSnapshot,
+    ) -> MailboxCreationStatus: ...
+
+    async def find_drafts_mailbox(self) -> str: ...
 
     async def find_archive_mailbox(self, source_mailbox: str) -> str: ...
 
     async def find_trash_mailbox(self, source_mailbox: str) -> str | None: ...
+    async def find_junk_mailbox(self) -> str: ...
 
     async def send(
         self,
@@ -705,10 +806,10 @@ def _validate_email_ids(email_ids: tuple[str, ...]) -> None:
         validate_imap_uid(email_id, field_name="email_ids item")
 
 
-def _validate_recipients(recipients: tuple[str, ...]) -> None:
+def _validate_recipients(recipients: tuple[str, ...], *, allow_empty: bool = False) -> None:
     from email.utils import getaddresses
 
-    if not recipients:
+    if not recipients and not allow_empty:
         raise ValueError("at least one recipient is required")
     if len(recipients) > APPLICATION_LIMITS.recipients:
         raise ValueError(f"recipient batch must contain at most {APPLICATION_LIMITS.recipients} values")
@@ -735,21 +836,40 @@ def _validate_content(subject: str, body: str, attachments: tuple[str, ...]) -> 
     )
     if len(body.encode("utf-8")) > APPLICATION_LIMITS.body_bytes:
         raise ValueError(f"body exceeds {APPLICATION_LIMITS.body_bytes} bytes")
-    _validate_attachments(attachments)
+    _validate_attachment_paths(attachments)
 
 
-def _validate_attachments(attachments: tuple[str, ...]) -> None:
+def _validate_attachment_paths(attachments: tuple[str, ...]) -> None:
+    """Bound caller-supplied attachment paths without touching the filesystem.
+
+    Command validation runs before account authority is known, so it stays
+    purely syntactic. Filesystem size evidence is gathered separately by
+    ``_preflight_attachment_sizes`` once the request has been authorized.
+    """
+
     if len(attachments) > APPLICATION_LIMITS.attachments:
         raise ValueError(f"attachments must contain at most {APPLICATION_LIMITS.attachments} paths")
     if any(not isinstance(raw_path, str) for raw_path in attachments):
         raise ValueError("attachment paths must be strings")
-    total_size = 0
     for raw_path in attachments:
         validate_controlled_string(
             raw_path,
             field_name="attachment path",
             maximum_bytes=APPLICATION_LIMITS.attachment_path_bytes,
         )
+
+
+def _preflight_attachment_sizes(attachments: tuple[str, ...]) -> None:
+    """Bound attachment sizes from filesystem metadata before a provider effect.
+
+    Callers invoke this only after account resolution, send capability, and
+    recipient policy have accepted the request. A rejected request therefore
+    never stats caller-supplied paths, which on Windows could otherwise open an
+    SMB/WebDAV session for a UNC path the request was never allowed to use.
+    """
+
+    total_size = 0
+    for raw_path in attachments:
         path = Path(raw_path)
         try:
             metadata = path.stat()
@@ -801,7 +921,7 @@ def _quoted_body(body: str, quote_html: str) -> str:
 def _validate_forward_source(source: ForwardSource) -> None:
     """Bound in-memory forwarded parts before any delivery.
 
-    ``_validate_attachments`` bounds caller-supplied filesystem paths; forwarded
+    ``_preflight_attachment_sizes`` bounds caller-supplied filesystem paths; forwarded
     parts never touch the filesystem, so their declared sizes are bounded here
     against the same limits. The derived subject and body are validated once,
     by ``ComposeCommand.validate`` on the derived command — not duplicated here.
@@ -851,17 +971,20 @@ def _validate_optional_header(name: str, value: str | None) -> None:
 
 
 def _recipient_policy_allows(recipient: str, allowed: tuple[str, ...]) -> bool:
-    # Re-parse the validated single-address value so direct application callers
-    # receive the same exact allowlist decision as the MCP compatibility gate.
+    """Match explicit recipient glob authority; an empty allowlist denies all."""
+    # Re-parse the validated single-address value for normalized matching shared
+    # by MCP and direct application callers. Input validation still applies to '*'.
     from email.utils import getaddresses
+    from fnmatch import fnmatchcase
 
     from mcp_email_server.config import normalize_address
 
     if not allowed:
-        return True
+        return False
     addresses = [normalize_address(address) for _, address in getaddresses([recipient]) if address]
-    allowed_set = set(allowed)
-    return bool(addresses) and all(address in allowed_set for address in addresses)
+    return bool(addresses) and all(
+        any(fnmatchcase(address, pattern.lower()) for pattern in allowed) for address in addresses
+    )
 
 
 def _validate_recipient_policy(command: ComposeCommand, account: MutationAccountSnapshot) -> None:
@@ -986,9 +1109,23 @@ def _validate_append_result(outcome: AppendMutationOutcome) -> AppendMutationOut
     return outcome
 
 
+def _validate_optional_message_id(message_id: str | None) -> None:
+    if message_id is None:
+        return
+    _validate_result_string(
+        message_id,
+        field_name="message_id",
+        maximum_bytes=APPLICATION_LIMITS.header_bytes,
+    )
+
+
 def _validate_delivery_result(outcome: DeliveryMutationOutcome) -> DeliveryMutationOutcome:
     _validate_target_outcomes(outcome.outcomes)
-    _validate_result_payload({"outcomes": [_outcome_payload(item) for item in outcome.outcomes]})
+    _validate_optional_message_id(outcome.message_id)
+    _validate_result_payload({
+        "outcomes": [_outcome_payload(item) for item in outcome.outcomes],
+        "message_id": outcome.message_id,
+    })
     return outcome
 
 
@@ -1008,6 +1145,7 @@ def _validate_sent_copy_result(outcome: SentCopyMutationOutcome) -> SentCopyMuta
 def _validate_send_result(outcome: SendMutationOutcome) -> SendMutationOutcome:
     _validate_target_outcomes(outcome.delivery)
     _validate_sent_copy_result(outcome.sent_copy)
+    _validate_optional_message_id(outcome.message_id)
     _validate_result_payload({
         "delivery": [_outcome_payload(item) for item in outcome.delivery],
         "sent_copy": {
@@ -1016,6 +1154,7 @@ def _validate_send_result(outcome: SendMutationOutcome) -> SendMutationOutcome:
             "detail": outcome.sent_copy.detail,
         },
         "reconciliation_needed": outcome.reconciliation_needed,
+        "message_id": outcome.message_id,
     })
     return outcome
 
@@ -1064,69 +1203,65 @@ class _MutationWorkflow:
     ) -> SendMutationOutcome:
         """Attach the independent Sent copy to already-authoritative delivery.
 
-        Every submission workflow shares this tail so the ambiguity and
-        ``reconciliation_needed`` semantics have exactly one owner.
+        Every submission workflow shares this tail so the ambiguity,
+        ``reconciliation_needed``, and reported-identifier semantics have exactly
+        one owner.
         """
 
+        def completed(
+            sent_copy: SentCopyMutationOutcome,
+            *,
+            reconciliation_needed: bool = False,
+        ) -> SendMutationOutcome:
+            """Report the delivery evidence identically on every sent-copy path."""
+            return _validate_send_result(
+                SendMutationOutcome(
+                    delivery.outcomes,
+                    sent_copy,
+                    reconciliation_needed,
+                    message_id=delivery.message_id,
+                )
+            )
+
         if not delivery.has_accepted_recipient or delivery.sent_message is None:
-            return _validate_send_result(SendMutationOutcome(delivery.outcomes, SentCopyMutationOutcome("skipped")))
+            return completed(SentCopyMutationOutcome("skipped"))
 
         # Saving the copy is a separate provider effect and therefore gets a fresh
         # lifecycle/credential resolution. SMTP delivery is never rewritten.
         try:
             sent_access = self._open(account, purpose="sent-copy")
+            require_mutation(sent_access.account.allowed_mutations, "send")
         except Exception:
             # SMTP delivery is already authoritative. Lifecycle or credential
             # failure before opening the independent copy cannot erase it.
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
-                )
-            )
+            return completed(SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"))
         try:
             sent_copy = await _bounded_provider_effect(sent_access.provider.save_sent_copy(delivery.sent_message, bcc))
+        except PermissionError:
+            return completed(SentCopyMutationOutcome("failed", detail="mutation-policy"))
         except MutationProviderError:
             # Typed APPEND-boundary cancellation is returned by the provider;
             # escaped setup/cancellation happened before APPEND started.
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
-                )
-            )
+            return completed(SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"))
         except TimeoutError:
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("unknown", detail="provider-timeout"),
-                    reconciliation_needed=True,
-                )
+            return completed(
+                SentCopyMutationOutcome("unknown", detail="provider-timeout"),
+                reconciliation_needed=True,
             )
         except asyncio.CancelledError:
             # Provider adapters use typed unknown outcomes once APPEND may have
             # started; an escaped cancellation is therefore pre-effect setup.
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"),
-                )
-            )
+            return completed(SentCopyMutationOutcome("failed", detail="sent-copy-unavailable"))
         except Exception:
             # Treat an untyped provider escape conservatively rather than claim
             # that an APPEND definitely did not happen.
-            return _validate_send_result(
-                SendMutationOutcome(
-                    delivery.outcomes,
-                    SentCopyMutationOutcome("unknown", detail="sent-copy"),
-                )
-            )
+            return completed(SentCopyMutationOutcome("unknown", detail="sent-copy"))
         sent_copy = _validate_sent_copy_result(sent_copy)
         reconciliation_needed = False
         if sent_copy.status in ("succeeded", "unknown") and sent_copy.mailbox is not None:
             invalidated = await self._invalidate(sent_access.account, (sent_copy.mailbox,))
             reconciliation_needed = not invalidated
-        return _validate_send_result(SendMutationOutcome(delivery.outcomes, sent_copy, reconciliation_needed))
+        return completed(sent_copy, reconciliation_needed=reconciliation_needed)
 
     @staticmethod
     def _require_send_capability(account: MutationAccountSnapshot) -> None:
@@ -1149,7 +1284,9 @@ class SetEmailFlagsService(_MutationWorkflow):
     async def execute(self, command: SetEmailFlagsCommand) -> BatchMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "organize")
         access = self._open(account)
+        require_mutation(access.account.allowed_mutations, "organize")
         try:
             outcome = _validate_batch_result(
                 await _bounded_provider_effect(access.provider.set_flags(command, access.account))
@@ -1162,6 +1299,37 @@ class SetEmailFlagsService(_MutationWorkflow):
         return _validate_batch_result(
             BatchMutationOutcome(
                 outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
+            )
+        )
+
+
+class SetEmailTagsService(_MutationWorkflow):
+    async def execute(self, command: SetEmailTagsCommand) -> BatchMutationOutcome:
+        command.validate()
+        account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "organize")
+        # Reject invalid semantic input before provider construction, then use
+        # the freshly opened authority snapshot for the actual provider keyword.
+        account.tag_registry.resolve(command.tags, require_writable=True)
+        access = self._open(account)
+        require_mutation(access.account.allowed_mutations, "organize")
+        provider_command = replace(
+            command,
+            tags=access.account.tag_registry.resolve(command.tags, require_writable=True),
+        )
+        try:
+            outcome = _validate_batch_result(
+                await _bounded_provider_effect(access.provider.set_tags(provider_command, access.account))
+            )
+        except TimeoutError:
+            outcome = _validate_batch_result(_timeout_batch(command.email_ids))
+        if not outcome.effect_may_have_started:
+            return outcome
+        invalidated = await self._invalidate(access.account, (command.mailbox,))
+        return _validate_batch_result(
+            BatchMutationOutcome(
+                outcome.outcomes,
+                reconciliation_needed=outcome.reconciliation_needed or not invalidated,
             )
         )
 
@@ -1188,9 +1356,12 @@ class SaveToMailboxService(_MutationWorkflow):
     async def execute(self, command: SaveToMailboxCommand) -> AppendMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_append_permissions(account.allowed_mutations, command.flags)
         _validate_recipient_policy(command, account)
         access = self._open(account)
+        require_append_permissions(access.account.allowed_mutations, command.flags)
         _validate_recipient_policy(command, access.account)
+        _preflight_attachment_sizes(command.attachments)
         try:
             outcome = _validate_append_result(
                 await _bounded_provider_effect(access.provider.save_to_mailbox(command, access.account))
@@ -1234,6 +1405,40 @@ class DeleteMutationOutcome:
     trash_mailbox: str | None
 
 
+class SaveDraftService(_MutationWorkflow):
+    async def execute(self, command: SaveDraftCommand) -> AppendMutationOutcome:
+        command.validate()
+        account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "draft")
+        _validate_recipient_policy(command, account)
+        access = self._open(account)
+        require_mutation(access.account.allowed_mutations, "draft")
+        mailbox = access.account.drafts_mailbox
+        if mailbox is None:
+            mailbox = await _bounded_provider_effect(access.provider.find_drafts_mailbox())
+        validate_mailbox_name(mailbox)
+        # Discovery is a read; reopen fresh authority before the independent APPEND.
+        access = self._open(account)
+        require_mutation(access.account.allowed_mutations, "draft")
+        if access.account.drafts_mailbox != account.drafts_mailbox:
+            raise PermissionError("Draft mailbox authority changed; retry")
+        _validate_recipient_policy(command, access.account)
+        _preflight_attachment_sizes(command.attachments)
+        append = DraftAppendCommand(**vars(command), mailbox=mailbox, flags=(r"\Draft",))
+        try:
+            outcome = _validate_append_result(
+                await _bounded_provider_effect(access.provider.save_to_mailbox(append, access.account))
+            )
+        except TimeoutError:
+            outcome = AppendMutationOutcome(
+                "unknown", "", mailbox=mailbox, detail="provider-timeout", reconciliation_needed=True
+            )
+        if outcome.status in ("succeeded", "unknown"):
+            invalidated = await self._invalidate(access.account, (mailbox,))
+            outcome = replace(outcome, reconciliation_needed=outcome.reconciliation_needed or not invalidated)
+        return _validate_append_result(outcome)
+
+
 class DeleteService(_MutationWorkflow):
     """Delete into Trash when the account has one, permanently when it does not.
 
@@ -1249,7 +1454,9 @@ class DeleteService(_MutationWorkflow):
     async def execute(self, command: DeleteCommand) -> DeleteMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "delete")
         discovery = self._open(account)
+        require_mutation(discovery.account.allowed_mutations, "delete")
         try:
             trash_mailbox = await _bounded_provider_effect(discovery.provider.find_trash_mailbox(command.mailbox))
         except TimeoutError:
@@ -1269,10 +1476,13 @@ class DeleteService(_MutationWorkflow):
             expected_mode=account.mode,
             purpose="incoming",
         )
+        require_mutation(access.account.allowed_mutations, "delete")
+        # Trash-first is still a delete: the move into Trash is authorized by the
+        # delete grant, so an account without ``organize`` can still delete.
         effect = (
             access.provider.delete(command, access.account)
             if move is None
-            else access.provider.move(move, access.account)
+            else access.provider.move(move, access.account, grant="delete")
         )
         try:
             outcome = _validate_batch_result(await _bounded_provider_effect(effect))
@@ -1297,25 +1507,49 @@ class DeleteService(_MutationWorkflow):
         return DeleteMutationOutcome(outcome, trash_mailbox)
 
 
+@dataclass(frozen=True)
+class MoveMutationOutcome:
+    batch: BatchMutationOutcome
+    destination_mailbox: str
+
+
 class MoveService(_MutationWorkflow):
-    async def execute(self, command: MoveCommand) -> BatchMutationOutcome:
+    async def execute(self, command: MoveCommand) -> MoveMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "organize")
         access = self._open(account)
+        require_mutation(access.account.allowed_mutations, "organize")
+        if command.destination_role == "junk":
+            try:
+                destination = await _bounded_provider_effect(access.provider.find_junk_mailbox())
+            except TimeoutError:
+                raise MutationProviderError("junk mailbox discovery timed out") from None
+            command = replace(command, destination_mailbox=destination, destination_role=None)
+            command.validate()
+            # Discovery does not authorize the subsequent move effect.
+            access = self._open(account)
+            require_mutation(access.account.allowed_mutations, "organize")
+        destination_mailbox = cast(str, command.destination_mailbox)
         try:
             outcome = _validate_batch_result(
                 await _bounded_provider_effect(access.provider.move(command, access.account))
             )
         except TimeoutError:
             outcome = _validate_batch_result(_timeout_batch(command.email_ids))
-        if not outcome.effect_may_have_started:
-            return outcome
-        invalidated = await self._invalidate(access.account, (command.source_mailbox, command.destination_mailbox))
-        return _validate_batch_result(
-            BatchMutationOutcome(
-                outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
+        if outcome.effect_may_have_started:
+            invalidated = await self._invalidate(access.account, (command.source_mailbox, destination_mailbox))
+            outcome = _validate_batch_result(
+                BatchMutationOutcome(
+                    outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
+                )
             )
-        )
+        _validate_result_payload({
+            "outcomes": [_outcome_payload(item) for item in outcome.outcomes],
+            "reconciliation_needed": outcome.reconciliation_needed,
+            "destination_mailbox": destination_mailbox,
+        })
+        return MoveMutationOutcome(outcome, destination_mailbox)
 
 
 @dataclass(frozen=True)
@@ -1328,7 +1562,9 @@ class ArchiveService(_MutationWorkflow):
     async def execute(self, command: ArchiveCommand) -> ArchiveMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "organize")
         discovery = self._open(account)
+        require_mutation(discovery.account.allowed_mutations, "organize")
         try:
             archive_mailbox = await _bounded_provider_effect(
                 discovery.provider.find_archive_mailbox(command.source_mailbox)
@@ -1348,6 +1584,7 @@ class ArchiveService(_MutationWorkflow):
             expected_mode=account.mode,
             purpose="incoming",
         )
+        require_mutation(access.account.allowed_mutations, "organize")
         try:
             outcome = _validate_batch_result(await _bounded_provider_effect(access.provider.move(move, access.account)))
         except TimeoutError:
@@ -1370,18 +1607,52 @@ class ArchiveService(_MutationWorkflow):
         return result
 
 
+@dataclass(frozen=True)
+class CreateMailboxOutcome:
+    mailbox: str
+    status: MailboxCreationStatus
+    reconciliation_needed: bool
+
+
+class CreateMailboxService(_MutationWorkflow):
+    async def execute(self, command: CreateMailboxCommand) -> CreateMailboxOutcome:
+        command.validate()
+        account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "organize")
+        access = self._open(account)
+        require_mutation(access.account.allowed_mutations, "organize")
+        status: MailboxCreationStatus
+        try:
+            status = await _bounded_provider_effect(access.provider.create_mailbox(command, access.account))
+        except TimeoutError:
+            # CREATE may already have reached the server; never replay.
+            status = "unknown"
+        if status not in ("created", "already_exists", "unknown"):
+            raise MutationProviderError("provider_failure: invalid mailbox creation status")
+        outcome = CreateMailboxOutcome(command.mailbox, status, reconciliation_needed=status == "unknown")
+        _validate_result_payload({
+            "mailbox": outcome.mailbox,
+            "status": outcome.status,
+            "reconciliation_needed": outcome.reconciliation_needed,
+        })
+        return outcome
+
+
 class SendService(_MutationWorkflow):
     async def execute(self, command: SendCommand) -> SendMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "send")
         # In compatibility mode the outgoing open does not itself enforce role
         # presence, so both submission workflows check the same non-secret flag.
         self._require_send_capability(account)
         _validate_recipient_policy(command, account)
         submission = await self._quote_original(command, account)
         access = self._open(account, purpose="outgoing")
+        require_mutation(access.account.allowed_mutations, "send")
         self._require_send_capability(access.account)
         _validate_recipient_policy(submission, access.account)
+        _preflight_attachment_sizes(submission.attachments)
         try:
             delivery = _validate_delivery_result(
                 await _bounded_provider_effect(access.provider.send(submission, access.account))
@@ -1425,6 +1696,7 @@ class ForwardService(_MutationWorkflow):
     async def execute(self, command: ForwardCommand) -> SendMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "send")
         # A forward is a submission: refuse a send-incapable account before the
         # source message is ever logged into, downloaded, or parsed. The flag is
         # non-secret authority evidence, so the outgoing secret stays unresolved
@@ -1432,6 +1704,7 @@ class ForwardService(_MutationWorkflow):
         self._require_send_capability(account)
         _validate_recipient_policy(command, account)
         incoming = self._open(account, purpose="incoming")
+        require_mutation(incoming.account.allowed_mutations, "send")
         self._require_send_capability(incoming.account)
         _validate_recipient_policy(command, incoming.account)
         try:
@@ -1456,6 +1729,7 @@ class ForwardService(_MutationWorkflow):
         ComposeCommand.validate(forwarded)
         # Re-resolve authority immediately before the outgoing submission effect.
         access = self._open(account, purpose="outgoing")
+        require_mutation(access.account.allowed_mutations, "send")
         # Protect source privacy before reporting any independently tightened
         # send capability or recipient policy. Otherwise those errors could
         # distinguish a newly blocked retained source from a missing message.
@@ -1477,7 +1751,9 @@ class CopyService(_MutationWorkflow):
     async def execute(self, command: CopyCommand) -> BatchMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "organize")
         access = self._open(account)
+        require_mutation(access.account.allowed_mutations, "organize")
         try:
             outcome = _validate_batch_result(
                 await _bounded_provider_effect(access.provider.copy(command, access.account))
@@ -1505,7 +1781,11 @@ class _FolderShapeService(_MutationWorkflow):
     the pre-open snapshot and again on the opened account, mirroring
     ``AttachmentDownloadService``: neither a stale snapshot nor a policy change
     between resolution and provider construction may let the effect through.
+    The account's mutation grant (``organize``, or ``delete`` for removal) is
+    required on both snapshots as well.
     """
+
+    _grant: MutationClass = "organize"
 
     _FOLDER_MANAGEMENT_DENIED = (
         "Folder management is disabled. Set 'enable_folder_management=true' in settings "
@@ -1520,9 +1800,11 @@ class _FolderShapeService(_MutationWorkflow):
     def _authorize(self, account_name: str) -> MutationProviderAccess:
         account = self._resolve(account_name)
         self._require_folder_management(account)
+        require_mutation(account.allowed_mutations, self._grant)
         # Re-resolve selected-mode authority immediately before the shape effect.
         access = self._open(account)
         self._require_folder_management(access.account)
+        require_mutation(access.account.allowed_mutations, self._grant)
         return access
 
     async def _settle(
@@ -1557,6 +1839,8 @@ class CreateFolderService(_FolderShapeService):
 
 
 class DeleteFolderService(_FolderShapeService):
+    _grant: MutationClass = "delete"
+
     async def execute(self, command: DeleteFolderCommand) -> FolderMutationOutcome:
         command.validate()
         access = self._authorize(command.account_name)
@@ -1596,7 +1880,9 @@ class RemoveLabelService(_MutationWorkflow):
     async def execute(self, command: RemoveLabelCommand) -> BatchMutationOutcome:
         command.validate()
         account = self._resolve(command.account_name)
+        require_mutation(account.allowed_mutations, "organize")
         access = self._open(account)
+        require_mutation(access.account.allowed_mutations, "organize")
         try:
             outcome = _validate_batch_result(
                 await _bounded_provider_effect(access.provider.remove_label(command, access.account))
@@ -1689,11 +1975,14 @@ class ApplyLabelService:
 @dataclass(frozen=True)
 class MutationServices:
     set_flags: SetEmailFlagsService
+    set_tags: SetEmailTagsService
     mark_read: MarkReadService
+    save_draft: SaveDraftService
     save_to_mailbox: SaveToMailboxService
     delete: DeleteService
     move: MoveService
     archive: ArchiveService
+    create_mailbox: CreateMailboxService
     send: SendService
     forward: ForwardService
     # Port slots for new service fields; add each cluster's fields above its marker.
@@ -1727,11 +2016,14 @@ class MutationServices:
         delete_folder = DeleteFolderService(*arguments)
         return cls(
             set_flags=set_flags,
+            set_tags=SetEmailTagsService(*arguments),
             mark_read=MarkReadService(set_flags),
+            save_draft=SaveDraftService(*arguments),
             save_to_mailbox=SaveToMailboxService(*arguments),
             delete=DeleteService(*arguments),
             move=MoveService(*arguments),
             archive=ArchiveService(*arguments),
+            create_mailbox=CreateMailboxService(*arguments),
             send=SendService(*arguments),
             forward=ForwardService(*arguments),
             # Port slots for new service construction; add each cluster's entries above its marker.

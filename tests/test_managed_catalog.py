@@ -15,6 +15,7 @@ import pytest
 
 from mcp_email_server import managed as managed_module
 from mcp_email_server.config import EmailServer
+from mcp_email_server.imap_keywords import ImapKeywordTag
 from mcp_email_server.managed import (
     SQLITE_BUSY_TIMEOUT_MS,
     WAL_RETRY_BUSY_TIMEOUT_MS,
@@ -108,13 +109,61 @@ def _catalog(tmp_path: Path, store: FakeSecretStore | None = None) -> ManagedCat
     return ManagedCatalog(initialized.path, secret_store=store) if store is not None else initialized
 
 
-def _add_account(catalog: ManagedCatalog, *, outgoing: bool = False) -> None:
+def _v3_catalog(tmp_path: Path) -> ManagedCatalog:
+    parent = _private_directory(tmp_path / "managed-v3")
+    path = parent / "catalog.sqlite3"
+    path.touch(mode=0o600)
+    _harden_private_test_file(path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(managed_module._SCHEMA_V3)
+        connection.execute("INSERT INTO schema_metadata(singleton, version) VALUES (1, 3)")
+        connection.execute(
+            """INSERT INTO catalog(
+                   id, revision, enable_attachment_download,
+                   allowed_recipients_json, allowed_senders_json, report_blocked_mutations
+               ) VALUES ('local', 7, 1, '[\"bob@example.test\"]', '[\"*@example.test\"]', 1)"""
+        )
+        connection.execute(
+            """INSERT INTO managed_account(
+                   id, catalog_id, name, normalized_name, full_name, email_address,
+                   enabled, revision, save_to_sent, sent_folder_name, removed_at
+               ) VALUES (
+                   'account-1', 'local', 'alice', 'alice', 'Alice', 'alice@example.test',
+                   1, 5, 1, 'Sent', NULL
+               )"""
+        )
+        connection.execute(
+            """INSERT INTO endpoint(
+                   account_id, role, host, port, use_ssl, start_ssl, verify_ssl, user_name
+               ) VALUES ('account-1', 'incoming', 'imap.example.test', 993, 1, 0, 1, 'alice@example.test')"""
+        )
+        connection.execute(
+            """INSERT INTO secret_binding(
+                   id, account_id, role, status, opaque_locator, supersedes_id
+               ) VALUES ('binding-1', 'account-1', 'incoming', 'ACTIVE', 'locator-1', NULL)"""
+        )
+        connection.execute("INSERT INTO managed_secret(locator, secret_value) VALUES ('locator-1', 'stored-secret')")
+        connection.commit()
+    return ManagedCatalog(path, secret_store=ManagedSqliteSecretStore(path))
+
+
+def _tag(name: str = "important", keyword: str = "$Important") -> ImapKeywordTag:
+    return ImapKeywordTag(name=name, keyword=keyword, description=f"{name} messages", writable=True)
+
+
+def _add_account(
+    catalog: ManagedCatalog,
+    *,
+    outgoing: bool = False,
+    tags: tuple[ImapKeywordTag, ...] = (),
+) -> None:
     catalog.add_account(
         name="alice",
         full_name="Alice",
         email_address="alice@example.test",
         incoming=_server(),
         outgoing=_server(host="smtp.example.test") if outgoing else None,
+        tags=tags,
     )
 
 
@@ -180,7 +229,8 @@ def test_initialize_adopts_existing_catalog_without_resetting_state(tmp_path: Pa
     policy = catalog.policy()
     catalog.update_policy(
         expected_revision=policy.revision,
-        enable_attachment_download=True,
+        enable_attachment_download=False,
+        enable_attachment_content=True,
         allowed_recipients=("alice@example.test",),
         allowed_senders=(),
         report_blocked_mutations=False,
@@ -191,6 +241,8 @@ def test_initialize_adopts_existing_catalog_without_resetting_state(tmp_path: Pa
 
     assert adopted.path == catalog.path
     assert adopted.catalog_revision() == revision
+    assert adopted.policy().enable_attachment_download is False
+    assert adopted.policy().enable_attachment_content is True
     assert adopted.policy().allowed_recipients == ("alice@example.test",)
 
 
@@ -220,7 +272,57 @@ def test_initialize_rejects_foreign_existing_file_without_modifying_it(tmp_path:
     assert path.read_bytes() == original
 
 
-def test_pre_release_schema_version_is_rejected_without_migration(tmp_path: Path) -> None:
+def test_v3_catalog_migrates_to_v5_without_losing_accounts_policy_or_secrets(tmp_path: Path) -> None:
+    catalog = _v3_catalog(tmp_path)
+
+    assert catalog.catalog_revision() == 7
+    policy = catalog.policy()
+    assert policy.enable_attachment_download is True
+    assert policy.enable_attachment_content is False
+    assert policy.allowed_recipients == ("bob@example.test",)
+    assert policy.allowed_senders == ("*@example.test",)
+    assert policy.report_blocked_mutations is True
+    account = catalog.load_account("alice")
+    assert account.incoming.password.get_secret_value() == "stored-secret"
+    assert account.tags == ()
+    details = catalog.show_account("alice")
+    assert details.revision == 5
+    assert details.sent_folder_name == "Sent"
+
+    with closing(sqlite3.connect(catalog.path)) as connection:
+        assert connection.execute("SELECT version FROM schema_metadata").fetchone()[0] == managed_module.SCHEMA_VERSION
+        assert connection.execute("SELECT enable_attachment_content FROM catalog").fetchone()[0] == 0
+        assert connection.execute("SELECT tags_json FROM managed_account").fetchone()[0] == "[]"
+
+
+def test_v3_migration_rolls_back_before_advertising_v5(monkeypatch, tmp_path: Path) -> None:
+    catalog = _v3_catalog(tmp_path)
+
+    def fail_after_first_addition(connection: sqlite3.Connection, _schema: str) -> None:
+        connection.execute(
+            """ALTER TABLE catalog
+               ADD COLUMN enable_attachment_content INTEGER NOT NULL DEFAULT 0
+                   CHECK (enable_attachment_content IN (0, 1))"""
+        )
+        raise RuntimeError("synthetic migration failure")
+
+    with (
+        monkeypatch.context() as scoped,
+        pytest.raises(RuntimeError, match="synthetic migration failure"),
+    ):
+        scoped.setattr(managed_module, "_execute_schema", fail_after_first_addition)
+        catalog.catalog_revision()
+
+    with closing(sqlite3.connect(catalog.path)) as connection:
+        assert connection.execute("SELECT version FROM schema_metadata").fetchone()[0] == 3
+        catalog_columns = {row[1] for row in connection.execute("PRAGMA table_info(catalog)")}
+        account_columns = {row[1] for row in connection.execute("PRAGMA table_info(managed_account)")}
+    assert "enable_attachment_content" not in catalog_columns
+    assert "tags_json" not in account_columns
+    assert catalog.catalog_revision() == 7
+
+
+def test_unsupported_pre_release_schema_version_is_rejected_without_mutation(tmp_path: Path) -> None:
     catalog = _catalog(tmp_path, FakeSecretStore())
     with closing(sqlite3.connect(catalog.path)) as connection:
         connection.execute("UPDATE schema_metadata SET version = 1 WHERE singleton = 1")
@@ -233,7 +335,7 @@ def test_pre_release_schema_version_is_rejected_without_migration(tmp_path: Path
         assert connection.execute("SELECT version FROM schema_metadata").fetchone()[0] == 1
 
 
-def test_v3_open_rejects_persistent_invariant_corruption(tmp_path: Path) -> None:
+def test_current_schema_open_rejects_persistent_invariant_corruption(tmp_path: Path) -> None:
     catalog = _catalog(tmp_path, FakeSecretStore())
     with closing(sqlite3.connect(catalog.path)) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
@@ -262,6 +364,24 @@ def test_normalized_name_and_tombstone_prevent_reuse(tmp_path: Path) -> None:
             outgoing=None,
         )
     assert duplicate_error.value.reason == "account_name_exists"
+
+
+def test_account_tags_round_trip_through_add_show_update_and_runtime_settings(tmp_path: Path) -> None:
+    store = FakeSecretStore()
+    catalog = _catalog(tmp_path, store)
+    _add_account(catalog, tags=(_tag(),))
+
+    assert catalog.show_account("alice").tags == (_tag(),)
+    catalog.set_secret("alice", "incoming", "secret")
+    revision = catalog.show_account("alice").revision
+    catalog.update_account(
+        "alice",
+        expected_revision=revision,
+        tags=(_tag("triage", "$Triage"),),
+    )
+
+    assert catalog.show_account("alice").tags == (_tag("triage", "$Triage"),)
+    assert catalog.load_settings().emails[0].tags == (_tag("triage", "$Triage"),)
 
 
 def test_add_and_resolve_round_trip_never_persists_secret(tmp_path):

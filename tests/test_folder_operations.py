@@ -740,6 +740,58 @@ async def test_mailbox_shape_command_failure_is_unknown_not_rejection(email_clie
 
 
 # --------------------------------------------------------------------------- #
+# Mutation grants (upstream #261)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("service_name", "command", "grant"),
+    [
+        ("copy", CopyCommand("primary", ("7",), "INBOX", "Archive"), "organize"),
+        ("create_folder", CreateFolderCommand("primary", "Projects"), "organize"),
+        ("rename_folder", RenameFolderCommand("primary", "Projects", "Renamed"), "organize"),
+        ("delete_folder", DeleteFolderCommand("primary", "Projects"), "delete"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fork_mutations_require_their_grant_before_any_provider_is_opened(
+    service_name: str,
+    command: object,
+    grant: str,
+) -> None:
+    others = tuple(item for item in ("draft", "organize", "delete", "send", "append") if item != grant)
+    services, _, factory, projection = _services(account=replace(_enabled(), allowed_mutations=others))
+
+    with pytest.raises(PermissionError, match=f"'{grant}' is not allowed"):
+        await getattr(services, service_name).execute(command)
+
+    factory.open.assert_not_called()
+    projection.invalidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_copy_rechecks_authority_before_each_uid_copy(email_client) -> None:
+    imap = _mock_imap()
+    email_client.mutation_guard = MagicMock(side_effect=PermissionError("revoked"))
+    with patch.object(email_client, "imap_class", return_value=imap):
+        outcome = await email_client.copy_emails_with_outcome(["11"], "INBOX", "Archive")
+
+    assert [(item.status, item.detail) for item in outcome.outcomes] == [("failed", "mutation-policy")]
+    assert _uid_targets(imap, "copy") == []
+
+
+@pytest.mark.asyncio
+async def test_mailbox_shape_rechecks_authority_before_the_command(email_client) -> None:
+    imap = _mock_imap()
+    email_client.mutation_guard = MagicMock(side_effect=PermissionError("revoked"))
+    with patch.object(email_client, "imap_class", return_value=imap), pytest.raises(PermissionError):
+        await email_client.create_mailbox_with_outcome("Projects")
+
+    imap.create.assert_not_called()
+    imap.logout.assert_awaited_once()
+
+
+# --------------------------------------------------------------------------- #
 # MCP tool dispatch
 # --------------------------------------------------------------------------- #
 
