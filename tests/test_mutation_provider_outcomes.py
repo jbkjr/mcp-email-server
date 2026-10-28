@@ -95,6 +95,50 @@ async def test_set_email_flags_removes_multiple_flags_with_silent_store(email_se
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("operation", "store_operation"),
+    [("add", "+FLAGS.SILENT"), ("remove", "-FLAGS.SILENT")],
+)
+async def test_set_email_tags_adds_or_removes_keywords_with_silent_store(
+    email_server,
+    operation: str,
+    store_operation: str,
+) -> None:
+    client = EmailClient(email_server)
+    imap = _imap()
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.set_email_tags_with_outcome(
+            ["8", "9"],
+            cast(FlagOperation, operation),
+            ["$label4"],
+            "Archive",
+            [],
+            False,
+        )
+
+    assert result.targets("succeeded") == ["8", "9"]
+    assert [call.args for call in imap.uid.await_args_list] == [
+        ("store", "8", store_operation, "($label4)"),
+        ("store", "9", store_operation, "($label4)"),
+    ]
+    imap.select.assert_awaited_once_with('"Archive"')
+
+
+@pytest.mark.asyncio
+async def test_set_email_tags_rejects_empty_tags_before_connect(email_server) -> None:
+    client = EmailClient(email_server)
+    connect = AsyncMock()
+
+    with (
+        patch.object(client, "_connect_imap", connect),
+        pytest.raises(ValueError, match="tags must contain between 1 and"),
+    ):
+        await client.set_email_tags_with_outcome(["8"], "add", [], "INBOX", [], False)
+
+    connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("operation", "flags", "message"),
     [
         ("replace", [r"\Seen"], "operation must be"),
@@ -632,6 +676,36 @@ async def test_smtp_partial_recipient_rejection_is_preserved(email_server) -> No
     assert smtp.rcpt.await_count == 2
     smtp.data.assert_awaited_once()
     assert b"Bcc:" not in smtp.data.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_smtp_accepted_data_reports_the_delivered_message_id(email_server) -> None:
+    """The composed Message-Id is the only handle a caller has on what was actually delivered."""
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    smtp = _smtp()
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await client.send_email_with_outcome(["one@example.test"], "Subject", "body")
+
+    assert [item.status for item in result.outcomes] == ["succeeded"]
+    assert result.message_id is not None
+    assert re.fullmatch(r"<[^<>@\s]+@[^<>@\s]+>", result.message_id)
+    assert f"Message-Id: {result.message_id}".encode() in smtp.data.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_smtp_data_transport_loss_reports_no_message_id(email_server) -> None:
+    """A lost DATA result leaves delivery unknown, so no identifier may be claimed for it."""
+    client = EmailClient(email_server, sender="Sender <sender@example.test>")
+    smtp = _smtp()
+    smtp.data.side_effect = ConnectionError("result lost")
+
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await client.send_email_with_outcome(["one@example.test"], "Subject", "body")
+
+    assert [item.status for item in result.outcomes] == ["unknown"]
+    assert result.sent_message is None
+    assert result.message_id is None
 
 
 @pytest.mark.asyncio

@@ -481,7 +481,7 @@ async def test_mutation_adapter_forwards_the_derived_label_mailbox_and_policy() 
     client.remove_label_with_outcome = AsyncMock(
         return_value=BatchMutationOutcome((TargetMutationOutcome("42", "succeeded"),))
     )
-    provider = ClassicMutationProvider(SimpleNamespace(incoming_client=client))  # pyright: ignore[reportArgumentType]
+    provider = ClassicMutationProvider(SimpleNamespace(incoming_client=client, outgoing_client=None))  # pyright: ignore[reportArgumentType]
     account = MutationAccountSnapshot(
         account_name="work",
         mode="managed",

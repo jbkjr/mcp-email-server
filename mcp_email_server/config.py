@@ -33,6 +33,12 @@ from pydantic_settings import (
 
 from mcp_email_server import keyring_store
 from mcp_email_server.application.limits import APPLICATION_LIMITS
+from mcp_email_server.application.mutation_policy import (
+    DEFAULT_ALLOWED_MUTATIONS,
+    MutationClass,
+    parse_mutations,
+    validate_mutations,
+)
 from mcp_email_server.bootstrap import (
     Bootstrap,
     Mode,
@@ -42,6 +48,7 @@ from mcp_email_server.bootstrap import (
     process_bootstrap,
     read_bootstrap,
 )
+from mcp_email_server.imap_keywords import ImapKeywordAccount, ImapKeywordTag
 from mcp_email_server.log import logger
 from mcp_email_server.windows_security import (
     atomic_write_private,
@@ -92,6 +99,71 @@ def _parse_bool_env(value: str | None, default: bool = False) -> bool:
     return value.lower() in ("true", "1", "yes", "on")
 
 
+ImapNonAsciiSearchMode = Literal["literal", "quoted", "auto"]
+ImapNonAsciiSearchEncoding = Literal["literal", "quoted"]
+_IMAP_NON_ASCII_SEARCH_MODES = frozenset({"literal", "quoted", "auto"})
+# QQ Mail mis-parses ``UID SEARCH CHARSET UTF-8 SUBJECT {n}`` synchronizing
+# literals. A quoted UTF-8 string on the same CHARSET command matches. Other
+# hosts, including the Exchange case from #178 and the literal framing from
+# #230, keep synchronizing literals unless an operator opts into quoted mode.
+_QQ_IMAP_SEARCH_HOST = "imap.qq.com"
+
+
+def imap_non_ascii_search_mode() -> ImapNonAsciiSearchMode:
+    """Return the process default for non-ASCII IMAP SEARCH text.
+
+    Unset means ``auto``. An account field overrides this value when present.
+    """
+
+    raw = os.getenv("MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH")
+    if raw is None:
+        return "auto"
+    mode = raw.strip().casefold()
+    if mode not in _IMAP_NON_ASCII_SEARCH_MODES:
+        raise ValueError("MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH must be one of: literal, quoted, auto")
+    if mode == "literal":
+        return "literal"
+    if mode == "quoted":
+        return "quoted"
+    return "auto"
+
+
+def resolve_imap_non_ascii_search(
+    host: str,
+    configured: ImapNonAsciiSearchMode | None,
+) -> ImapNonAsciiSearchEncoding:
+    """Resolve literal versus quoted non-ASCII SEARCH text for one IMAP host."""
+
+    mode = imap_non_ascii_search_mode() if configured is None else configured
+    if mode == "auto":
+        normalized = host.strip().rstrip(".").casefold()
+        return "quoted" if normalized == _QQ_IMAP_SEARCH_HOST else "literal"
+    return mode
+
+
+ImapSearchMode = Literal["server", "local"]
+_IMAP_SEARCH_MODES = frozenset({"server", "local"})
+
+
+def imap_search_mode() -> ImapSearchMode:
+    """Return the process default for subject, from, and to header search.
+
+    Unset means ``server`` (IMAP SEARCH). ``local`` filters those headers from
+    a metadata observation and is never selected from the IMAP hostname. An
+    account field overrides this value when present.
+    """
+
+    raw = os.getenv("MCP_EMAIL_SERVER_IMAP_SEARCH_MODE")
+    if raw is None:
+        return "server"
+    mode = raw.strip().casefold()
+    if mode not in _IMAP_SEARCH_MODES:
+        raise ValueError("MCP_EMAIL_SERVER_IMAP_SEARCH_MODE must be one of: server, local")
+    if mode == "local":
+        return "local"
+    return "server"
+
+
 def normalize_address(raw: str) -> str:
     """Extract and normalize a bare email address for case-insensitive comparison.
 
@@ -118,9 +190,16 @@ def sender_allowed(sender: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(addrs[0], pattern.lower()) for pattern in patterns)
 
 
-def normalize_address_list(raw: Iterable[str]) -> list[str]:
-    """Normalize each address, drop empties, de-duplicate (order-preserving)."""
-    return list(dict.fromkeys(a for a in (normalize_address(x) for x in raw) if a))
+def normalize_recipient_patterns(raw: Iterable[str]) -> list[str]:
+    """Normalize exact addresses and bare glob patterns without losing glob syntax.
+
+    Display-name addresses retain legacy address extraction. Bare patterns must
+    not go through ``parseaddr``, which can discard bracket expressions.
+    """
+    return normalize_pattern_list(
+        value if any(char in value for char in "*?[") and "<" not in value else normalize_address(value)
+        for value in raw
+    )
 
 
 def normalize_pattern_list(raw: Iterable[str]) -> list[str]:
@@ -131,22 +210,29 @@ def normalize_pattern_list(raw: Iterable[str]) -> list[str]:
 def compose_legacy_policy_environment(
     *,
     enable_attachment_download: bool,
+    enable_attachment_content: bool,
     allowed_recipients: Iterable[str],
     allowed_senders: Iterable[str],
     report_blocked_mutations: bool,
     enable_folder_management: bool,
-) -> tuple[bool, list[str], list[str], bool, bool]:
+) -> tuple[bool, bool, list[str], list[str], bool, bool]:
     """Apply legacy policy environment precedence without resolving credentials."""
-    attachment_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
+    attachment_download_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD")
+    attachment_content_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT")
     report_value = os.getenv("MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS")
     recipients_value = os.getenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS")
     senders_value = os.getenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS")
     folder_value = os.getenv("MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT")
     return (
-        _parse_bool_env(attachment_value, False) if attachment_value is not None else enable_attachment_download,
-        normalize_address_list(recipients_value.split(","))
+        _parse_bool_env(attachment_download_value, False)
+        if attachment_download_value is not None
+        else enable_attachment_download,
+        _parse_bool_env(attachment_content_value, False)
+        if attachment_content_value is not None
+        else enable_attachment_content,
+        normalize_recipient_patterns(recipients_value.split(","))
         if recipients_value is not None
-        else normalize_address_list(allowed_recipients),
+        else normalize_recipient_patterns(allowed_recipients),
         normalize_pattern_list(senders_value.split(","))
         if senders_value is not None
         else normalize_pattern_list(allowed_senders),
@@ -329,6 +415,27 @@ class EmailSettings(AccountAttributes):
     # Selects the quoted-reply markup shape ('protonmail', 'gmail', 'generic').
     # None auto-detects from the IMAP host; set it explicitly when detection is wrong.
     email_service: str | None = None
+    tags: tuple[ImapKeywordTag, ...] = ()
+    allowed_mutations: list[MutationClass] | None = None
+    drafts_mailbox: str | None = None
+    allow_protocol_commands: bool = False
+    # None inherits MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH, which defaults to auto.
+    # Managed accounts leave this unset; auto still quotes imap.qq.com by host.
+    imap_non_ascii_search: ImapNonAsciiSearchMode | None = None
+    # None inherits MCP_EMAIL_SERVER_IMAP_SEARCH_MODE, which defaults to server.
+    # Managed accounts leave this unset and follow that same process default.
+    imap_search_mode: ImapSearchMode | None = None
+
+    @model_validator(mode="after")
+    def validate_tags(self) -> EmailSettings:
+        if self.allowed_mutations is not None:
+            validate_mutations(self.allowed_mutations)
+        if self.drafts_mailbox is not None:
+            from mcp_email_server.application.mutations import validate_mailbox_name
+
+            validate_mailbox_name(self.drafts_mailbox)
+        ImapKeywordAccount(tags=self.tags)
+        return self
 
     @property
     def can_send(self) -> bool:
@@ -363,6 +470,9 @@ class EmailSettings(AccountAttributes):
         email_service: str | None = None,
         smtp_user_agent: str = DEFAULT_SMTP_USER_AGENT,
         smtp_x_mailer: str = DEFAULT_SMTP_X_MAILER,
+        allowed_mutations: list[MutationClass] | None = None,
+        drafts_mailbox: str | None = None,
+        allow_protocol_commands: bool = False,
     ) -> EmailSettings:
         for candidate in (password, imap_password, smtp_password):
             if candidate == keyring_store.SENTINEL:
@@ -405,6 +515,9 @@ class EmailSettings(AccountAttributes):
             save_to_sent=save_to_sent,
             sent_folder_name=sent_folder_name,
             email_service=email_service,
+            allowed_mutations=allowed_mutations,
+            drafts_mailbox=drafts_mailbox,
+            allow_protocol_commands=allow_protocol_commands,
         )
 
     @classmethod
@@ -432,6 +545,7 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_EMAIL_SERVICE (default: auto-detect from the IMAP host)
         - MCP_EMAIL_SERVER_SMTP_USER_AGENT (default: mcp-email-server; empty omits the header)
         - MCP_EMAIL_SERVER_SMTP_X_MAILER (default: mcp-email-server; empty omits the header)
+        - MCP_EMAIL_SERVER_ALLOW_PROTOCOL_COMMANDS (default: false)
         """
         # Check if minimum required environment variables are set
         email_address = os.getenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS")
@@ -478,6 +592,19 @@ class EmailSettings(AccountAttributes):
                 email_service=os.getenv("MCP_EMAIL_SERVER_EMAIL_SERVICE"),
                 smtp_user_agent=os.getenv("MCP_EMAIL_SERVER_SMTP_USER_AGENT", DEFAULT_SMTP_USER_AGENT),
                 smtp_x_mailer=os.getenv("MCP_EMAIL_SERVER_SMTP_X_MAILER", DEFAULT_SMTP_X_MAILER),
+                drafts_mailbox=os.getenv("MCP_EMAIL_SERVER_DRAFTS_MAILBOX"),
+                allow_protocol_commands=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_ALLOW_PROTOCOL_COMMANDS"), False),
+                allowed_mutations=(
+                    list(
+                        parse_mutations([
+                            item.strip()
+                            for item in os.environ["MCP_EMAIL_SERVER_ACCOUNT_ALLOWED_MUTATIONS"].split(",")
+                            if item.strip()
+                        ])
+                    )
+                    if "MCP_EMAIL_SERVER_ACCOUNT_ALLOWED_MUTATIONS" in os.environ
+                    else None
+                ),
             )
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to create email settings from environment variables: {e}")
@@ -516,6 +643,8 @@ class Settings(BaseSettings):
     providers: list[ProviderSettings] = []
     db_location: str = CONFIG_PATH.with_name("db.sqlite3").as_posix()
     enable_attachment_download: bool = False
+    enable_attachment_content: bool = False
+    allowed_mutations: list[MutationClass] = Field(default_factory=lambda: list(DEFAULT_ALLOWED_MUTATIONS))
     allowed_recipients: list[str] = []
     allowed_senders: list[str] = []
     report_blocked_mutations: bool = False
@@ -563,8 +692,9 @@ class Settings(BaseSettings):
 
         # TOML normalisation is unconditional (safe during migration loads too): it
         # only reshapes values already in the file, independent of env state.
+        validate_mutations(self.allowed_mutations)
         if self.allowed_recipients:
-            self.allowed_recipients = normalize_address_list(self.allowed_recipients)
+            self.allowed_recipients = normalize_recipient_patterns(self.allowed_recipients)
         if self.allowed_senders:
             self.allowed_senders = normalize_pattern_list(self.allowed_senders)
 
@@ -587,17 +717,25 @@ class Settings(BaseSettings):
         self._pickup_credential_storage_override()
         (
             self.enable_attachment_download,
+            self.enable_attachment_content,
             self.allowed_recipients,
             self.allowed_senders,
             self.report_blocked_mutations,
             self.enable_folder_management,
         ) = compose_legacy_policy_environment(
             enable_attachment_download=self.enable_attachment_download,
+            enable_attachment_content=self.enable_attachment_content,
             allowed_recipients=self.allowed_recipients,
             allowed_senders=self.allowed_senders,
             report_blocked_mutations=self.report_blocked_mutations,
             enable_folder_management=self.enable_folder_management,
         )
+        raw_mutations = os.getenv("MCP_EMAIL_SERVER_ALLOWED_MUTATIONS")
+        if raw_mutations is not None:
+            self.allowed_mutations = list(
+                parse_mutations([value.strip() for value in raw_mutations.split(",") if value.strip()])
+            )
+        validate_mutations(self.allowed_mutations)
         self._inject_env_account()
 
     def _inject_env_account(self) -> None:

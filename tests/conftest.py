@@ -195,6 +195,26 @@ class _RecordingKeyring(KeyringBackend):
         del self._store[key]
 
 
+@pytest.fixture(autouse=True)
+def _isolated_keyring():
+    """Give every test its own in-memory keyring so none can reach the OS keyring.
+
+    The plaintext guard above only covers legacy credential storage. On macOS a
+    ``ManagedCatalog`` without an explicit secret store uses the OS keyring, so
+    managed-mode tests would otherwise write to the real login Keychain and see
+    entries left behind by earlier tests. Autouse fixtures run before requested
+    ones, so ``fake_keyring`` and ``broken_keyring`` still override this per test.
+    """
+    previous = keyring.get_keyring()
+    keyring.set_keyring(_RecordingKeyring())
+    keyring_store.keyring_usable.cache_clear()
+    try:
+        yield
+    finally:
+        keyring.set_keyring(previous)
+        keyring_store.keyring_usable.cache_clear()
+
+
 @pytest.fixture
 def fake_keyring():
     """Installs an in-memory keyring backend and yields it (with a `.calls` log).

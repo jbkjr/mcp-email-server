@@ -39,6 +39,7 @@ from mcp_email_server.application.management import (
 from mcp_email_server.bootstrap import BootstrapError, bootstrap_path, read_bootstrap, write_bootstrap
 from mcp_email_server.cli import app
 from mcp_email_server.config import Settings
+from mcp_email_server.imap_keywords import ImapKeywordTag
 from mcp_email_server.managed import ManagedCatalog, ManagedCatalogError, ManagedSqliteSecretStore
 
 
@@ -254,22 +255,36 @@ def test_cli_policy_update_and_index_health_use_managed_services(monkeypatch, tm
             "--expected-revision",
             "1",
             "--enable-attachment-download",
+            "--enable-attachment-content",
             "--allowed-recipients",
-            "BOB@EXAMPLE.TEST, Alice <ALICE@example.test>",
+            "BOB@EXAMPLE.TEST, Alice <ALICE@example.test>, *, *@*, *@EXAMPLE.TEST, user[0-9]@example.test",
             "--allowed-senders",
             "*@EXAMPLE.TEST,*@example.test",
             "--report-blocked-mutations",
         ],
     )
+    shown = runner.invoke(app, ["config", "policy"])
     health = runner.invoke(app, ["config", "index-health"])
 
     assert initial.exit_code == 0, initial.output
     assert "revision=1" in initial.output
+    assert "enable_attachment_content=false" in initial.output
     assert "allowed_recipients=none" in initial.output
     assert updated.exit_code == 0, updated.output
     assert "revision 2" in updated.output
+    assert shown.exit_code == 0, shown.output
+    assert "enable_attachment_content=true" in shown.output
     policy = ManagedCatalog(database).policy()
-    assert policy.allowed_recipients == ("bob@example.test", "alice@example.test")
+    assert policy.enable_attachment_download is True
+    assert policy.enable_attachment_content is True
+    assert policy.allowed_recipients == (
+        "bob@example.test",
+        "alice@example.test",
+        "*",
+        "*@*",
+        "*@example.test",
+        "user[0-9]@example.test",
+    )
     assert policy.allowed_senders == ("*@example.test",)
     assert health.exit_code == 0, health.output
     assert "status=" in health.output
@@ -553,6 +568,7 @@ def test_cli_legacy_import_preview_apply_and_repeat_are_deterministic(
     config_path.write_text(
         """credential_storage = "plaintext"
 enable_attachment_download = true
+enable_attachment_content = true
 allowed_recipients = ["BOB@EXAMPLE.TEST"]
 allowed_senders = ["*@example.test"]
 report_blocked_mutations = true
@@ -563,6 +579,12 @@ full_name = "Stored User"
 email_address = "stored@example.test"
 save_to_sent = false
 sent_folder_name = "Sent Items"
+
+[[emails.tags]]
+name = "todo"
+keyword = "$label4"
+description = "Needs action"
+writable = true
 
 [emails.incoming]
 user_name = "stored@example.test"
@@ -595,6 +617,7 @@ api_key = "provider-secret"
     assert preview.exit_code == 0, preview.output
     assert "mode=preview" in preview.output
     assert "account=stored action=create" in preview.output
+    assert 'tags=[{"name":"todo","keyword":"$label4","description":"Needs action","writable":true}]' in preview.output
     assert "provider=unsupported-provider action=unsupported" in preview.output
     assert "account=environment-only action=create" in preview.output
     assert "secret_source=environment" in preview.output
@@ -626,6 +649,17 @@ api_key = "provider-secret"
     catalog = ManagedCatalog(database)
     account = catalog.load_account("stored")
     assert account.incoming.password.get_secret_value() == "stored-secret"
+    assert account.tags == (ImapKeywordTag(name="todo", keyword="$label4", description="Needs action", writable=True),)
+    shown = runner.invoke(app, ["account", "show", "stored", "--json"])
+    assert shown.exit_code == 0, shown.output
+    assert _json_document(shown)["data"]["tags"] == [
+        {
+            "name": "todo",
+            "keyword": "$label4",
+            "description": "Needs action",
+            "writable": True,
+        }
+    ]
     environment_account = catalog.load_account("environment-only")
     assert environment_account.incoming.password.get_secret_value() == "environment-secret"
     assert {item.account_name for item in catalog.load_settings().emails} == {
@@ -634,6 +668,7 @@ api_key = "provider-secret"
     }
     policy = catalog.policy()
     assert policy.enable_attachment_download is True
+    assert policy.enable_attachment_content is True
     assert policy.allowed_recipients == ("bob@example.test",)
     assert policy.allowed_senders == ("*@example.test",)
     assert policy.report_blocked_mutations is True
@@ -734,6 +769,7 @@ def test_cli_json_mode_exposes_stable_non_secret_management_results(monkeypatch,
     assert details["incoming"]["host"] == "imap.example.test"  # type: ignore[index]
     assert details["incoming"]["use_ssl"] is True  # type: ignore[index]
     assert details["outgoing"] is None  # type: ignore[index]
+    assert details["tags"] == []  # type: ignore[index]
 
 
 def test_cli_json_error_is_single_document_and_preflight_precedes_secret_read(monkeypatch, tmp_path) -> None:
@@ -1187,3 +1223,26 @@ def test_account_add_validates_non_secret_endpoint_before_secret_read(monkeypatc
         "details": {},
     }
     read_secret.assert_not_called()
+
+
+def test_protocol_opt_in_cli_round_trip_and_omitted_update(monkeypatch, tmp_path, fake_keyring):
+    parent = _private_directory(tmp_path / "protocol-cli")
+    database = parent / "catalog.sqlite3"
+    monkeypatch.setenv("MCP_EMAIL_SERVER_CONFIG_PATH", str(parent / "config.toml"))
+    runner = CliRunner()
+    assert runner.invoke(app, ["config", "init", "--database", str(database)]).exit_code == 0
+    added = runner.invoke(app, [*_base_account_args(), "--allow-protocol-commands"], input="synthetic-secret\n")
+    assert added.exit_code == 0, added.output
+    catalog = ManagedCatalog(database)
+    assert catalog.show_account("alice").allow_protocol_commands
+    shown = runner.invoke(app, ["account", "show", "alice"])
+    assert shown.exit_code == 0, shown.output
+    assert "allow_protocol_commands=true" in shown.output
+    updated = runner.invoke(app, ["account", "update", "alice", "--expected-revision", "2", "--full-name", "Renamed"])
+    assert updated.exit_code == 0, updated.output
+    assert catalog.show_account("alice").allow_protocol_commands
+    disabled = runner.invoke(
+        app, ["account", "update", "alice", "--expected-revision", "3", "--no-allow-protocol-commands"]
+    )
+    assert disabled.exit_code == 0, disabled.output
+    assert not catalog.show_account("alice").allow_protocol_commands

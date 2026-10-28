@@ -115,6 +115,34 @@ provider authentication, timeout, and transport failures retain their category.
 Endpoint port range and mutually exclusive implicit-TLS/STARTTLS modes are
 validated before CLI secret collection and again at the application boundary.
 
+## Explicit Protocol Command Access
+
+Each email account has `allow_protocol_commands: bool`, default false and never
+inherited from global mutation grants. Only user-operated configuration, CLI,
+or UI can set it; the MCP request cannot enable or override it. Persist and
+round-trip it through legacy configuration, managed accounts, import, and
+non-secret management DTOs. Existing accounts migrate with access disabled.
+
+Execution additionally requires current compatible effective policy:
+
+- IMAP: an incoming endpoint, organize/delete/append grants, no sender allowlist,
+  and attachment-content access enabled.
+- SMTP: an outgoing endpoint, send grant, and an explicit universal `*` recipient
+  pattern. An empty recipient allowlist denies rather than allows sending.
+
+An incompatible profile is rejected as a whole, even for an individually benign
+command. Never broaden settings automatically. Existing focused tools remain
+available under their normal fine-grained grants. Account disable/removal,
+endpoint/credential identity changes, and policy revocation stop further commands
+on an established connection. Resolve only the selected protocol's secret.
+
+Enabling the flag explicitly authorizes wider server-side protocol semantics,
+including mailbox deletion/expunge and arbitrary flag/keyword changes without
+semantic-tag restrictions. Explain this in CLI/UI and published security docs;
+this is not the same promise as using the existing focused tools. It does not
+authorize local files, host programs, credential management, or other endpoints.
+Spec 10 owns the MCP surface and spec 07 owns provider execution.
+
 ## Low-level Agent Management CLI
 
 The `config` and `account` command groups are the low-level agent management API.
@@ -163,21 +191,111 @@ Catalog defaults and account overrides form effective policy. Policy includes at
 least:
 
 - allowed mail mutation classes;
-- attachment materialization enablement and size ceilings;
+- attachment materialization and MCP content-transfer enablement plus shared
+  result ceilings;
 - provider TLS requirements;
 - relevant request/result limits where configurable;
 - sent-copy behavior and safe fallback choices.
 
-Policy updates are revisioned. Recipient addresses are extracted, trimmed,
-lowercased, empty-filtered, and stably deduplicated; sender glob patterns are
+### Mutation grants and draft destination
+
+`allowed_mutations` is a list drawn from exactly `draft`, `organize`, `delete`,
+`send`, and `append`. Catalog/global defaults and legacy global settings default
+to all five classes, for both new and existing configurations that omit the
+field. This preserves read/write behavior; omission is not a deny default.
+An account override of `None`/omitted inherits the global list. An explicit
+account list replaces it, never unions with it; `[]` means read-only. An empty
+global list likewise denies mutations for inheriting accounts. Unknown classes
+are invalid. This policy is independent of endpoint capability and recipient,
+sender, attachment, and lifecycle constraints: a grant does not waive them.
+The effect-to-class mapping and Sent-copy exception are owned by spec 07.
+Legacy environment composition accepts global `MCP_EMAIL_SERVER_ALLOWED_MUTATIONS`
+and environment-account `MCP_EMAIL_SERVER_ACCOUNT_ALLOWED_MUTATIONS` as CSV
+lists, including empty for no grants. The latter applies only to the account
+created/replaced by the environment; omission inherits. `inherit` is a CLI
+sentinel, not an environment grant. `MCP_EMAIL_SERVER_DRAFTS_MAILBOX` sets that
+environment account's exact draft destination; omission selects discovery.
+These overlays do not override managed catalog authority.
+
+`drafts_mailbox` is an optional non-secret account field in managed and legacy
+configuration. When present it names the existing draft mailbox exactly; when
+absent, `save_draft` resolves the unique mailbox advertising the special-use
+`\Drafts` attribute. There is no name guessing, mailbox creation, or arbitrary
+MCP destination parameter for this tool. Missing or ambiguous discovery fails
+with guidance to configure `drafts_mailbox`. The management UI and CLI expose
+these fields without adding a mail composer or mutation route.
+
+Legacy accounts may set `imap_non_ascii_search` to `literal`, `quoted`, or
+`auto`. Omission inherits `MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH`, whose
+default is `auto`. Managed accounts do not persist the field; they use that
+same process default, and `auto` still selects quoted SEARCH text for
+`imap.qq.com`. The SEARCH encoding contract and the
+`MCP_EMAIL_SERVER_METADATA_SNAPSHOT_ROWS` ceiling are owned by spec 06.
+
+Legacy accounts may set `imap_search_mode` to `server` or `local`. Omission
+inherits `MCP_EMAIL_SERVER_IMAP_SEARCH_MODE`, whose default is `server`.
+Managed accounts do not persist the field; they use that same process default.
+The value chooses the header-search strategy owned by spec 06 and does not
+depend on the IMAP hostname.
+
+Policy updates are revisioned. Recipient entries accept exact addresses (with
+legacy display-name extraction) or bare glob patterns, preserving glob syntax.
+Both are trimmed, lowercased, empty-filtered, and stably deduplicated; sender glob patterns are
 trimmed, lowercased, empty-filtered, and stably deduplicated. Managed updates and
 legacy composition use the same canonicalizers. The UI presents each allowed
 recipient and sender as an individual add/edit/remove item rather than a
 comma-separated field. Empty collections have deliberately different semantics:
-empty allowed recipients disables sending, while empty allowed senders does not
-restrict reading. Permissive changes do not bypass capability or input
-validation. Restrictive changes take effect on the next independent effect
-because authority is revalidated at operation boundaries.
+an empty allowed-recipient collection denies `send_email`, `forward_email`, and
+`save_to_mailbox` in both managed and legacy mode, while an empty allowed-sender
+collection does not restrict reading. Every To, CC, and BCC address requires an
+case-insensitive whole-address glob match (`*`, `?`, and bracket expressions,
+as for sender policy). A literal `*` or `*@*` explicitly permits all valid
+recipients for all three operations, not just drafts; no implicit unrestricted
+mode exists. Patterns apply to the extracted address, never the display name.
+An initially empty recipient policy is rejected for recipient-bearing compose
+requests before opening a provider,
+including before a forward source is read. `save_draft` also permits an explicit
+recipientless draft: no To, CC, or BCC addresses means no recipient match is
+required, even with an empty allowlist. Any supplied recipient must match the
+same policy; recipientless permission is not permission to send. Permissive changes do not bypass
+capability or input validation. Restrictive changes take effect on the next
+independent effect because authority is revalidated at operation boundaries.
+
+## Semantic IMAP Keyword Configuration
+
+Semantic IMAP tags are account-scoped, non-secret account configuration. Managed
+mode stores them with the account in the revisioned catalog, exposes them through
+the account service and UI editor, and includes them in CLI account/import
+presentation. Legacy mode stores the same model in the account's existing TOML
+section and follows normal legacy persistence and environment-composition rules;
+there is no independent keyword sidecar or second authority. A legacy example is:
+
+```toml
+[[emails]]
+account_name = "sales"
+
+[[emails.tags]]
+name = "todo"
+keyword = "$label4"
+description = "Messages requiring an action"
+writable = true
+```
+
+Each tag requires non-empty `name` and `keyword`. `description` defaults to the
+empty string and `writable` defaults to `false`; write authority therefore
+requires an explicit `writable = true`. Semantic names and provider keywords are
+case-insensitively unique within an account. A keyword is one bounded
+non-system IMAP atom: system flags such as `\Seen`, protocol controls,
+whitespace, and atom-special characters are rejected. Configuration collections
+use centralized bounds.
+
+Mail workflows resolve the selected account and its current tag definitions at
+invocation time. Mutations re-resolve current account authority before each
+independent provider effect, so managed revisions and legacy configuration remain
+the only authority. The registry is a small immutable projection of that resolved
+account, not a process-global configuration source. Unknown semantic names fail
+before provider access; provider keywords are observable data but are never
+accepted as semantic mutation input.
 
 ## Legacy Mode
 
@@ -311,6 +429,18 @@ SQL, raw provider responses, or reusable locators.
 
 ## Acceptance Criteria
 
+- **04-P1:** Protocol access defaults off and survives TOML/environment composition, legacy
+  import, managed migration, CLI and UI create/update/readback. Omitted partial
+  updates preserve it; explicit false revokes it. Admission rejects incompatible
+  filters/grants before secret lookup, with no automatic policy broadening.
+
+- Omitted mutation settings preserve all five grants for new and old managed and
+  legacy configurations; account null/omission inherits, explicit lists replace,
+  and explicit empty lists are read-only. Persistence/import and CLI/UI preserve
+  this distinction and reject unknown classes.
+- Account draft destinations round-trip in managed and legacy mode; recipientless
+  `save_draft` and recipient-bearing allowlist enforcement remain distinct.
+
 1. Missing bootstrap retains only the historical implicit-legacy rule; explicit
    managed selection fails closed with no fallback.
 2. Fresh initialization, v1-preserving migration preparation, successful-import
@@ -319,7 +449,11 @@ SQL, raw provider responses, or reusable locators.
 3. Every account, policy, catalog, import, binding, and bootstrap mutation
    rejects stale revisions with a bounded current summary; account and policy
    cardinality limits are enforced on both read and write boundaries, including
-   the full 1,000-entry recipient and sender policy limit.
+   the full 1,000-entry recipient and sender policy limit. Empty recipient policy
+   denies send, forward, and mailbox saves in both runtime modes, including
+   after policy is cleared between independent provider effects. Explicit glob
+   authority works for all three operations without bypassing address validation;
+   glob syntax survives managed updates, legacy TOML/environment, and import.
 4. Soft removal disables provider work and permanently reserves the normalized
    name in this delivery.
 5. Every finite management command has a tested single-document JSON success
@@ -346,3 +480,7 @@ SQL, raw provider responses, or reusable locators.
     satisfy spec 08's reparse, ACL, identity, lock, WAL/SHM, replacement, and
     crash-recovery contract; unsupported Windows path/filesystem classes fail
     before authority or secret effects.
+12. Semantic keyword configuration is independently loaded and bounded, is
+    never rewritten by the UI or catalog, rejects invalid, duplicate, or system
+    keyword mappings, and proves that omitted `description` and `writable`
+    values become `""` and `false`.

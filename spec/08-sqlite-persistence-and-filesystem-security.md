@@ -21,7 +21,7 @@ logical model includes:
 
 - catalog metadata: stable ID, revision, schema version, timestamps;
 - accounts: stable ID, normalized unique name, display data, lifecycle,
-  revision, timestamps;
+  revision, account-scoped semantic IMAP tag definitions, and timestamps;
 - IMAP/SMTP endpoint configuration without credentials;
 - catalog defaults and account policy overrides;
 - role binding state: revision, opaque internal handles, active/superseded and
@@ -43,7 +43,9 @@ Windows catalog copies, snapshots, and backups therefore contain plaintext
 secret values and MUST retain private protection equivalent to the original;
 they are never classified as non-secret databases. Bodies, raw MIME,
 attachment bytes, UI bootstrap/session/CSRF state, and browser view state MUST
-NOT be stored in managed SQLite.
+NOT be stored in managed SQLite. Semantic tag definitions are bounded non-secret
+account configuration; provider message keyword observations remain projection
+data.
 
 ## Schema Version and Migration
 
@@ -58,10 +60,32 @@ A new catalog is created at the current exact schema version. Opening:
 - leaves no partially advertised version on rollback or crash.
 
 No startup path silently drops/recreates authoritative tables. Projection-only
-rebuild is explicit and isolated. There are no released managed-catalog users,
-so this delivery makes no compatibility or automatic-migration commitment for
-pre-release managed schema files. Legacy TOML, environment, and keyring import
-remains supported through the explicit spec 04 workflow.
+rebuild is explicit and isolated. Schemas v3, v4, v5 and v6 are the declared migration
+sources for v7. Opening a source first validates its exact schema, then uses
+one bounded `BEGIN IMMEDIATE` transaction. A v3 source first receives the disabled
+attachment-content policy and empty account tag mappings from v4. Sources below
+v5 receive the fixed-five global mutation grants, nullable account overrides that
+inherit, and an unset draft destination. Sources below v6 receive the per-account
+`allow_protocol_commands INTEGER NOT NULL DEFAULT 0 CHECK (... IN (0, 1))`.
+Existing grants and overrides are unchanged; protocol access is never inferred
+from them. All sources receive the v7 nullable `to_addresses_json` projection
+column. NULL preserves unknown To evidence in old rows; a stored empty JSON list
+means the To header was observed empty (spec 06). Legacy operational databases
+at v1 or v6 receive the same column without catalog changes. The exact v7 schema
+and invariants are validated before recording version 7 as the final write. Failure or process
+interruption rolls back all additions and leaves the original source version
+advertised; account, policy, binding, secret, and projection rows retain their
+identifiers and revisions. Migration does not resolve or copy secret values.
+Other schema versions remain unsupported without a general compatibility promise.
+Legacy TOML, environment, and keyring import remains supported through the
+explicit spec 04 workflow.
+
+Older runtimes cannot read a migrated v7 catalog. Published upgrade guidance MUST
+require stopping all catalog users, privately backing up the catalog before its
+first new-version open, and upgrading UI, CLI, and MCP together. A package-only
+downgrade is not a catalog rollback: recovery requires the matching pre-migration
+catalog and application version. Do not introduce a silent downgrade or weaken
+exact-schema validation to support mixed-version processes.
 
 ## Filesystem Layout and Locking
 
@@ -265,6 +289,11 @@ remain separate operator procedures outside this delivery.
 
 ## Acceptance Criteria
 
+- **08-P1:** V3/v4/v5/v6 migration to v7 is transactional and idempotent, preserves prior rows
+  and revisions, never accesses secrets, and retains unknown To evidence in old
+  projection rows. Sources before v6 default protocol access to false.
+  Injected migration failure restores the exact source schema and version.
+
 1. Schema tests assert exact version, required constraints, foreign keys, the
    Linux/Windows dedicated `managed_secret` boundary, and absence of secret values
    from catalog/projection/body/UI-session columns.
@@ -279,7 +308,7 @@ remain separate operator procedures outside this delivery.
 5. Concurrent initialization/open, application-lock timeout, crash release, and
    SQLite busy timeout behavior is deterministic and bounded on POSIX and native
    Windows.
-6. Unsupported pre-release schema versions are rejected without mutation; future crash and migration tests never advertise a partially migrated schema.
+6. Exact schemas v3/v4/v5/v6 migrate transactionally to v7 without losing authority or secret rows; rollback never advertises a partially migrated schema, and every other unsupported pre-release version is rejected without mutation.
 7. External network, system-keyring, and large filesystem work is absent from
    SQLite transaction scopes; Linux secret insertion and binding activation are
    atomic in one bounded transaction.

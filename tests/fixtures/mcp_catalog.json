@@ -83,8 +83,74 @@
             }
         },
         {
+            "name": "list_email_tags",
+            "description": "List the configured semantic IMAP tags for one account. The name and description support natural-language selection; writable is false unless explicitly enabled in the account configuration.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name"],
+                "title": "list_email_tagsArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "$defs": {
+                    "ImapKeywordTag": {
+                        "additionalProperties": false,
+                        "description": "One semantic tag name mapped to one provider keyword.",
+                        "properties": {
+                            "name": {
+                                "title": "Name",
+                                "type": "string"
+                            },
+                            "keyword": {
+                                "title": "Keyword",
+                                "type": "string"
+                            },
+                            "description": {
+                                "default": "",
+                                "title": "Description",
+                                "type": "string"
+                            },
+                            "writable": {
+                                "default": false,
+                                "title": "Writable",
+                                "type": "boolean"
+                            }
+                        },
+                        "required": ["name", "keyword"],
+                        "title": "ImapKeywordTag",
+                        "type": "object"
+                    }
+                },
+                "properties": {
+                    "result": {
+                        "items": {
+                            "$ref": "#/$defs/ImapKeywordTag"
+                        },
+                        "title": "Result",
+                        "type": "array"
+                    }
+                },
+                "required": ["result"],
+                "title": "list_email_tagsOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "list_emails_metadata",
-            "description": "List email metadata (email_id, subject, sender, recipients, date) without body content. Returns email_id for use with get_emails_content.",
+            "description": "List email metadata (email_id, subject, sender, recipients, date) without body content. Time filtering and ordering use provider INTERNALDATE; the returned date is the message's RFC 5322 Date header. Returns email_id for use with get_emails_content.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -119,7 +185,7 @@
                             }
                         ],
                         "default": null,
-                        "description": "Retrieve emails before this datetime (UTC).",
+                        "description": "Filter to messages whose provider INTERNALDATE is earlier than this timezone-aware datetime (exclusive); any UTC offset is accepted and normalized to UTC.",
                         "title": "Before"
                     },
                     "since": {
@@ -133,7 +199,7 @@
                             }
                         ],
                         "default": null,
-                        "description": "Retrieve emails since this datetime (UTC).",
+                        "description": "Filter to messages whose provider INTERNALDATE is equal to or later than this timezone-aware datetime (inclusive); any UTC offset is accepted and normalized to UTC.",
                         "title": "Since"
                     },
                     "subject": {
@@ -180,7 +246,7 @@
                     },
                     "order": {
                         "default": "desc",
-                        "description": "Sort matching emails by date: oldest first (`asc`) or newest first (`desc`).",
+                        "description": "Sort matching emails by provider INTERNALDATE: oldest first (`asc`) or newest first (`desc`).",
                         "enum": ["asc", "desc"],
                         "title": "Order",
                         "type": "string"
@@ -271,6 +337,31 @@
                         "default": null,
                         "description": "Filter by attachment presence: True=has attachment, False=none, None=all (multipart/mixed heuristic; may miss inline images or yield false positives).",
                         "title": "Has Attachment"
+                    },
+                    "semantic_tags": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Configured semantic tag names to match.",
+                        "title": "Semantic Tags"
+                    },
+                    "tag_match": {
+                        "default": "all",
+                        "description": "Require all requested tags or at least any one requested tag.",
+                        "enum": ["all", "any"],
+                        "title": "Tag Match",
+                        "type": "string"
                     }
                 },
                 "required": ["account_name"],
@@ -323,6 +414,24 @@
                                     "type": "string"
                                 },
                                 "title": "Attachments",
+                                "type": "array"
+                            },
+                            "provider_keywords": {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "title": "Provider Keywords",
+                                "type": "array"
+                            },
+                            "semantic_tags": {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "title": "Semantic Tags",
                                 "type": "array"
                             }
                         },
@@ -533,6 +642,24 @@
                                 "title": "Attachments",
                                 "type": "array"
                             },
+                            "provider_keywords": {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "title": "Provider Keywords",
+                                "type": "array"
+                            },
+                            "semantic_tags": {
+                                "items": {
+                                    "maxLength": 128,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "title": "Semantic Tags",
+                                "type": "array"
+                            },
                             "in_reply_to": {
                                 "anyOf": [
                                     {
@@ -683,7 +810,7 @@
         },
         {
             "name": "list_allowed_recipients",
-            "description": "List the configured recipient allowlist — the addresses that send_email and forward_email are permitted to send to and save_to_mailbox is permitted to address. Returns an empty list when unrestricted.",
+            "description": "List the configured recipient allowlist — the address patterns that send_email and forward_email are permitted to send to and save_to_mailbox is permitted to address. Matching is case-insensitive and supports glob patterns such as *@example.com; * explicitly allows all recipients. An empty list denies all recipients for these operations; configure patterns through the user-operated CLI/UI.",
             "inputSchema": {
                 "properties": {},
                 "title": "list_allowed_recipientsArguments",
@@ -743,7 +870,7 @@
         },
         {
             "name": "send_email",
-            "description": "Send one email using the specified account. Supports reply threading. The body is written in Markdown and is rendered to email-safe HTML automatically; set html=true only when the body is already pre-formatted raw HTML. When in_reply_to is set, the original message is read over IMAP and appended as a collapsible quote block; if it cannot be read the call fails before any SMTP session is opened rather than sending an unquoted reply. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically.",
+            "description": "Send one email using the specified account. Supports reply threading. The body is written in Markdown and is rendered to email-safe HTML automatically; set html=true only when the body is already pre-formatted raw HTML. When in_reply_to is set, the original message is read over IMAP and appended as a collapsible quote block; if it cannot be read the call fails before any SMTP session is opened rather than sending an unquoted reply. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically. The response names the delivered message's RFC Message-Id once the provider accepts the message data, and reports no identifier for an ambiguous delivery.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -908,7 +1035,7 @@
         },
         {
             "name": "forward_email",
-            "description": "Forward an existing message to new recipients using the specified account. The source message is read over IMAP first: if it cannot be read, the call fails before any SMTP session is opened, so a forward is never delivered without the content it was supposed to carry. The subject is derived from the source as 'Fwd: <original subject>' without stacking a second prefix, the caller's Markdown note is placed above a forwarded block re-composed from the source's parsed text body and escaped so quoted content is delivered literally, and the source's attachments are re-attached with their original MIME types unless include_attachments is false. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically.",
+            "description": "Forward an existing message to new recipients using the specified account. The source message is read over IMAP first: if it cannot be read, the call fails before any SMTP session is opened, so a forward is never delivered without the content it was supposed to carry. The subject is derived from the source as 'Fwd: <original subject>' without stacking a second prefix, the caller's Markdown note is placed above a forwarded block re-composed from the source's parsed text body and escaped so quoted content is delivered literally, and the source's attachments are re-attached with their original MIME types unless include_attachments is false. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically. The response names the delivered message's RFC Message-Id once the provider accepts the message data, and reports no identifier for an ambiguous delivery.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -1185,6 +1312,158 @@
             }
         },
         {
+            "name": "save_draft",
+            "description": "Compose and save an unsent draft to the configured drafts mailbox or unique special-use Drafts mailbox. Requires draft permission, not append or send. Recipients may be omitted; supplied recipients obey the recipient allowlist. The Draft flag is fixed; no arbitrary target or flags.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "subject": {
+                        "description": "The subject of the email.",
+                        "maxLength": 65536,
+                        "title": "Subject",
+                        "type": "string"
+                    },
+                    "body": {
+                        "description": "The body of the email.",
+                        "maxLength": 1048576,
+                        "title": "Body",
+                        "type": "string"
+                    },
+                    "recipients": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "maxLength": 1024,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Optional draft recipients; supplied addresses obey the recipient allowlist.",
+                        "title": "Recipients"
+                    },
+                    "cc": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "maxLength": 1024,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "A list of CC email addresses.",
+                        "title": "Cc"
+                    },
+                    "bcc": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "maxLength": 1024,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "A list of BCC email addresses.",
+                        "title": "Bcc"
+                    },
+                    "html": {
+                        "default": false,
+                        "description": "Whether the email body is HTML (True) or plain text (False).",
+                        "title": "Html",
+                        "type": "boolean"
+                    },
+                    "attachments": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "maxLength": 4096,
+                                    "type": "string"
+                                },
+                                "maxItems": 20,
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended.",
+                        "title": "Attachments"
+                    },
+                    "in_reply_to": {
+                        "anyOf": [
+                            {
+                                "maxLength": 65536,
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Message-ID of the email being replied to. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
+                        "title": "In Reply To"
+                    },
+                    "references": {
+                        "anyOf": [
+                            {
+                                "maxLength": 65536,
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Space-separated Message-IDs for the thread chain. Simple IDs may be bare or bracketed; bare IDs gain RFC angle brackets during composition.",
+                        "title": "References"
+                    }
+                },
+                "required": ["account_name", "subject", "body"],
+                "title": "save_draftArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "save_draftOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
             "name": "delete_emails",
             "description": "Delete one or more emails by email_id. Deletion is recoverable where the account allows it: the emails are moved to the Trash mailbox, auto-detected via the RFC 6154 \\Trash flag (falling back to common names like Trash, Deleted Items, or [Gmail]/Trash). When the account has no Trash mailbox, and when the emails are already in Trash, they are instead removed permanently using target-scoped UID EXPUNGE. The result says which happened. Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
             "inputSchema": {
@@ -1313,6 +1592,76 @@
             }
         },
         {
+            "name": "set_email_tags",
+            "description": "Add or remove configured writable semantic tags on emails. Only semantic names are accepted; standard flags and unrelated provider keywords are preserved.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "email_ids": {
+                        "description": "List of email_id values whose tags should be changed.",
+                        "items": {
+                            "maxLength": 10,
+                            "pattern": "^[1-9][0-9]*$",
+                            "type": "string"
+                        },
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Email Ids",
+                        "type": "array"
+                    },
+                    "operation": {
+                        "description": "Whether to add or remove every supplied semantic tag.",
+                        "enum": ["add", "remove"],
+                        "title": "Operation",
+                        "type": "string"
+                    },
+                    "tags": {
+                        "description": "Configured writable semantic tag names.",
+                        "items": {
+                            "maxLength": 128,
+                            "type": "string"
+                        },
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Tags",
+                        "type": "array"
+                    },
+                    "mailbox": {
+                        "default": "INBOX",
+                        "description": "The mailbox containing the emails.",
+                        "maxLength": 1024,
+                        "title": "Mailbox",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "email_ids", "operation", "tags"],
+                "title": "set_email_tagsArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "set_email_tagsOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
             "name": "mark_emails_as_read",
             "description": "Mark one or more emails as read by email_id. This is the common-workflow equivalent of adding \\Seen with set_email_flags. Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
             "inputSchema": {
@@ -1367,7 +1716,7 @@
         },
         {
             "name": "move_emails",
-            "description": "Move one or more emails between IMAP folders by email_id. Use list_emails_metadata and list_mailboxes first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried.",
+            "description": "Move emails between IMAP folders using UIDs from list_emails_metadata in source_mailbox. Specify exactly one of destination_mailbox or destination_role='junk' to discover the Junk folder via \\Junk, then common names. Missing or ambiguous discovery requires an explicit destination; no folder is created. To restore from Junk, list it again for current UIDs and move to INBOX with that explicit source_mailbox. This requests a move, not guaranteed spam training or reporting. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -1389,24 +1738,42 @@
                         "type": "array"
                     },
                     "destination_mailbox": {
-                        "description": "The destination mailbox/folder to move emails to.",
-                        "maxLength": 1024,
-                        "title": "Destination Mailbox",
-                        "type": "string"
+                        "anyOf": [
+                            {
+                                "maxLength": 1024,
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Exact destination mailbox. Omit only when destination_role='junk' is supplied.",
+                        "title": "Destination Mailbox"
                     },
                     "source_mailbox": {
                         "default": "INBOX",
-                        "description": "The source mailbox containing the emails.",
+                        "description": "Mailbox in which email_ids were listed; UIDs are not transferable across mailboxes.",
                         "maxLength": 1024,
                         "title": "Source Mailbox",
                         "type": "string"
+                    },
+                    "destination_role": {
+                        "anyOf": [
+                            {
+                                "const": "junk",
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Discover the Junk destination. Mutually exclusive with destination_mailbox.",
+                        "title": "Destination Role"
                     }
                 },
-                "required": [
-                    "account_name",
-                    "email_ids",
-                    "destination_mailbox"
-                ],
+                "required": ["account_name", "email_ids"],
                 "title": "move_emailsArguments",
                 "type": "object"
             },
@@ -1548,6 +1915,103 @@
                 },
                 "required": ["result"],
                 "title": "list_mailboxesOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "create_mailbox",
+            "description": "Create one mailbox/folder by its exact server name, including the hierarchy delimiter reported by list_mailboxes (for example 'Archive/Projects' or 'INBOX.Projects'). Requires the organize permission. Idempotent: an existing mailbox reports already_exists without changes. Parent levels are created only if the server does so itself. An unknown status is not retried automatically; verify with list_mailboxes.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "mailbox": {
+                        "description": "Exact mailbox name to create; must not contain the LIST wildcards '*' or '%' or end with the server's hierarchy delimiter.",
+                        "maxLength": 1024,
+                        "minLength": 1,
+                        "title": "Mailbox",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "mailbox"],
+                "title": "create_mailboxArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "description": "Outcome of an explicit mailbox creation request",
+                "properties": {
+                    "mailbox": {
+                        "description": "The exact mailbox name that was requested.",
+                        "title": "Mailbox",
+                        "type": "string"
+                    },
+                    "status": {
+                        "description": "created: CREATE succeeded; already_exists: no change; unknown: the effect may have happened.",
+                        "enum": ["created", "already_exists", "unknown"],
+                        "title": "Status",
+                        "type": "string"
+                    },
+                    "reconciliation_needed": {
+                        "description": "True when status is unknown; verify with list_mailboxes before retrying.",
+                        "title": "Reconciliation Needed",
+                        "type": "boolean"
+                    }
+                },
+                "required": ["mailbox", "status", "reconciliation_needed"],
+                "title": "CreateMailboxResult",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "get_attachment_content",
+            "description": "Read one email attachment as an MCP embedded binary resource without writing a local file. This independent transfer mode requires enable_attachment_content=true.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "email_id": {
+                        "description": "The email ID obtained from list_emails_metadata or get_emails_content.",
+                        "maxLength": 10,
+                        "pattern": "^[1-9][0-9]*$",
+                        "title": "Email Id",
+                        "type": "string"
+                    },
+                    "attachment_name": {
+                        "description": "The attachment filename shown in the message's attachments list.",
+                        "maxLength": 4096,
+                        "title": "Attachment Name",
+                        "type": "string"
+                    },
+                    "mailbox": {
+                        "default": "INBOX",
+                        "description": "The mailbox containing the email.",
+                        "maxLength": 1024,
+                        "title": "Mailbox",
+                        "type": "string"
+                    }
+                },
+                "required": ["account_name", "email_id", "attachment_name"],
+                "title": "get_attachment_contentArguments",
                 "type": "object"
             },
             "annotations": {
@@ -2147,6 +2611,189 @@
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "email_command",
+            "description": "Execute IMAP or SMTP primitives when a focused email tool does not cover the operation. Existing tools, including create_mailbox, remain the simpler policy-aware route. Start with commands=[{\"command\":\"HELP\"}] or HELP UID COPY for local syntax and examples; no account is needed for help. Execution requires account_name and user-enabled allow_protocol_commands with compatible policy. Commands run in order on one automatically authenticated connection; state lasts only for this call. For example SELECT a mailbox, then UID COPY known UIDs to an existing destination. Put APPEND/DATA message content in data, never in command lines. No login commands, passwords, hosts, shell scripts or local paths. Stops on the first error. Inspect every result: prior effects may exist and unknown completion must not be replayed automatically. HELP lists supported syntax; server CAPABILITY alone does not imply client support for arbitrary extensions.",
+            "inputSchema": {
+                "$defs": {
+                    "ProtocolCommand": {
+                        "additionalProperties": false,
+                        "properties": {
+                            "command": {
+                                "description": "One untagged command line, or local HELP. No CR/LF or literal markers.",
+                                "maxLength": 65536,
+                                "minLength": 1,
+                                "title": "Command",
+                                "type": "string"
+                            },
+                            "data": {
+                                "anyOf": [
+                                    {
+                                        "maxLength": 1048576,
+                                        "type": "string"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "default": null,
+                                "description": "UTF-8 message content for IMAP APPEND or SMTP DATA only; framing is supplied by the server.",
+                                "title": "Data"
+                            }
+                        },
+                        "required": ["command"],
+                        "title": "ProtocolCommand",
+                        "type": "object"
+                    }
+                },
+                "additionalProperties": false,
+                "properties": {
+                    "account_name": {
+                        "anyOf": [
+                            {
+                                "maxLength": 256,
+                                "minLength": 1,
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Configured account name; required for execution, omitted for local HELP.",
+                        "title": "Account Name"
+                    },
+                    "protocol": {
+                        "default": "imap",
+                        "enum": ["imap", "smtp"],
+                        "title": "Protocol",
+                        "type": "string"
+                    },
+                    "commands": {
+                        "items": {
+                            "$ref": "#/$defs/ProtocolCommand"
+                        },
+                        "maxItems": 20,
+                        "minItems": 1,
+                        "title": "Commands",
+                        "type": "array"
+                    }
+                },
+                "required": ["commands"],
+                "title": "ProtocolRequest",
+                "type": "object"
+            },
+            "outputSchema": {
+                "$defs": {
+                    "ProtocolStep": {
+                        "properties": {
+                            "index": {
+                                "title": "Index",
+                                "type": "integer"
+                            },
+                            "status": {
+                                "default": "not_attempted",
+                                "enum": [
+                                    "ok",
+                                    "error",
+                                    "unknown",
+                                    "not_attempted"
+                                ],
+                                "title": "Status",
+                                "type": "string"
+                            },
+                            "code": {
+                                "anyOf": [
+                                    {
+                                        "type": "string"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "default": null,
+                                "title": "Code"
+                            },
+                            "responses": {
+                                "items": {
+                                    "$ref": "#/$defs/ResponseBlock"
+                                },
+                                "title": "Responses",
+                                "type": "array"
+                            }
+                        },
+                        "required": ["index"],
+                        "title": "ProtocolStep",
+                        "type": "object"
+                    },
+                    "ResponseBlock": {
+                        "properties": {
+                            "kind": {
+                                "default": "line",
+                                "enum": ["line", "literal"],
+                                "title": "Kind",
+                                "type": "string"
+                            },
+                            "encoding": {
+                                "default": "text",
+                                "enum": ["text", "base64"],
+                                "title": "Encoding",
+                                "type": "string"
+                            },
+                            "data": {
+                                "title": "Data",
+                                "type": "string"
+                            }
+                        },
+                        "required": ["data"],
+                        "title": "ResponseBlock",
+                        "type": "object"
+                    }
+                },
+                "properties": {
+                    "status": {
+                        "default": "stopped",
+                        "enum": ["completed", "stopped", "unknown"],
+                        "title": "Status",
+                        "type": "string"
+                    },
+                    "results": {
+                        "items": {
+                            "$ref": "#/$defs/ProtocolStep"
+                        },
+                        "title": "Results",
+                        "type": "array"
+                    },
+                    "error": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "title": "Error"
+                    },
+                    "warnings": {
+                        "items": {
+                            "type": "string"
+                        },
+                        "title": "Warnings",
+                        "type": "array"
+                    }
+                },
+                "title": "ProtocolResult",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
                 "idempotentHint": false,
                 "openWorldHint": true
             }

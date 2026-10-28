@@ -8,8 +8,19 @@ never a complete offline mailbox and may be rebuilt without changing provider
 truth.
 
 Read workflows are mailbox discovery, metadata listing/search, body retrieval,
-and attachment materialization. Each begins from a current operational account
+attachment transfer, and attachment materialization. Each begins from a current operational account
 snapshot and uses late credential resolution from spec 05.
+
+Message flags are split at the public boundary. `provider_keywords` contains
+every observed non-system IMAP keyword, including unknown provider keywords.
+`semantic_tags` contains only configured semantic names whose provider keyword
+is present. Standard system flags remain separate and never appear in either
+field. The same fields are returned by metadata listing and full-content reads.
+The projection stores the last bounded provider flag observation, but a page
+answered from the projection refreshes current FLAGS for only its returned UIDs
+before exposing keywords. Semantic names are resolved from the currently
+selected account configuration when constructing a response, so a configuration
+change never requires a projection rewrite.
 
 ## Mailbox Discovery
 
@@ -65,6 +76,89 @@ updates the projection only with evidence actually observed. Partial scans,
 bounded windows, failed refreshes, or interrupted fetches never delete rows by
 absence and never produce an exact total claim.
 
+`STATUS` must include `MESSAGES`. `UIDVALIDITY` and `UIDNEXT` may be omitted
+from `STATUS`; the parser then reads the same names from `SELECT` response
+codes. If both responses supply UIDVALIDITY and disagree, the observation
+fails; fields from different epochs must not be combined to qualify cached
+rows. A field that is still absent stays unknown. It is not replaced with
+`max(uid) + 1` or with a hash of the UID set. Some servers, including the
+reported NetEase IMAP responses, return `MESSAGES` and `UIDVALIDITY` while
+omitting `UIDNEXT`, and answer `UID SEARCH` with an empty set. That shape is
+handled by the rules below for every host. The hostname does not select a
+search strategy.
+
+When `UIDNEXT` or `UIDVALIDITY` is unknown, mailbox membership for a snapshot
+comes from `UID FETCH 1:* (UID)`, not from `UID SEARCH`. The inventory may
+contain gaps left by expunged messages. An exact result requires the inventory
+length to equal `MESSAGES`, every UID to lie in the IMAP range, and header plus
+`INTERNALDATE` evidence for every inventoried UID, all inside the existing row,
+byte, and time bounds. A short inventory, a failed batch, or a mailbox above
+the snapshot ceiling is incomplete. It is not reported as an exact empty page.
+
+When `UIDVALIDITY` is unknown, rows from another observation are not reused.
+Retained refresh rows and a complete projection are both ineligible. The fresh
+read may still return an exact result when the coverage rules above hold. That
+observation is not stored as a reusable projection, because there is no provider
+epoch to qualify on a later read. A mailbox reset that reissues the same UID
+numbers therefore cannot return the previous subjects, senders, or Message-IDs.
+
+A stored projection is reusable only when the current `UIDVALIDITY`, `UIDNEXT`,
+and message count are all present and match the stored qualification.
+Append-only extension requires those same provider fields and remains limited
+to UIDs above the highest cached UID. The extension is complete only when the
+provider message count equals the cached count plus those new UIDs and
+`UIDVALIDITY`, `UIDNEXT`, and message count remain stable during the fetch.
+`UIDVALIDITY` changes, deletions, gaps, a missing `UIDNEXT`, and a merged row
+count above the snapshot ceiling fall back to a full bounded refresh. Partial
+windows are not extended by that append-only path, because they are not a
+prefix of the mailbox. A full refresh may resume from a partial same-epoch
+window only when both observations carry the same provider `UIDVALIDITY`. The
+retained rows are discarded when that value is missing or different. The
+refresh fetches only UIDs still missing from the newest retained rows, and it
+may mark the merged window complete when the message count, `UIDVALIDITY`, and
+per-row evidence prove full coverage. Until that proof exists the rows stay
+partial and cannot answer an exact total.
+The snapshot ceiling defaults to 1,000 rows and is overridden by
+`MCP_EMAIL_SERVER_METADATA_SNAPSHOT_ROWS` (an integer from 1 through 100,000).
+A full refresh fetches that window newest-first. Each batch uses
+`MCP_EMAIL_SERVER_METADATA_REFRESH_TIMEOUT_SECONDS` (default 60 seconds, from 1
+to 3600) and `MCP_EMAIL_SERVER_METADATA_HEADER_BUDGET_BYTES` (default 4 MiB,
+from 64 KiB through 64 MiB). `MCP_EMAIL_SERVER_METADATA_REFRESH_BATCH_SIZE`
+(default 100, from 1 through 1000) is additionally capped so one batch of
+maximum-size headers fits that budget. A failed batch stores the newest rows
+already fetched as a partial snapshot. Connection establishment also has its
+own refresh timeout, including cancellation cleanup. A failed refresh logs the
+causal exception class and at most 20 function-name/line-number traceback
+locations, omitting exception text/chains, source lines, paths, and locals even
+with diagnostic sinks. It then follows the existing legacy fallback or managed
+fail-closed rule. The log is operational; the client-facing error stays the
+sanitized provider failure.
+
+Tag filters accept configured semantic names only, resolve them to provider
+keywords, and issue IMAP `KEYWORD` search before sorting and pagination. `all`
+requires every resolved keyword; `any` builds the exact nested IMAP `OR`
+predicate. Name matching is ASCII-case-insensitive and unknown requested tags
+fail before provider access. The projection never answers a tag-filtered query
+because external clients may mutate keywords without changing UIDNEXT or message
+count.
+
+Metadata datetime boundaries are timezone-aware absolute instants. Any valid UTC
+offset is normalized to UTC; an offset-free value fails before account authority
+or provider access. `since` is inclusive and `before` is exclusive, forming the
+interval `[since, before)`. Filtering and ordering use IMAP `INTERNALDATE` as the
+authoritative provider timestamp. The public metadata `date` remains the RFC 5322
+message-header value and can differ from `INTERNALDATE`.
+
+Base IMAP `BEFORE` and `SINCE` disregard the time and timezone components of
+`INTERNALDATE`, so they are conservative pushdowns rather than exact datetime
+predicates. The provider widens their calendar dates enough to include every
+accepted `INTERNALDATE` offset, fetches complete `INTERNALDATE` evidence for the
+bounded candidates, and reapplies the exact interval before total calculation,
+ordering, and pagination. At a representable datetime edge where a widened date
+cannot be formed, the provider omits that coarse criterion and relies on the
+exact residual predicate. Candidate or evidence limits fail explicitly rather
+than returning an approximate total or partial page.
+
 ## Metadata Query Flow
 
 ```mermaid
@@ -101,12 +195,18 @@ contract; silent unlimited copying is forbidden.
 Every IMAP SEARCH criterion preserves caller text without changing its semantics.
 ASCII values use an atom/astring only when permitted by the complete IMAP
 grammar and otherwise use a quoted string with exact quote and backslash
-escaping. Non-ASCII values use synchronizing UTF-8 literals with `CHARSET UTF-8`;
-each literal waits for its own continuation, and a definitive rejection sends no
-remaining literal bytes. Cancellation, timeout, or transport failure while a
-synchronizing command is in flight aborts the connection because its framing can
-no longer be reused safely. IMAP dates use fixed English month tokens and never
-depend on the process locale.
+escaping. Non-ASCII values use synchronizing UTF-8 literals with `CHARSET UTF-8`
+unless the account resolves quoted mode. Each literal waits for its own
+continuation, and a definitive rejection sends no remaining literal bytes.
+Quoted mode sends the same charset with one quoted UTF-8 string per value,
+escapes `"` and `\`, and rejects CR or LF before the command is written.
+The process default is `auto`: host `imap.qq.com` uses quoted mode because that
+server mis-parses the synchronizing literal, and every other host keeps the
+literal. An account field or `MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH` may force
+`literal`, `quoted`, or `auto`. ASCII-only searches still omit `CHARSET`.
+Cancellation, timeout, or transport failure while a synchronizing command is in
+flight aborts the connection because its framing can no longer be reused safely.
+IMAP dates use fixed English month tokens and never depend on the process locale.
 
 ## Body Retrieval
 
@@ -149,6 +249,12 @@ Body reads:
 - decode text parts independently and fall back to UTF-8 with replacement for an
   unknown or invalid declared charset, so one bad part cannot hide the rest of a
   readable message;
+- resolve GB2312 charset labels to GB18030 as the WHATWG Encoding Standard does,
+  in both MIME bodies and RFC 2047 encoded words (only A1A4 and A1AA change
+  meaning, to their WHATWG code points), and decode `gbk`/`big5` bodies with the
+  declared codec first and GB18030/Big5-HKSCS only after it fails, so text that
+  strict GBK or Big5 decoding accepts is never changed; `gbk`, the Windows code
+  page names, and `big5` keep their strict codec;
 - sanitize decode/parser errors and never persist bodies, thread headers from
   full-content reads, or raw MIME in SQLite.
 
@@ -210,6 +316,29 @@ local-only response. Logs and remote/provider errors do not include it. Partial
 files are removed when their identity can be proven; otherwise the operation
 returns a bounded cleanup warning without deleting an unverified path.
 
+Attachment lookup MUST use the same attachment-root traversal as body retrieval:
+include a named top-level single-part attachment and prune attachment subtrees.
+A nested file inside an attached message or multipart entity MUST NOT shadow an
+outer listed filename. Exact filenames take precedence over NFC-normalized
+fallback matches; identical duplicate names retain first-match ordering.
+Leaf attachments return decoded payload bytes. A `message/rfc822` attachment
+exports its encapsulated message without the wrapper; a named multipart
+attachment exports its content headers and complete MIME tree without outer
+mail envelope headers. Structured exports use CRLF and may normalize MIME
+serialization rather than promising byte-exact wire preservation.
+
+`get_attachment_content` shares the same MIME lookup, sender allowlist, and
+current account authority as attachment materialization, but performs no
+filesystem write. It has the independent `enable_attachment_content` policy,
+which defaults to `false` because the default product mode is a local client with
+filesystem access. Operators of ChatGPT apps and other clients without a shared
+filesystem enable it explicitly. The tool returns one content-only MCP embedded
+blob resource with filename metadata, MIME type, exact size, an opaque response
+URI, and the original decoded bytes. The blob appears exactly once and the
+canonical complete MCP result must fit the existing global serialized-result
+ceiling; there is no second configurable or attachment-specific inline limit.
+`download_attachment` remains unchanged.
+
 ## Index Writes and Failures
 
 Projection writes occur after provider reads and outside provider sessions when
@@ -230,7 +359,9 @@ catalog authority or secret binding state.
    name, delimiter, and attributes.
 2. UIDVALIDITY changes prevent prior-epoch rows from answering current queries.
 3. Exact totals require fresh qualified complete coverage; partial absence never
-   deletes or proves absence.
+   deletes or proves absence. Datetime-filtered totals and pages apply the exact
+   timezone-aware `[since, before)` interval to complete `INTERNALDATE` evidence
+   after conservative IMAP date search and before ordering or pagination.
 4. Candidate UID count, fetch batches, headers, bodies, parser work, errors, and
    serialized results have enforced ceilings, including direct service calls.
 5. Body reads use PEEK, preserve input order, and return per-item outcomes for up
@@ -254,7 +385,56 @@ catalog authority or secret binding state.
 8. Projection failure cannot turn known provider read evidence into a false mail
    failure, and rebuild cannot alter catalog or credential state.
 9. Interoperability tests cover quoted and grouped address fields, attachment
-   subtree pruning, unknown MIME charsets, all English IMAP month tokens, exact
+   subtree pruning, unknown MIME charsets, GB18030 decoding of GB2312 labels in
+   bodies and encoded words, strict-first GBK/Big5 body fallback without
+   regressing strictly decodable text, all English IMAP month tokens, exact
    ASCII astring escaping, multi-literal UTF-8 SEARCH continuations and failure
    framing, LIST completion filtering and literal lengths, and case-insensitive
    special-use attributes.
+10. Metadata and content return every non-system provider keyword plus configured
+    semantic names, preserve unknown keywords, and implement exact
+    pre-pagination `all` and `any` filtering for semantic-name inputs.
+11. Embedded attachment content preserves filename, MIME type, size, opaque URI,
+    and bytes exactly once; its independent default-off policy and global
+    serialized-result ceiling are proven without writing a local file.
+12. Non-ASCII SEARCH defaults to `auto`: synchronizing UTF-8 literals on every
+    host except `imap.qq.com`, which uses quoted UTF-8 strings. Explicit
+    `literal`, `quoted`, and `auto` overrides remain available. Quoted mode
+    escapes quotes and backslashes and rejects CR/LF. The metadata snapshot row
+    ceiling stays 1,000 unless `MCP_EMAIL_SERVER_METADATA_SNAPSHOT_ROWS` sets a
+    validated larger bound. A full refresh is batched newest-first. Each batch
+    has its own refresh timeout and header budget, both configurable and
+    defaulting to 60 seconds and 4 MiB. A failed batch persists the newest
+    fetched rows as a partial snapshot, a later refresh can turn that same
+    epoch into a complete snapshot, and a partial snapshot is never treated as
+    complete. Refresh failures retain only the causal exception class and
+    value-free traceback locations. Retained rows cannot cross UIDVALIDITY,
+    and connection establishment is bounded by the refresh timeout. A complete
+    same-UIDVALIDITY projection can be extended from UIDs above its high-water
+    mark only when count and stable-state evidence prove an append-only change.
+    Snapshot progress is logged at INFO: partial row counts, a complete
+    message count, or the number of UIDs an append-only sync added.
+13. Subject, from, and to header search has two explicit strategies, `server`
+    (the default) and `local`, set by `MCP_EMAIL_SERVER_IMAP_SEARCH_MODE` or
+    the legacy account field `imap_search_mode`. Neither strategy depends on
+    the IMAP hostname, and a zero-result SEARCH does not switch strategies.
+    `server` sends the predicates to IMAP SEARCH. `local` answers only a
+    subject, from, and/or to predicate from a qualified complete projection
+    when the provider `UIDVALIDITY` and `UIDNEXT` match it, and otherwise from
+    a bounded fresh UID and header read. Matches are case-insensitive
+    substrings of decoded header text, including RFC 2047 encoded words. To
+    matches the To header only; the display recipient list still combines To
+    and Cc. The projection persists To addresses separately. An unknown To
+    field in older rows is distinct from a known empty To list. Complete cache
+    hits and append-only merges must have this evidence for every row before
+    answering To; otherwise a bounded refresh refetches rows missing it.
+    Body, text, date, flag, tag, and attachment predicates stay on
+    IMAP SEARCH. Combining one of those with subject, from, or to in `local`
+    mode fails before provider access. Incomplete local coverage, or a local
+    read past the row, byte, or time bound, is `query_too_broad` and does not
+    fall back to IMAP SEARCH or to an exact empty page. An omitted `UIDNEXT`
+    stays unknown and coverage uses the UID inventory, including gaps. An
+    omitted `UIDVALIDITY` stays unknown, does not reuse rows across
+    observations, and still allows one fresh read to be exact when coverage
+    is complete. `MESSAGES` remains required. A partial snapshot never
+    supplies an exact filtered total.
