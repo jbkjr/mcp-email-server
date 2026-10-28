@@ -4900,17 +4900,21 @@ class EmailClient:
                         targets.append((email_id, label_uids))
 
                 # Phase 3 (label mailbox): scoped STORE, then one scoped UID EXPUNGE.
-                # Authority is rechecked once before the first effect; a revoked grant
-                # fails every target with nothing flagged.
-                try:
-                    self._check_mutation_authority()
-                except PermissionError:
-                    for email_id, _ in targets:
-                        outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "mutation-policy")
-                    targets = []
+                # Authority is rechecked before every STORE and before the EXPUNGE. A
+                # revocation fails the unattempted targets with nothing flagged, and
+                # leaves already-flagged copies unknown because they were not expunged.
                 pending_expunge: dict[str, list[str]] = {}
                 store_cancelled = False
                 for index, (email_id, label_uids) in enumerate(targets):
+                    try:
+                        self._check_mutation_authority()
+                    except PermissionError:
+                        for remaining_id, _ in targets[index:]:
+                            outcomes[remaining_id] = TargetMutationOutcome(remaining_id, "failed", "mutation-policy")
+                        for pending_id in pending_expunge:
+                            outcomes[pending_id] = TargetMutationOutcome(pending_id, "unknown", "expunge-not-attempted")
+                        store_cancelled = True
+                        break
                     try:
                         response = await imap.uid("store", ",".join(label_uids), "+FLAGS", r"(\Deleted)")
                     except asyncio.CancelledError:
@@ -4937,14 +4941,18 @@ class EmailClient:
                     expunge_detail = "expunge-unknown"
                     expunge_uids = [uid for uids in pending_expunge.values() for uid in uids]
                     try:
-                        response = await imap.uid("expunge", ",".join(expunge_uids))
-                    except asyncio.CancelledError:
+                        self._check_mutation_authority()
+                    except PermissionError:
                         response = None
-                    except Exception:
-                        response = None
+                        expunge_detail = "expunge-not-attempted"
                     else:
-                        if _imap_effect_status(response) == "failed":
-                            expunge_detail = "expunge-rejected"
+                        try:
+                            response = await imap.uid("expunge", ",".join(expunge_uids))
+                        except (asyncio.CancelledError, Exception):
+                            response = None
+                        else:
+                            if _imap_effect_status(response) == "failed":
+                                expunge_detail = "expunge-rejected"
                     if response is not None and _imap_effect_status(response) == "succeeded":
                         for email_id in pending_expunge:
                             outcomes[email_id] = TargetMutationOutcome(email_id, "succeeded")
