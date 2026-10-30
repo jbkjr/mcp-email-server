@@ -594,6 +594,20 @@ remains reserved permanently in this delivery.
 An environment account with the same name as a TOML email account is the one
 exception: it intentionally replaces that account in the runtime view.
 
+## Gmail gateway partial writes and draft saves
+
+If a move reports `destination-added-source-retained`, the destination label was
+confirmed but the source-label removal was rejected. Inspect the message's current
+labels before deciding on another operation. An unknown completion can mean a
+write already happened; do not automatically repeat it. A draft save with unknown
+completion must not be re-APPENDed. Check Drafts through an independently operated
+mail client before composing a replacement.
+
+Use LIST flags rather than English folder names for localized Drafts/Trash. Draft
+discard refusals can reflect absent MOVE/UIDPLUS, changed UIDVALIDITY, an edited
+draft, another label alias, missing proxy provenance, or the proxy's disabled
+discard gate. None permits a COPY/delete/expunge fallback.
+
 ## Collect information for a bug report
 
 Include:

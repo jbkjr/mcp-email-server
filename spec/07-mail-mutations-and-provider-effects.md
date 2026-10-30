@@ -348,6 +348,35 @@ enter public errors.
 
 ## Acceptance Criteria
 
+### Explicit Gmail gateway dispatch
+
+An account's explicit `gmail_imap` discriminator overrides the historical
+folder-copy mutation contracts below. Omission and `proton_bridge` MUST preserve
+them. No hostname or reply-markup setting selects dispatch.
+
+Gmail archive MUST remove only Inbox membership from INBOX. Organizing writes
+MUST be incremental label changes over at most 25 explicit unique UIDs. Moves
+MUST add the exact existing destination label/Inbox, confirm destination and the
+same decimal-string X-GM-MSGID at the selected mailbox UID, then remove only the
+source label. Trash/Drafts overlaps MUST be rejected; Spam allows only Inbox
+rescue. Label reads MUST use X-GM-LABELS rather than RFC Message-ID alias searches.
+Special mailbox roles MUST come from unambiguous LIST flags.
+
+Draft APPEND MUST use one fresh ASCII Message-ID, one literal, exact Draft/Seen
+flags, and the resolved Drafts mailbox. Outcomes MUST preserve APPENDUID and
+UIDVALIDITY and MUST NOT replay unknown completion. Draft discard MUST require
+MOVE/UIDPLUS and use only Drafts-to-Trash UID MOVE, leaving provenance, epoch,
+identity, unchanged-content and membership enforcement to the policy proxy.
+Every operation MUST explicitly select before using mailbox UIDs.
+
+No Gmail path may issue COPY, generic MOVE, Deleted, CLOSE or expunge as a
+fallback. Partial and unknown outcomes MUST be per UID and MUST NOT produce a
+complete-success summary. Public summary schemas remain compatible. Acceptance
+requires fake-upstream wire assertions, real proxy-class agreement where the
+reference checkout is available, and unchanged default-provider regressions.
+
+### Existing provider criteria
+
 1. Every mutation revalidates current authority before each independent provider
    effect and resolves only the needed account/role secret.
 2. Per-target results preserve caller order and distinguish success, failure,

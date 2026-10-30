@@ -134,6 +134,7 @@ class MetadataAccountSnapshot:
     account_name: str
     mode: RuntimeMode
     allowed_senders: tuple[str, ...]
+    gateway_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -330,7 +331,7 @@ class MetadataQueryService:
     ) -> EmailMetadataPageResponse:
         query.validate()
         account = self._accounts.resolve(query.account_name)
-        if not query.index_supported:
+        if account.gateway_provider == "gmail_imap" or not query.index_supported:
             return await self._provider_fallback(query, account.mode)
 
         try:

@@ -64,6 +64,7 @@ class MutationAccountSnapshot:
     # Legacy-mode-only gate for mailbox-shape mutations. Managed mode has no policy
     # column for it, so the managed authority path always resolves it to False.
     enable_folder_management: bool = False
+    gateway_provider: Literal["proton_bridge", "gmail_imap"] | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ class AppendMutationOutcome:
     status: MutationStatus
     message_id: str
     uid: str | None = None
+    uidvalidity: str | None = None
     mailbox: str | None = None
     detail: str | None = None
     reconciliation_needed: bool = False
@@ -476,10 +478,10 @@ class RemoveLabelCommand:
     label_name: str
     source_mailbox: str = "INBOX"
 
-    def validate(self) -> None:
+    def validate(self, *, gateway_provider: str | None = None) -> None:
         _validate_account_name(self.account_name)
         _validate_email_ids(self.email_ids)
-        validate_label_name(self.label_name)
+        validate_label_name(self.label_name, gateway_provider=gateway_provider)
         validate_mailbox_name(self.source_mailbox)
 
     @property
@@ -528,10 +530,10 @@ class ApplyLabelCommand:
     label_name: str
     source_mailbox: str = "INBOX"
 
-    def validate(self) -> None:
+    def validate(self, *, gateway_provider: str | None = None) -> None:
         _validate_account_name(self.account_name)
         _validate_email_ids(self.email_ids)
-        validate_label_name(self.label_name)
+        validate_label_name(self.label_name, gateway_provider=gateway_provider)
         validate_mailbox_name(self.source_mailbox)
 
     @property
@@ -572,6 +574,10 @@ class MutationProvider(Protocol):
         self,
         command: MoveCommand,
         account: MutationAccountSnapshot,
+    ) -> BatchMutationOutcome: ...
+
+    async def archive_gmail(
+        self, command: ArchiveCommand, account: MutationAccountSnapshot
     ) -> BatchMutationOutcome: ...
 
     async def find_archive_mailbox(self, source_mailbox: str) -> str: ...
@@ -963,6 +969,8 @@ def _validate_append_result(outcome: AppendMutationOutcome) -> AppendMutationOut
         maximum_bytes=APPLICATION_LIMITS.header_bytes,
         allow_empty=True,
     )
+    if outcome.uidvalidity is not None:
+        validate_imap_uid(outcome.uidvalidity)
     if outcome.uid is not None:
         try:
             _validate_email_ids((outcome.uid,))
@@ -979,6 +987,7 @@ def _validate_append_result(outcome: AppendMutationOutcome) -> AppendMutationOut
         "status": outcome.status,
         "message_id": outcome.message_id,
         "uid": outcome.uid,
+        **({"uidvalidity": outcome.uidvalidity} if outcome.uidvalidity is not None else {}),
         "mailbox": outcome.mailbox,
         "detail": outcome.detail,
         "reconciliation_needed": outcome.reconciliation_needed,
@@ -1213,6 +1222,7 @@ class SaveToMailboxService(_MutationWorkflow):
                 status=outcome.status,
                 message_id=outcome.message_id,
                 uid=outcome.uid,
+                uidvalidity=outcome.uidvalidity,
                 mailbox=outcome.mailbox,
                 detail=outcome.detail,
                 reconciliation_needed=outcome.reconciliation_needed or not invalidated,
@@ -1349,7 +1359,12 @@ class ArchiveService(_MutationWorkflow):
             purpose="incoming",
         )
         try:
-            outcome = _validate_batch_result(await _bounded_provider_effect(access.provider.move(move, access.account)))
+            operation = (
+                access.provider.archive_gmail(command, access.account)
+                if access.account.gateway_provider == "gmail_imap"
+                else access.provider.move(move, access.account)
+            )
+            outcome = _validate_batch_result(await _bounded_provider_effect(operation))
         except TimeoutError:
             outcome = _validate_batch_result(_timeout_batch(command.email_ids))
         if outcome.effect_may_have_started:
@@ -1586,16 +1601,17 @@ class RenameFolderService(_FolderShapeService):
 
 # port-slot A: folder ops (CopyService, CreateFolderService, DeleteFolderService, RenameFolderService)
 class RemoveLabelService(_MutationWorkflow):
-    """Remove one label from messages by deleting only the label's own copies.
+    """Remove a label incrementally on Gmail or delete Proton label copies.
 
-    The message the caller names is never modified: the provider locates the
+    On the historical Proton path the message the caller names is never modified: the provider locates the
     copy inside the label mailbox by Message-ID and scopes every flag change and
     expunge to that mailbox, so only the label mailbox needs invalidating.
     """
 
     async def execute(self, command: RemoveLabelCommand) -> BatchMutationOutcome:
-        command.validate()
+        command.validate(gateway_provider="gmail_imap")  # Structural validation precedes authority reads.
         account = self._resolve(command.account_name)
+        command.validate(gateway_provider=account.gateway_provider)
         access = self._open(account)
         try:
             outcome = _validate_batch_result(
@@ -1605,7 +1621,9 @@ class RemoveLabelService(_MutationWorkflow):
             outcome = _validate_batch_result(_timeout_batch(command.email_ids))
         if not outcome.effect_may_have_started:
             return outcome
-        invalidated = await self._invalidate(access.account, (command.label_mailbox,))
+        invalidated = await self._invalidate(
+            access.account, (label_mailbox(command.label_name, gateway_provider=access.account.gateway_provider),)
+        )
         return _validate_batch_result(
             BatchMutationOutcome(
                 outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
@@ -1657,11 +1675,12 @@ class DeleteLabelService:
 
 
 class ApplyLabelService:
-    """Apply one label by copying each message into the label's mailbox.
+    """Apply an existing Gmail label incrementally or copy into a Proton label mailbox.
 
     Delegating to :class:`CopyService` is what makes the sender allowlist and
     ``report_blocked_mutations`` apply to labelling exactly as they apply to
-    ``copy_emails``: there is one COPY implementation, not a parallel one.
+    ``copy_emails``: the provider dispatches that operation to COPY or Gmail's
+    incremental label STORE. Gmail requires an existing exact label.
     Applying a label is additive and therefore ungated — it changes which
     messages a mailbox holds, not the account's folder layout.
     """
@@ -1670,8 +1689,10 @@ class ApplyLabelService:
         self._copy = copy
 
     async def execute(self, command: ApplyLabelCommand) -> BatchMutationOutcome:
-        command.validate()
-        mailbox = command.label_mailbox
+        command.validate(gateway_provider="gmail_imap")  # Structural validation precedes authority reads.
+        account = self._copy._resolve(command.account_name)
+        command.validate(gateway_provider=account.gateway_provider)
+        mailbox = label_mailbox(command.label_name, gateway_provider=account.gateway_provider)
         logger.debug(f"Applying label by copying into mailbox: {mailbox}")
         return await self._copy.execute(
             CopyCommand(

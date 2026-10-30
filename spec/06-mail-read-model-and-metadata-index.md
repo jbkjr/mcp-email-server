@@ -226,6 +226,15 @@ catalog authority or secret binding state.
 
 ## Acceptance Criteria
 
+Explicit Gmail gateway reads MUST use standard bounded SEARCH and groups of at
+most five explicit UIDs per FETCH, BODY.PEEK only, and permitted metadata fields.
+UID/X-GM-MSGID/X-GM-LABELS evidence MUST retain the 64-bit identity as a decimal
+string. Mailbox names MUST work in modified UTF-7 without UTF8=ACCEPT. Body fetches
+MUST preflight the configured byte cap. Gmail queries bypass the generic SQLite
+projection, which has no Gmail identity/label columns. Identity evidence is scoped
+to the provider operation; shared MCP schemas are not widened. The proxy's allowed
+standard search grammar is authoritative (TEXT is permitted; BODY is not).
+
 1. Mailbox discovery is bounded by count and aggregate bytes and exposes only
    name, delimiter, and attributes.
 2. UIDVALIDITY changes prevent prior-epoch rows from answering current queries.

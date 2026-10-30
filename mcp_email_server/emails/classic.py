@@ -3,6 +3,7 @@ import base64
 import binascii
 import email.utils
 import mimetypes
+import os
 import re
 import ssl
 import time
@@ -60,7 +61,7 @@ from mcp_email_server.application.mutations import (
     validate_mailbox_name,
 )
 from mcp_email_server.config import EmailServer, EmailSettings, get_settings, sender_allowed
-from mcp_email_server.emails import EmailHandler
+from mcp_email_server.emails import EmailHandler, gmail
 from mcp_email_server.emails.html_utils import html_to_text
 from mcp_email_server.emails.markdown_utils import markdown_to_email_html
 from mcp_email_server.emails.models import (
@@ -1341,7 +1342,9 @@ class EmailClient:
         *,
         sender_name: str | None = None,
         sender_address: str | None = None,
+        gateway_provider: Literal["proton_bridge", "gmail_imap"] | None = None,
     ):
+        self.gateway_provider = gateway_provider
         self.email_server = email_server
         raw_sender = sender or email_server.user_name
         if sender_name is not None and sender_address is not None:
@@ -1766,6 +1769,8 @@ class EmailClient:
         if not email_ids:
             return {}
 
+        if self.gateway_provider == "gmail_imap":
+            chunk_size = min(chunk_size, 5)
         # Split into chunks
         chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
         total_chunks = len(chunks)
@@ -1796,7 +1801,7 @@ class EmailClient:
         budget = header_budget or _MetadataHeaderBudget()
         partial = f"<0.{MAX_METADATA_HEADER_BYTES + 1}>"
         fetch_item = f"(FLAGS BODY.PEEK[HEADER]{partial})" if include_flags else f"BODY.PEEK[HEADER]{partial}"
-        chunk_size = min(chunk_size, MAX_METADATA_HEADER_FETCH_UIDS)
+        chunk_size = min(chunk_size, 5 if self.gateway_provider == "gmail_imap" else MAX_METADATA_HEADER_FETCH_UIDS)
         for start in range(0, len(str_ids), chunk_size):
             chunk = str_ids[start : start + chunk_size]
             uid_list = ",".join(chunk)
@@ -1839,6 +1844,10 @@ class EmailClient:
                             flags_match.group(1).decode(errors="replace").split() if flags_match is not None else []
                         )
                     results[uid] = metadata
+        if self.gateway_provider == "gmail_imap":
+            identities = await self._gmail_metadata(imap, str_ids)
+            for uid, metadata in results.items():
+                metadata.update(identities[uid])
         return results
 
     async def _batch_fetch_header_field(
@@ -1861,7 +1870,7 @@ class EmailClient:
         if not email_ids:
             return {}
 
-        chunk_size = min(chunk_size, MAX_METADATA_HEADER_FETCH_UIDS)
+        chunk_size = min(chunk_size, 5 if self.gateway_provider == "gmail_imap" else MAX_METADATA_HEADER_FETCH_UIDS)
         chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
         values: dict[str, str] = {}
         budget = header_budget or _MetadataHeaderBudget()
@@ -2101,6 +2110,8 @@ class EmailClient:
             select_response = await imap.select(_quote_mailbox(mailbox))
             _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
 
+            if self.gateway_provider == "gmail_imap" and body:
+                raise ValueError("Gmail gateway supports TEXT search, not BODY")
             search_criteria = self._build_search_criteria(
                 before,
                 since,
@@ -2114,6 +2125,15 @@ class EmailClient:
                 answered=answered,
                 has_attachment=has_attachment,
             )
+            if self.gateway_provider == "gmail_imap":
+                # The proxy deliberately rejects bracket syntax in SEARCH atoms.
+                # Keep such values quoted; literal UTF-8 values remain literals.
+                search_criteria = [
+                    '"' + token.replace("\\", "\\\\").replace('"', r"\"") + '"'
+                    if isinstance(token, str) and not token.startswith('"') and ("[" in token or "]" in token)
+                    else token
+                    for token in search_criteria
+                ]
             logger.info(f"Get metadata: Search criteria: {search_criteria}")
 
             # ASCII searches omit CHARSET for Exchange compatibility. Non-ASCII
@@ -2242,7 +2262,18 @@ class EmailClient:
 
     async def _fetch_email_with_formats(self, imap, email_id: str) -> list | None:
         """Try non-mutating fetch formats to get email data."""
-        fetch_formats = ["BODY.PEEK[]", "(BODY.PEEK[])"]
+        cap = MAX_RAW_EMAIL_BYTES
+        if self.gateway_provider == "gmail_imap":
+            validate_imap_uid(email_id)
+            size_response = await imap.uid("fetch", email_id, "(UID RFC822.SIZE)")
+            _raise_for_imap_error(size_response, "FETCH Gmail size")
+            sizes = re.findall(rb"RFC822.SIZE (\d+)", b" ".join(x for x in size_response[1] if isinstance(x, bytes)))
+            cap = min(int(os.environ.get("MCP_EMAIL_SERVER_MAX_FETCH_BYTES", 8 * 1024 * 1024)), MAX_RAW_EMAIL_BYTES)
+            if len(sizes) != 1 or not 0 < int(sizes[0]) <= cap:
+                return None
+        fetch_formats = (
+            [f"BODY.PEEK[]<0.{cap + 1}>"] if self.gateway_provider == "gmail_imap" else ["BODY.PEEK[]", "(BODY.PEEK[])"]
+        )
 
         for fetch_format in fetch_formats:
             try:
@@ -2251,6 +2282,8 @@ class EmailClient:
                 _, data = response
 
                 if data and len(data) > 0 and self._check_email_content(data):
+                    if self.gateway_provider == "gmail_imap" and len(self._extract_raw_email(data) or b"") > cap:
+                        return None
                     return data
 
             except Exception as e:
@@ -2309,6 +2342,8 @@ class EmailClient:
                 logger.error(f"Error parsing email: {e!s}")
                 return None
 
+            if self.gateway_provider == "gmail_imap":
+                email_data.update((await self._gmail_metadata(imap, [email_id]))[email_id])
             # Marking is intentionally owned by the application mutation
             # service after a successful body retrieval.
             return email_data
@@ -3288,7 +3323,7 @@ class EmailClient:
         outcome = await self.append_to_sent_with_outcome(msg, incoming_server, sent_folder_name)
         return outcome.status == "succeeded"
 
-    async def append_to_mailbox_with_outcome(
+    async def append_to_mailbox_with_outcome(  # noqa: C901 - explicit provider and APPEND evidence
         self,
         msg: MIMEText | MIMEMultipart,
         incoming_server: EmailServer,
@@ -3296,13 +3331,28 @@ class EmailClient:
         flags: str = r"(\Draft \Seen)",
     ) -> AppendMutationOutcome:
         """Append exactly once and distinguish rejection from a lost result."""
+        is_gmail = self.gateway_provider == "gmail_imap"
+        if is_gmail:
+            del msg["Message-ID"]
+            msg["Message-ID"] = email.utils.make_msgid(domain="mcp-email-server.invalid")
         message_id = msg["Message-Id"] or "saved"
         imap = await self._connect_imap_server(incoming_server)
         try:
             await _imap_login(imap, incoming_server.user_name, incoming_server.password.get_secret_value())
-            await _send_imap_id(imap)
+            if not is_gmail:
+                await _send_imap_id(imap)
             try:
-                append_mode = await _prepare_imap_append(imap, msg)
+                if is_gmail:
+                    discovered = gmail.special_mailbox("drafts", await self._gmail_mailboxes(imap))
+                    if mailbox != discovered or flags != r"(\Draft \Seen)":
+                        return AppendMutationOutcome("failed", message_id, mailbox=mailbox, detail="gmail-drafts-only")
+                    if _message_requires_smtputf8(msg):
+                        return AppendMutationOutcome(
+                            "failed", message_id, mailbox=mailbox, detail="utf8-append-unsupported"
+                        )
+                    append_mode = _ImapAppendMode(False, False)
+                else:
+                    append_mode = await _prepare_imap_append(imap, msg)
             except ImapUtf8UnsupportedError:
                 return AppendMutationOutcome("failed", message_id, mailbox=mailbox, detail="utf8-append-unsupported")
             select_result = await imap.select(_quote_mailbox(mailbox, utf8=append_mode.session_utf8_enabled))
@@ -3329,22 +3379,25 @@ class EmailClient:
                     detail="append-rejected" if append_status == "failed" else "append-unknown",
                 )
             uid: str | None = None
+            uidvalidity: str | None = None
             if isinstance(append_result, tuple) and len(append_result) > 1:
                 for part in append_result[1]:
                     part_text = part.decode("utf-8", errors="replace") if isinstance(part, bytes) else str(part)
                     match = re.search(
-                        r"APPENDUID\s+[1-9][0-9]*\s+([1-9][0-9]*)(?=\s|\]|$)",
+                        r"APPENDUID\s+([1-9][0-9]*)\s+([1-9][0-9]*)(?=\s|\]|$)",
                         part_text,
                         re.IGNORECASE,
                     )
-                    if match is not None and int(match.group(1)) <= MAX_IMAP_UID:
-                        uid = match.group(1)
+                    if match is not None and max(int(match.group(1)), int(match.group(2))) <= MAX_IMAP_UID:
+                        uidvalidity, uid = match.group(1), match.group(2)
                         break
-            return AppendMutationOutcome("succeeded", message_id, uid=uid, mailbox=mailbox)
+            return AppendMutationOutcome(
+                "succeeded", message_id, uid=uid, mailbox=mailbox, uidvalidity=uidvalidity if is_gmail else None
+            )
         finally:
             await _best_effort_imap_logout(imap)
 
-    async def append_to_mailbox(
+    async def append_to_mailbox(  # noqa: C901 - legacy wrapper and Gmail dispatch
         self,
         msg: MIMEText | MIMEMultipart,
         incoming_server: EmailServer,
@@ -3358,6 +3411,9 @@ class EmailClient:
         (if the server supports APPENDUID / RFC 4315), or ``"unknown"`` on
         success without UID, or ``None`` on failure.
         """
+        if self.gateway_provider == "gmail_imap":
+            outcome = await self.append_to_mailbox_with_outcome(msg, incoming_server, mailbox, flags)
+            return (outcome.uid or "unknown") if outcome.status == "succeeded" else None
         imap = await self._connect_imap_server(incoming_server)
 
         try:
@@ -3418,6 +3474,10 @@ class EmailClient:
         report_blocked_mutations: bool = False,
     ) -> BatchMutationOutcome:
         """Delete scoped UIDs while preserving STORE and UID EXPUNGE evidence."""
+        if self.gateway_provider == "gmail_imap":
+            return BatchMutationOutcome(
+                tuple(TargetMutationOutcome(uid, "failed", "gmail-delete-denied") for uid in email_ids)
+            )
         _validate_imap_uids(email_ids)
         imap = await self._connect_imap()
         outcomes: dict[str, TargetMutationOutcome] = {}
@@ -3498,6 +3558,12 @@ class EmailClient:
         report_blocked_mutations: bool = False,
     ) -> BatchMutationOutcome:
         """Add or remove approved flags once per UID and retain effect evidence."""
+        if self.gateway_provider == "gmail_imap":
+            gmail.validate_uids(email_ids)
+            if flags != [r"\Seen"]:
+                return BatchMutationOutcome(
+                    tuple(TargetMutationOutcome(uid, "failed", "gmail-flags-denied") for uid in email_ids)
+                )
         _validate_imap_uids(email_ids)
         store_operation, formatted_flags = _validate_mutable_email_flags(operation, flags)
         imap = await self._connect_imap()
@@ -3570,6 +3636,148 @@ class EmailClient:
             report_blocked_mutations,
         )
 
+    async def _gmail_metadata(self, imap: Any, uids: list[str]) -> dict[str, dict[str, Any]]:
+        """Read selected-mailbox identities in explicit groups of at most five."""
+        result: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(uids), 5):
+            chunk = uids[start : start + 5]
+            gmail.validate_uids(chunk)
+            response = await imap.uid("fetch", ",".join(chunk), "(UID X-GM-MSGID X-GM-LABELS)")
+            _raise_for_imap_error(response, "FETCH Gmail identity")
+            metadata = gmail.parse_metadata(response[1])
+            if set(metadata) != set(chunk):
+                raise ValueError("Gmail identity set mismatch")
+            result.update(metadata)
+        return result
+
+    async def _gmail_mailboxes(self, imap: Any) -> list[MailboxInfo]:
+        response = await imap.list('""', '"*"')
+        _raise_for_imap_error(response, "LIST Gmail mailboxes")
+        mailboxes = _parse_list_responses(response[1])
+        if len(mailboxes) > APPLICATION_LIMITS.mailboxes or len({m.name for m in mailboxes}) != len(mailboxes):
+            raise ValueError("Ambiguous or oversized Gmail LIST")
+        return mailboxes
+
+    async def _gmail_mutate(  # noqa: C901 - ordered per-UID evidence for two distinct effects
+        self,
+        email_ids: list[str],
+        source_mailbox: str,
+        destination_mailbox: str | None,
+        operation: Literal["move", "add", "remove", "archive"],
+        allowed_senders: list[str] | None = None,
+    ) -> BatchMutationOutcome:
+        """Increment labels without COPY, expunge, or alias UID reuse.
+
+        Draft discard is the sole MOVE exception. The gateway proxy owns its
+        durable APPEND provenance/body/UIDVALIDITY gate; no weaker fallback exists.
+        """
+        gmail.validate_uids(email_ids)
+        outcomes = {uid: TargetMutationOutcome(uid, "failed", "not-attempted") for uid in email_ids}
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            mailboxes = await self._gmail_mailboxes(imap)
+            source_role = gmail.mailbox_role(source_mailbox, mailboxes)
+            dest_role = gmail.mailbox_role(destination_mailbox, mailboxes) if destination_mailbox else "unknown"
+            discard = operation == "move" and source_role == "drafts" and dest_role == "trash"
+            if operation == "archive":
+                if source_role != "inbox":
+                    raise ValueError("Gmail archive requires INBOX")
+                destination_label = r"\Inbox"
+            elif discard:
+                capabilities = await _refresh_imap_capabilities(imap)
+                if not {"MOVE", "UIDPLUS"} <= capabilities:
+                    return BatchMutationOutcome(
+                        tuple(TargetMutationOutcome(uid, "failed", "move-uidplus-unavailable") for uid in email_ids)
+                    )
+                destination_label = ""
+            else:
+                if source_role not in {"inbox", "label", "all", "sent", "junk"}:
+                    raise ValueError("Protected or unknown Gmail source")
+                if operation in {"add", "remove"} and dest_role != "label":
+                    raise ValueError("Gmail requires an exact existing user label")
+                if operation == "move" and (
+                    dest_role not in {"inbox", "label"} or source_role not in {"inbox", "label", "junk"}
+                ):
+                    raise ValueError("Unsupported Gmail move")
+                if source_role == "junk" and not (operation == "move" and dest_role == "inbox"):
+                    raise ValueError("Gmail Spam permits rescue to Inbox only")
+                destination_label = r"\Inbox" if dest_role == "inbox" else str(destination_mailbox)
+            selected = await imap.select(_quote_mailbox(source_mailbox))
+            _raise_for_imap_error(selected, "SELECT Gmail source")
+            blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+            for uid in email_ids:
+                if uid in blocked:
+                    outcomes[uid] = TargetMutationOutcome(uid, "failed", "sender-policy")
+                    continue
+                detail = "identity-unavailable"
+                effect_started = False
+                try:
+                    before = (await self._gmail_metadata(imap, [uid]))[uid]
+                    labels = {label.upper() for label in before["gmail_labels"]}
+                    protected = labels & {r"\TRASH", r"\DRAFTS", r"\DRAFT", r"\SPAM"}
+                    if discard:
+                        if labels != {r"\DRAFTS"}:
+                            outcomes[uid] = TargetMutationOutcome(uid, "failed", "protected-label-overlap")
+                            continue
+                        detail = "move-unknown"
+                        effect_started = True
+                        response = await imap.uid("move", uid, _quote_mailbox(str(destination_mailbox)))
+                    else:
+                        if protected and not (protected == {r"\SPAM"} and source_role == "junk"):
+                            outcomes[uid] = TargetMutationOutcome(uid, "failed", "protected-label-overlap")
+                            continue
+                        remove = operation in {"remove", "archive"}
+                        detail = "label-store-unknown"
+                        effect_started = True
+                        label_arg = (
+                            f"({destination_label})"
+                            if destination_label.startswith("\\")
+                            else f"({_quote_mailbox(destination_label)})"
+                        )
+                        response = await imap.uid("store", uid, "-X-GM-LABELS" if remove else "+X-GM-LABELS", label_arg)
+                        if _imap_effect_status(response) == "succeeded" and operation == "move":
+                            detail = "destination-added-confirmation-unknown"
+                            confirmed = (await self._gmail_metadata(imap, [uid]))[uid]
+                            if (
+                                before["gmail_message_id"] != confirmed["gmail_message_id"]
+                                or destination_label not in confirmed["gmail_labels"]
+                            ):
+                                outcomes[uid] = TargetMutationOutcome(
+                                    uid, "unknown", "destination-added-identity-unconfirmed"
+                                )
+                                break
+                            if source_mailbox == destination_mailbox or source_role == dest_role == "inbox":
+                                outcomes[uid] = TargetMutationOutcome(uid, "succeeded")
+                                continue
+                            source_label = {"inbox": r"\Inbox", "junk": r"\Spam"}.get(source_role, source_mailbox)
+                            source_arg = (
+                                f"({source_label})"
+                                if source_label.startswith("\\")
+                                else f"({_quote_mailbox(source_label)})"
+                            )
+                            detail = "destination-added-source-remove-unknown"
+                            response = await imap.uid("store", uid, "-X-GM-LABELS", source_arg)
+                            if _imap_effect_status(response) == "failed":
+                                outcomes[uid] = TargetMutationOutcome(
+                                    uid, "unknown", "destination-added-source-retained"
+                                )
+                                continue
+                    status = _imap_effect_status(response)
+                    outcomes[uid] = TargetMutationOutcome(
+                        uid,
+                        status,
+                        None if status == "succeeded" else "write-rejected" if status == "failed" else detail,
+                    )
+                    if status == "unknown":
+                        break
+                except (asyncio.CancelledError, Exception):
+                    outcomes[uid] = TargetMutationOutcome(uid, "unknown" if effect_started else "failed", detail)
+                    break  # Never retry an unresolved write or reuse a lost session.
+        finally:
+            await _best_effort_imap_logout(imap)
+        return BatchMutationOutcome(tuple(outcomes[uid] for uid in email_ids))
+
     async def move_emails_with_outcome(  # noqa: C901 - explicit native/fallback states
         self,
         email_ids: list[str],
@@ -3579,6 +3787,8 @@ class EmailClient:
         report_blocked_mutations: bool = False,
     ) -> BatchMutationOutcome:
         """Move UIDs with native MOVE or scoped COPY/STORE/UID EXPUNGE evidence."""
+        if self.gateway_provider == "gmail_imap":
+            return await self._gmail_mutate(email_ids, source_mailbox, destination_mailbox, "move", allowed_senders)
         _validate_imap_uids(email_ids)
         imap = await self._connect_imap()
         outcomes: dict[str, TargetMutationOutcome] = {}
@@ -3713,6 +3923,8 @@ class EmailClient:
         nonexistent UID, and only reports as failed when
         ``report_blocked_mutations`` is set.
         """
+        if self.gateway_provider == "gmail_imap":
+            return await self._gmail_mutate(email_ids, source_mailbox, destination_mailbox, "add", allowed_senders)
         _validate_imap_uids(email_ids)
         imap = await self._connect_imap()
         outcomes: dict[str, TargetMutationOutcome] = {}
@@ -3770,6 +3982,8 @@ class EmailClient:
         cancelled, or otherwise unclassifiable response is ``unknown`` because
         the command may already have taken effect.
         """
+        if self.gateway_provider == "gmail_imap":
+            return FolderMutationOutcome("failed", "gmail-mailbox-shape-denied")
         imap = await self._connect_imap()
         try:
             await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
@@ -3790,6 +4004,8 @@ class EmailClient:
             await _best_effort_imap_logout(imap)
 
     async def create_mailbox_with_outcome(self, mailbox: str) -> FolderMutationOutcome:
+        if self.gateway_provider == "gmail_imap":
+            return FolderMutationOutcome("failed", "gmail-label-creation-denied")
         """Create one mailbox by its RFC 3501 name."""
         return await self._mailbox_shape_outcome("create", lambda imap: imap.create(_quote_mailbox(mailbox)))
 
@@ -3817,6 +4033,8 @@ class EmailClient:
         no-op success (indistinguishable from a nonexistent UID); when
         report_blocked_mutations is True it is reported in failed_ids instead.
         """
+        if self.gateway_provider == "gmail_imap":
+            return [], list(email_ids)
         imap = await self._connect_imap()
         deleted_ids = []
         failed_ids = []
@@ -3928,6 +4146,11 @@ class EmailClient:
         A blocked sender's UID is never copied/moved: reported as a no-op success by default,
         or in failed_ids when report_blocked_mutations is True.
         """
+        if self.gateway_provider == "gmail_imap":
+            outcome = await self.move_emails_with_outcome(
+                email_ids, source_mailbox, destination_mailbox, allowed_senders, report_blocked_mutations
+            )
+            return outcome.targets("succeeded"), [o.target for o in outcome.outcomes if o.status != "succeeded"]
         imap = await self._connect_imap()
         moved_ids = []
         failed_ids = []
@@ -3991,6 +4214,21 @@ class EmailClient:
             [email_id for email_id in email_ids if email_id in moved_set],
             [email_id for email_id in email_ids if email_id in failed_set],
         )
+
+    async def gmail_email_labels(self, email_id: str, mailbox: str, allowed_senders: list[str]) -> list[str]:
+        validate_imap_uid(email_id)
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            mailboxes = await self._gmail_mailboxes(imap)
+            selected = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(selected, "SELECT Gmail labels")
+            if email_id in await self._blocked_uids(imap, [email_id], allowed_senders):
+                return []
+            metadata = (await self._gmail_metadata(imap, [email_id]))[email_id]
+            return [label for label in metadata["gmail_labels"] if gmail.mailbox_role(label, mailboxes) == "label"]
+        finally:
+            await _best_effort_imap_logout(imap)
 
     async def fetch_message_id(
         self,
@@ -4069,6 +4307,8 @@ class EmailClient:
         UIDs are marked ``\\Deleted`` and expunged. Every effect is scoped to the
         label mailbox: the message the caller named is never touched.
         """
+        if self.gateway_provider == "gmail_imap":
+            return await self._gmail_mutate(email_ids, source_mailbox, label_mailbox, "remove", allowed_senders)
         _validate_imap_uids(email_ids)
         imap = await self._connect_imap()
         outcomes: dict[str, TargetMutationOutcome] = {}
@@ -4215,6 +4455,7 @@ class ClassicEmailHandler(EmailHandler):
             email_settings.incoming,
             sender_name=email_settings.full_name,
             sender_address=email_settings.email_address,
+            gateway_provider=email_settings.gateway_provider,
         )
         self.outgoing_client = (
             EmailClient(
@@ -4472,6 +4713,8 @@ class ClassicEmailHandler(EmailHandler):
             return self._special_folder_cache[kind]
 
         special_use, candidates = _SPECIAL_FOLDER_KINDS[kind]
+        if self.email_settings.gateway_provider == "gmail_imap":
+            return gmail.special_mailbox(special_use, await self.incoming_client.list_mailboxes())
         mailboxes = await self.incoming_client.list_mailboxes()
 
         resolved: str | None = None
@@ -4530,6 +4773,15 @@ class ClassicEmailHandler(EmailHandler):
 
     async def archive_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str], str]:
         """Move emails to the auto-detected Archive folder. Returns (moved_ids, failed_ids, archive_folder)."""
+        if self.email_settings.gateway_provider == "gmail_imap":
+            outcome = await self.incoming_client._gmail_mutate(
+                email_ids, mailbox, None, "archive", get_settings().allowed_senders
+            )
+            return (
+                outcome.targets("succeeded"),
+                [o.target for o in outcome.outcomes if o.status != "succeeded"],
+                "INBOX",
+            )
         archive_folder = await self._find_archive_folder()
         if archive_folder is None:
             raise ValueError(

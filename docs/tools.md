@@ -846,6 +846,34 @@ Account lifecycle changes therefore do not require a tools-list notification.
 A bootstrap mode selection still requires a server restart because it changes
 the selected configuration authority.
 
+## Gmail gateway workflows
+
+These rules apply only to explicitly configured `gmail_imap` gateway accounts.
+Direct Gmail and Proton accounts retain the existing workflows and tool catalog.
+
+- Archive accepts INBOX only and removes `\Inbox` with incremental
+  `-X-GM-LABELS`. It never transfers messages to an Archive/All Mail folder.
+- Move accepts at most 25 unique explicit UIDs. It adds the existing destination
+  user label (or `\Inbox`), FETCH-confirms the same decimal-string X-GM-MSGID
+  and destination membership, then removes only the source label. Spam can move
+  only to Inbox. Other user labels remain intact.
+- Apply/remove labels use exact existing user label names, without adding
+  `Labels/`. `get_email_labels` reads X-GM-LABELS from the selected UID; it never
+  searches RFC Message-ID aliases or reuses a UID in another mailbox.
+- Save targets the exact LIST-discovered Drafts mailbox, with the default flags.
+  Its internal append outcome preserves both APPENDUID UID and UIDVALIDITY.
+  Discard uses only Drafts-to-Trash UID MOVE; rejected or ambiguous discard has
+  no fallback. Internationalized address headers requiring SMTPUTF8 are rejected
+  on this restricted APPEND transport; MIME-encoded Unicode subjects/bodies work.
+- Reads use bounded standard SEARCH and BODY.PEEK, never X-GM-RAW. The gateway
+  proxy accepts TEXT search but does not permit the separate BODY search key.
+  The attachment filter uses the standard (optionally NOT) HEADER heuristic.
+- Per-UID outcomes distinguish complete success, rejection, unknown completion,
+  and `destination-added-source-retained`. A partial operation never receives
+  a `Successfully ...` summary and unresolved writes are not retried. Existing
+  public summary/result schemas stay unchanged; Gmail identity evidence remains
+  in the provider workflow rather than adding fields to the shared MCP catalog.
+
 ## Reply threading
 
 To preserve conversation threading:

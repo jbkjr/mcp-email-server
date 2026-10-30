@@ -43,6 +43,10 @@ bounded, rebuildable observations.
 | [`11-agent-integration-and-safe-setup.md`](11-agent-integration-and-safe-setup.md)                     | Codex/Claude Code integration, safe CLI/UI handoff, installation, and no-secret agent rules   |
 | [`12-delivery-validation-and-evolution.md`](12-delivery-validation-and-evolution.md)                   | verification map, test layers, package/release gates, documentation, and future change rules  |
 
+The explicit legacy Gmail gateway discriminator is owned by spec 04, its bounded
+reads by spec 06, incremental mutations by spec 07, and verification/artifact gate
+by spec 12. It does not change default direct-provider workflows.
+
 Cross-references point to the owning document rather than duplicating its full
 contract. This README is the only ordered navigation map.
 

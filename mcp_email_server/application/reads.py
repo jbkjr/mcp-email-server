@@ -7,7 +7,7 @@ from typing import Protocol, TypeVar
 
 from pydantic import TypeAdapter
 
-from mcp_email_server.application.labels import LABEL_LIST_PATTERN, label_name_from_mailbox
+from mcp_email_server.application.labels import LABEL_LIST_PATTERN, label_name_from_mailbox, mailbox_role
 from mcp_email_server.application.limits import (
     APPLICATION_LIMITS,
     validate_controlled_string,
@@ -66,6 +66,7 @@ class ReadAccountSnapshot:
     mode: RuntimeMode
     allowed_senders: tuple[str, ...]
     enable_attachment_download: bool
+    gateway_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,8 @@ class ReadAccountAuthority(Protocol):
 
 
 class ReadProvider(Protocol):
+    async def gmail_email_labels(self, query: GetEmailLabelsQuery, account: ReadAccountSnapshot) -> list[str]: ...
+
     async def list_mailboxes(self, query: ListMailboxesQuery) -> list[MailboxInfo]: ...
 
     async def fetch_message_id(
@@ -267,11 +270,13 @@ _LABEL_LIST_ADAPTER = TypeAdapter(list[LabelInfo])
 _LABEL_NAME_LIST_ADAPTER = TypeAdapter(list[str])
 
 
-def _labels_from_mailboxes(mailboxes: list[MailboxInfo]) -> list[LabelInfo]:
+def _labels_from_mailboxes(mailboxes: list[MailboxInfo], gateway_provider: str | None = None) -> list[LabelInfo]:
     """Project label mailboxes onto labels, dropping the bare container."""
     labels: list[LabelInfo] = []
     for mailbox in mailboxes:
         name = label_name_from_mailbox(mailbox.name)
+        if gateway_provider == "gmail_imap":
+            name = mailbox.name if mailbox_role(mailbox.name, mailboxes) == "label" else None
         if name is None:
             continue
         labels.append(
@@ -367,17 +372,21 @@ class MailboxDiscoveryService:
 
 
 class LabelDiscoveryService:
-    """List labels as the `Labels/`-prefixed projection of mailbox discovery."""
+    """List exact Gmail labels or the historical Labels/ mailbox projection."""
 
     def __init__(self, mailboxes: MailboxDiscoveryService) -> None:
         self._mailboxes = mailboxes
 
     async def execute(self, query: ListLabelsQuery) -> list[LabelInfo]:
         query.validate()
+        account = self._mailboxes._accounts.resolve(query.account_name)
         mailboxes = await self._mailboxes.execute(
-            ListMailboxesQuery(account_name=query.account_name, pattern=LABEL_LIST_PATTERN)
+            ListMailboxesQuery(
+                account_name=query.account_name,
+                pattern="*" if account.gateway_provider == "gmail_imap" else LABEL_LIST_PATTERN,
+            )
         )
-        labels = _labels_from_mailboxes(mailboxes)
+        labels = _labels_from_mailboxes(mailboxes, account.gateway_provider)
         _validate_label_result(labels)
         return labels
 
@@ -401,6 +410,10 @@ class EmailLabelService:
         access = self._providers.open(account.account_name, expected_mode=account.mode)
         try:
             async with asyncio.timeout(APPLICATION_LIMITS.provider_timeout_seconds):
+                if access.account.gateway_provider == "gmail_imap":
+                    labels = await access.provider.gmail_email_labels(query, access.account)
+                    _validate_label_name_result(labels)
+                    return labels
                 # A blocked sender and a missing message both resolve to None,
                 # so the allowlist never reveals that a message exists.
                 message_id = await access.provider.fetch_message_id(query, access.account)

@@ -256,6 +256,16 @@ possibility does not add placeholders or generic abstractions now.
 
 ## Acceptance Criteria
 
+The explicit Gmail dispatch gate requires `tests/test_gateway_gmail.py`: synthetic
+alias UIDs, decimal-string identity, existing user labels, localized Drafts/Trash,
+protected overlap, partial two-step move, changed identity/epoch, edited draft,
+lost completion, and missing MOVE/UIDPLUS. With MCP_EMAIL_TEST_PROXY pointing to
+the reviewed gateway imap_proxy.py, the real Session class MUST admit worker wire
+commands and enforce draft provenance against an in-memory upstream. Socket-level
+and live draft-recoverability smoke remain separate deployment gates. Package
+gateway_gmail_contract.json only after these worker checks pass; it is a versioned
+capability declaration, not proof that live discard is enabled.
+
 1. Every acceptance item in specs 01-11 has concrete production, test, docs, and
    review references in the checked delivery matrix.
 2. The entire Python/frontend/security/E2E/docs gate passes from a clean checkout

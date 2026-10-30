@@ -46,6 +46,11 @@ class ClassicReadProvider:
     def __init__(self, handler: ClassicEmailHandler) -> None:
         self._handler = handler
 
+    async def gmail_email_labels(self, query: GetEmailLabelsQuery, account: ReadAccountSnapshot) -> list[str]:
+        return await self._handler.incoming_client.gmail_email_labels(
+            query.email_id, query.mailbox, list(account.allowed_senders)
+        )
+
     async def list_mailboxes(self, query: ListMailboxesQuery) -> list[MailboxInfo]:
         try:
             return await self._handler.list_mailboxes(query.pattern, query.reference)
@@ -485,6 +490,7 @@ class LocalReadBackend:
                 mode=resolved.mode,
                 allowed_senders=tuple(resolved.settings.allowed_senders),
                 enable_attachment_download=resolved.settings.enable_attachment_download,
+                gateway_provider=resolved.account.gateway_provider,
             ),
         )
 

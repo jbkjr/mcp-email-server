@@ -16,6 +16,7 @@ from mcp_email_server.application.management import BindingRole
 from mcp_email_server.application.metadata import RuntimeMode
 from mcp_email_server.application.mutations import (
     AppendMutationOutcome,
+    ArchiveCommand,
     BatchMutationOutcome,
     ComposeCommand,
     CopyCommand,
@@ -168,6 +169,13 @@ class ClassicMutationProvider:
             )
         )
 
+    async def archive_gmail(self, command: ArchiveCommand, account: MutationAccountSnapshot) -> BatchMutationOutcome:
+        return await _bounded_mutation_call(
+            self._handler.incoming_client._gmail_mutate(
+                list(command.email_ids), command.source_mailbox, None, "archive", list(account.allowed_senders)
+            )
+        )
+
     async def _mailbox_shape_effect(self, operation: Awaitable[FolderMutationOutcome]) -> FolderMutationOutcome:
         """Run one mailbox-shape effect and drop stale special-use resolutions.
 
@@ -219,7 +227,7 @@ class ClassicMutationProvider:
         return await _bounded_mutation_call(
             self._handler.incoming_client.remove_label_with_outcome(
                 list(command.email_ids),
-                command.label_mailbox,
+                command.label_name if account.gateway_provider == "gmail_imap" else command.label_mailbox,
                 command.source_mailbox,
                 list(account.allowed_senders),
                 account.report_blocked_mutations,
@@ -227,6 +235,10 @@ class ClassicMutationProvider:
         )
 
     async def find_archive_mailbox(self, source_mailbox: str) -> str:
+        if self._handler.email_settings.gateway_provider == "gmail_imap":
+            if source_mailbox.upper() != "INBOX":
+                raise ValueError("Gmail archive requires INBOX")
+            return "INBOX"
         archive_mailbox = await _bounded_mutation_call(self._handler._find_archive_folder())
         if archive_mailbox is None or archive_mailbox == source_mailbox:
             raise ValueError(
@@ -434,6 +446,7 @@ class LocalMutationBackend:
                 # Endpoint presence is authority metadata, not a secret: resolving
                 # it here does not read any outgoing credential.
                 can_send=resolved.account.can_send,
+                gateway_provider=resolved.account.gateway_provider,
             ),
         )
 

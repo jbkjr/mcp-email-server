@@ -175,6 +175,7 @@ class LocalMetadataBackend:
                 account_name=resolved.account.account_name,
                 mode=resolved.mode,
                 allowed_senders=tuple(resolved.settings.allowed_senders),
+                gateway_provider=resolved.account.gateway_provider,
             ),
         )
 

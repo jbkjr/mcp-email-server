@@ -329,6 +329,7 @@ class EmailSettings(AccountAttributes):
     # Selects the quoted-reply markup shape ('protonmail', 'gmail', 'generic').
     # None auto-detects from the IMAP host; set it explicitly when detection is wrong.
     email_service: str | None = None
+    gateway_provider: Literal["proton_bridge", "gmail_imap"] | None = None
 
     @property
     def can_send(self) -> bool:
@@ -361,6 +362,7 @@ class EmailSettings(AccountAttributes):
         save_to_sent: bool = True,
         sent_folder_name: str | None = None,
         email_service: str | None = None,
+        gateway_provider: Literal["proton_bridge", "gmail_imap"] | None = None,
         smtp_user_agent: str = DEFAULT_SMTP_USER_AGENT,
         smtp_x_mailer: str = DEFAULT_SMTP_X_MAILER,
     ) -> EmailSettings:
@@ -405,6 +407,7 @@ class EmailSettings(AccountAttributes):
             save_to_sent=save_to_sent,
             sent_folder_name=sent_folder_name,
             email_service=email_service,
+            gateway_provider=gateway_provider,
         )
 
     @classmethod
@@ -429,6 +432,7 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_SMTP_VERIFY_SSL (default: true)
         - MCP_EMAIL_SERVER_SAVE_TO_SENT (default: true)
         - MCP_EMAIL_SERVER_SENT_FOLDER_NAME (default: auto-detect)
+        - MCP_EMAIL_SERVER_GATEWAY_PROVIDER (optional: proton_bridge / gmail_imap)
         - MCP_EMAIL_SERVER_EMAIL_SERVICE (default: auto-detect from the IMAP host)
         - MCP_EMAIL_SERVER_SMTP_USER_AGENT (default: mcp-email-server; empty omits the header)
         - MCP_EMAIL_SERVER_SMTP_X_MAILER (default: mcp-email-server; empty omits the header)
@@ -453,6 +457,9 @@ class EmailSettings(AccountAttributes):
             return None
 
         try:
+            provider = os.getenv("MCP_EMAIL_SERVER_GATEWAY_PROVIDER")
+            if provider not in (None, "proton_bridge", "gmail_imap"):
+                raise ValueError("Invalid gateway provider")  # noqa: TRY301 - mapped with all env validation
             return cls.init(
                 account_name=account_name,
                 full_name=full_name,
@@ -476,6 +483,7 @@ class EmailSettings(AccountAttributes):
                 save_to_sent=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SAVE_TO_SENT"), True),
                 sent_folder_name=os.getenv("MCP_EMAIL_SERVER_SENT_FOLDER_NAME"),
                 email_service=os.getenv("MCP_EMAIL_SERVER_EMAIL_SERVICE"),
+                gateway_provider=provider,
                 smtp_user_agent=os.getenv("MCP_EMAIL_SERVER_SMTP_USER_AGENT", DEFAULT_SMTP_USER_AGENT),
                 smtp_x_mailer=os.getenv("MCP_EMAIL_SERVER_SMTP_X_MAILER", DEFAULT_SMTP_X_MAILER),
             )

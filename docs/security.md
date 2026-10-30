@@ -656,6 +656,23 @@ reads local file paths. Relative paths are likewise resolved against the server
 process's working directory. Only connect clients that should be trusted to
 request access to files visible to that process.
 
+## Gmail gateway mutation boundary
+
+Only an explicit `gateway_provider = "gmail_imap"` activates this boundary. It
+uses incremental label stores; it never falls back to COPY, Deleted flags, CLOSE,
+or expunge. It rejects unknown/system label targets, label creation, mailbox shape
+changes, and organizing messages that also carry Trash or Drafts labels. Spam
+permits only rescue to Inbox. Sender policy still applies.
+
+The sole MOVE is LIST-resolved Drafts to Trash, requiring MOVE and UIDPLUS.
+The gateway's IMAP policy proxy additionally owns durable draft provenance,
+UIDVALIDITY, X-GM-MSGID, unchanged-body, and Drafts-only membership checks. This
+worker setting alone does not supply that provenance authority. Keep proxy draft
+discard disabled until the separately supervised live recoverability smoke passes.
+APPEND occurs once with one fresh ASCII Message-ID; lost completion is reported
+as unknown and must not trigger resubmission. Each operation selects its mailbox
+again, including the first operation after the proxy invalidates APPEND selection.
+
 ## TLS certificate verification
 
 Keep `verify_ssl = true` for remote IMAP and SMTP services. Disabling

@@ -311,6 +311,13 @@ SQL, raw provider responses, or reusable locators.
 
 ## Acceptance Criteria
 
+Legacy accounts MAY select `gateway_provider` explicitly as `gmail_imap` or
+`proton_bridge` (environment-account equivalent: MCP_EMAIL_SERVER_GATEWAY_PROVIDER).
+Omission MUST preserve existing direct-provider behavior. This field MUST NOT be
+inferred from a hostname or the independent email_service reply-markup setting.
+It is a legacy gateway deployment discriminator, not a managed catalog column;
+the owning mutation contract is in spec 07 and bounded reads in spec 06.
+
 1. Missing bootstrap retains only the historical implicit-legacy rule; explicit
    managed selection fails closed with no fallback.
 2. Fresh initialization, v1-preserving migration preparation, successful-import

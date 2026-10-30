@@ -31,6 +31,26 @@ selection write, or the authority step preceding an explicit legacy source write
 materializes its selection into the sidecar without that step changing source
 bytes.
 
+## Explicit Gmail gateway dispatch
+
+Legacy TOML accounts can set `gateway_provider = "gmail_imap"` on the account
+(alongside `email_service`, outside `[emails.incoming]`). The environment-account
+equivalent is `MCP_EMAIL_SERVER_GATEWAY_PROVIDER`. The only accepted values are
+`gmail_imap` and `proton_bridge`; omission retains all existing behavior, including
+direct Gmail and Proton accounts. Neither hostname nor `email_service` enables
+gateway dispatch. SMTP configuration remains optional and is not added by this setting.
+This discriminator is for legacy gateway deployments, not a managed catalog field.
+
+Gmail gateway body fetches preflight `RFC822.SIZE` against
+`MCP_EMAIL_SERVER_MAX_FETCH_BYTES` (default 8 MiB, also capped by the application's
+raw-message limit). Metadata/header fetches use at most five explicit UIDs. This
+byte-limit environment variable applies only to `gmail_imap` accounts.
+
+Resolve special mailboxes with `list_mailboxes` and use their exact names and
+LIST flags. Draft saves require the discovered `\Drafts` mailbox name and the
+exact default `\Draft`, `\Seen` flags. Localized names use modified UTF-7 without
+enabling UTF8=ACCEPT. See [Gmail gateway workflows](tools.md#gmail-gateway-workflows).
+
 ## Configuration file
 
 The default path is:
