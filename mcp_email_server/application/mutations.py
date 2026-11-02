@@ -556,6 +556,41 @@ class ForwardCommand(ComposeCommand):
             raise ValueError("forward does not accept caller attachments; the source's parts are re-attached")
 
 
+@dataclass(frozen=True)
+class ReplySource:
+    """Unverified threading evidence read from the raw headers of a reply's source."""
+
+    message_id: str
+    references: str | None
+    in_reply_to: str | None
+    subject: str
+
+
+@dataclass(frozen=True)
+class ReplyCommand(ComposeCommand):
+    source_email_id: str = ""
+    source_mailbox: str = ""
+    reply_mode: str = ""
+    draft_mailbox: str | None = None
+
+    def validate(self) -> None:
+        super().validate()
+        validate_imap_uid(self.source_email_id, field_name="original_email_id")
+        validate_mailbox_name(self.source_mailbox)
+        if self.draft_mailbox is not None:
+            validate_mailbox_name(self.draft_mailbox)
+        # Lock the compose fields the reply workflow derives or does not support,
+        # so a caller-supplied value is rejected instead of silently overwritten.
+        if self.subject or self.in_reply_to or self.references:
+            raise ValueError("reply subject and threading headers are derived from the source message")
+        if self.bcc:
+            raise ValueError("reply does not accept bcc")
+        if self.reply_mode not in ("reply", "reply-all"):
+            raise ValueError("reply_mode must explicitly be reply or reply-all")
+        if self.reply_mode == "reply" and (len(self.recipients) != 1 or self.cc):
+            raise ValueError("reply permits exactly one recipient and no cc; choose reply-all explicitly")
+
+
 # Port-slot B1 commands: label reads. New commands from other clusters belong in
 # their own marked block so parallel ports append to distinct anchors.
 @dataclass(frozen=True)
@@ -708,6 +743,12 @@ class MutationProvider(Protocol):
         source: ForwardSource,
         account: MutationAccountSnapshot,
     ) -> DeliveryMutationOutcome: ...
+
+    async def fetch_reply_source(
+        self,
+        command: ReplyCommand,
+        account: MutationAccountSnapshot,
+    ) -> ReplySource: ...
 
     # Port slots. Several fork capabilities are being ported onto this
     # architecture in parallel, and they all extend the same few regions of this
@@ -895,6 +936,25 @@ def _forwarded_subject(subject: str) -> str:
     """Return the derived forward subject without stacking a second prefix."""
 
     return subject if subject.casefold().startswith("fwd:") else f"Fwd: {subject}"
+
+
+def _reply_subject(subject: str) -> str:
+    """Return the derived reply subject without stacking a second prefix."""
+
+    return subject if subject.casefold().startswith("re:") else f"Re: {subject}"
+
+
+def _source_thread_ids(value: str, *, single: bool = False) -> str:
+    """Normalize one source threading header, or fail before any effect."""
+    ids = value.split()
+    if (
+        not ids
+        or (single and len(ids) != 1)
+        # Each identifier must fit the RFC 5322 line limit beside its header name.
+        or any(not _is_simple_message_id(item) or len(item.encode()) > 980 for item in ids)
+    ):
+        raise ValueError("Reply source has missing or unsupported threading headers")
+    return normalize_thread_message_ids(value)
 
 
 def _forwarded_body(note: str, block: str) -> str:
@@ -1756,6 +1816,54 @@ class ForwardService(_MutationWorkflow):
         return await self._complete_send(account, delivery, forwarded.bcc)
 
 
+class ReplyService(_MutationWorkflow):
+    """Derive threading from the source's raw headers, then send or save a draft."""
+
+    def _authorize(self, command: ReplyCommand, account: MutationAccountSnapshot) -> None:
+        if command.draft_mailbox is None:
+            require_mutation(account.allowed_mutations, "send")
+            self._require_send_capability(account)
+        else:
+            require_append_permissions(account.allowed_mutations, None)
+        _validate_recipient_policy(command, account)
+
+    async def execute(self, command: ReplyCommand) -> SendMutationOutcome | AppendMutationOutcome:
+        command.validate()
+        account = self._resolve(command.account_name)
+        self._authorize(command, account)
+        incoming = self._open(account, purpose="incoming")
+        self._authorize(command, incoming.account)
+        try:
+            source = await _bounded_provider_effect(incoming.provider.fetch_reply_source(command, incoming.account))
+        except TimeoutError:
+            raise MutationProviderError("reply source retrieval timed out") from None
+        parent = _source_thread_ids(source.message_id, single=True)
+        # RFC 5322 section 3.6.4: the parent's References, else its single In-Reply-To.
+        ancestors = ()
+        if source.references is not None:
+            ancestors = (_source_thread_ids(source.references),)
+        elif source.in_reply_to is not None:
+            ancestors = (_source_thread_ids(source.in_reply_to, single=True),)
+        composed = ComposeCommand(
+            account_name=command.account_name,
+            recipients=command.recipients,
+            subject=_reply_subject(source.subject),
+            body=command.body,
+            cc=command.cc,
+            html=command.html,
+            attachments=command.attachments,
+            in_reply_to=parent,
+            references=" ".join((*ancestors, parent)),
+        )
+        # Each delegate revalidates the composed headers and re-resolves its own
+        # authority before its effect, so sends and drafts cannot diverge from it.
+        if command.draft_mailbox is not None:
+            draft = SaveToMailboxCommand(**vars(composed), mailbox=command.draft_mailbox)
+            return await SaveToMailboxService(self._accounts, self._providers, self._projections).execute(draft)
+        send = SendCommand(**vars(composed), quote_reply=False)
+        return await SendService(self._accounts, self._providers, self._projections).execute(send)
+
+
 # Port slots for new mutation services. See the slot note in the MutationProvider
 # Protocol above; each cluster defines its service classes directly ABOVE its marker.
 class CopyService(_MutationWorkflow):
@@ -1996,6 +2104,7 @@ class MutationServices:
     create_mailbox: CreateMailboxService
     send: SendService
     forward: ForwardService
+    reply: ReplyService
     # Port slots for new service fields; add each cluster's fields above its marker.
     copy: CopyService
     create_folder: CreateFolderService
@@ -2037,6 +2146,7 @@ class MutationServices:
             create_mailbox=CreateMailboxService(*arguments),
             send=SendService(*arguments),
             forward=ForwardService(*arguments),
+            reply=ReplyService(*arguments),
             # Port slots for new service construction; add each cluster's entries above its marker.
             copy=copy,
             create_folder=create_folder,

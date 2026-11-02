@@ -1142,6 +1142,139 @@
             }
         },
         {
+            "name": "reply_email",
+            "description": "Reply to a message identified by its mailbox and UID. The source's raw headers are read over IMAP first: In-Reply-To and References are derived from them and the subject gains 'Re:' without stacking a second prefix. If the source cannot be read or its headers are missing, malformed, or ambiguous, the call fails before any SMTP or APPEND effect, so a reply is never sent unthreaded. Recipients are exactly the ones supplied; the source's To and Cc are never added. reply_mode is required: reply permits one recipient and no cc, and reply-all permits several. The body is written in Markdown unless html=true; the source's body and attachments are not copied. Set draft_mailbox to save the threaded message there instead of sending. Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy outcome separately; ambiguous effects are not retried automatically. The response names the delivered message's RFC Message-Id once the provider accepts the message data.",
+            "inputSchema": {
+                "properties": {
+                    "account_name": {
+                        "description": "The name of the email account to reply from.",
+                        "maxLength": 256,
+                        "title": "Account Name",
+                        "type": "string"
+                    },
+                    "source_mailbox": {
+                        "description": "The mailbox that contains the source message.",
+                        "maxLength": 1024,
+                        "title": "Source Mailbox",
+                        "type": "string"
+                    },
+                    "original_email_id": {
+                        "description": "UID of the source message in source_mailbox.",
+                        "maxLength": 10,
+                        "pattern": "^[1-9][0-9]*$",
+                        "title": "Original Email Id",
+                        "type": "string"
+                    },
+                    "recipients": {
+                        "description": "Every intended recipient, supplied explicitly.",
+                        "items": {
+                            "maxLength": 1024,
+                            "type": "string"
+                        },
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Recipients",
+                        "type": "array"
+                    },
+                    "body": {
+                        "description": "The reply body, written in Markdown. It is rendered to email-safe HTML automatically.",
+                        "maxLength": 1048576,
+                        "title": "Body",
+                        "type": "string"
+                    },
+                    "reply_mode": {
+                        "description": "Explicit choice: reply permits one recipient and no cc; reply-all permits several.",
+                        "enum": ["reply", "reply-all"],
+                        "title": "Reply Mode",
+                        "type": "string"
+                    },
+                    "cc": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "maxLength": 1024,
+                                    "type": "string"
+                                },
+                                "maxItems": 100,
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "A list of CC email addresses.",
+                        "title": "Cc"
+                    },
+                    "attachments": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "maxLength": 4096,
+                                    "type": "string"
+                                },
+                                "maxItems": 20,
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended.",
+                        "title": "Attachments"
+                    },
+                    "html": {
+                        "default": false,
+                        "description": "Set True only when body is already pre-formatted raw HTML, which suppresses Markdown rendering.",
+                        "title": "Html",
+                        "type": "boolean"
+                    },
+                    "draft_mailbox": {
+                        "anyOf": [
+                            {
+                                "maxLength": 1024,
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "default": null,
+                        "description": "Save the threaded message to this IMAP folder instead of sending it.",
+                        "title": "Draft Mailbox"
+                    }
+                },
+                "required": [
+                    "account_name",
+                    "source_mailbox",
+                    "original_email_id",
+                    "recipients",
+                    "body",
+                    "reply_mode"
+                ],
+                "title": "reply_emailArguments",
+                "type": "object"
+            },
+            "outputSchema": {
+                "properties": {
+                    "result": {
+                        "title": "Result",
+                        "type": "string"
+                    }
+                },
+                "required": ["result"],
+                "title": "reply_emailOutput",
+                "type": "object"
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
             "name": "save_to_mailbox",
             "description": "Compose an email and save it to an IMAP folder (e.g., Drafts). Shares recipient, body, attachment, and threading parameters with send_email; adds mailbox and flags, and does not support reply_to. Default folder is Drafts with \\Draft and \\Seen flags. Pure IMAP operation — works without SMTP configuration. An ambiguous APPEND is reported as unknown and is not retried automatically.",
             "inputSchema": {

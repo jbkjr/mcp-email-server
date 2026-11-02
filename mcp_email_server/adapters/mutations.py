@@ -42,6 +42,8 @@ from mcp_email_server.application.mutations import (
     QuoteSource,
     RemoveLabelCommand,
     RenameFolderCommand,
+    ReplyCommand,
+    ReplySource,
     SaveToMailboxCommand,
     SendCommand,
     SentCopyMutationOutcome,
@@ -462,6 +464,19 @@ class ClassicMutationProvider:
         # The application layer already derived the subject and prefixed the
         # caller's note above the composed block: submit both verbatim.
         return await self._submit(command, reply_to=None, extra_parts=extra_parts)
+
+    async def fetch_reply_source(
+        self,
+        command: ReplyCommand,
+        account: MutationAccountSnapshot,
+    ) -> ReplySource:
+        return await _bounded_mutation_call(
+            self._handler.incoming_client.fetch_reply_source(
+                command.source_email_id,
+                command.source_mailbox,
+                list(account.allowed_senders),
+            )
+        )
 
     async def save_sent_copy(
         self,
