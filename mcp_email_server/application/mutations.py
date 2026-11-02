@@ -1808,7 +1808,7 @@ class ForwardService(_MutationWorkflow):
         # Protect source privacy before reporting any independently tightened
         # send capability or recipient policy. Otherwise those errors could
         # distinguish a newly blocked retained source from a missing message.
-        _validate_forward_sender_policy(forwarded, source, access.account)
+        _validate_source_sender_policy(forwarded, source, access.account)
         self._require_send_capability(access.account)
         _validate_recipient_policy(forwarded, access.account)
         try:
