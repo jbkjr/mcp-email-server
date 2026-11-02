@@ -42,3 +42,7 @@ Use this concise default handoff:
 If the host cannot provide a user-controlled terminal or browser, explain that setup cannot be completed safely in that host. Do not fall back to chat, MCP, argv, environment, or file-based secret transfer.
 
 For installation source verification and lifecycle commands, read [installation](references/installation.md).
+
+## Replies
+
+Prefer `reply_email` when the connected server exposes it. Supply the source mailbox and UID, the body, every intended recipient, and an explicit `reply_mode` of `reply` or `reply-all`; never infer reply-all. Set `draft_mailbox` to save a threaded draft instead of sending. The server derives the threading headers and subject itself and fails before writing if the source cannot be resolved. Do not get around that failure by sending an unthreaded message.

@@ -167,13 +167,13 @@ freshly before independent provider effects. Global `allowed_mutations` defaults
 to all five classes for old and new configurations. Account omission/null
 inherits; an explicit list replaces; `[]` means read-only.
 
-| Class      | Workflows                                                                                  |
-| ---------- | ------------------------------------------------------------------------------------------ |
-| `draft`    | `save_draft` with fixed destination resolution and `\Draft` flag                           |
-| `organize` | mark-read/unread, `set_email_flags`, `set_email_tags`, move, archive, and `create_mailbox` |
-| `delete`   | `delete_emails` and its scoped deletion/expunge                                            |
-| `send`     | `send_email`, `forward_email`, and narrowly their successful-message Sent copy             |
-| `append`   | `save_to_mailbox` with caller mailbox and flags                                            |
+| Class      | Workflows                                                                                     |
+| ---------- | --------------------------------------------------------------------------------------------- |
+| `draft`    | `save_draft` with fixed destination resolution and `\Draft` flag                              |
+| `organize` | mark-read/unread, `set_email_flags`, `set_email_tags`, move, archive, and `create_mailbox`    |
+| `delete`   | `delete_emails` and its scoped deletion/expunge                                               |
+| `send`     | `send_email`, `reply_email`, `forward_email`, and narrowly their successful-message Sent copy |
+| `append`   | `save_to_mailbox` with caller mailbox and flags, and `reply_email` with `draft_mailbox`       |
 
 `get_emails_content(mark_as_read=true)` also requires `organize`; use the
 non-marking read option for a read-only account. Organization cannot perform
@@ -191,7 +191,7 @@ Every tool advertises reviewed MCP `readOnlyHint`, `destructiveHint`,
 | `list_available_accounts`, `list_allowed_recipients`, `list_allowed_senders`, `list_email_tags`                                                            | yes       | no          | yes        | no         |
 | `list_emails_metadata`, `list_mailboxes`, `list_labels`, `get_email_labels`, `get_attachment_content`                                                      | yes       | no          | yes        | yes        |
 | `get_emails_content`                                                                                                                                       | no        | no          | yes        | yes        |
-| `send_email`, `forward_email`, `save_draft`, `save_to_mailbox`, `copy_emails`, `create_folder`, `create_label`, `apply_label`                              | no        | no          | no         | yes        |
+| `send_email`, `reply_email`, `forward_email`, `save_draft`, `save_to_mailbox`, `copy_emails`, `create_folder`, `create_label`, `apply_label`               | no        | no          | no         | yes        |
 | `set_email_flags`, `set_email_tags`, `mark_emails_as_read`, `create_mailbox`                                                                               | no        | no          | yes        | yes        |
 | `delete_emails`, `move_emails`, `archive_emails`, `remove_label`, `delete_label`, `download_attachment`, `delete_folder`, `rename_folder`, `email_command` | no        | yes         | no         | yes        |
 
@@ -681,6 +681,47 @@ for `send_email`.
 
 For a worked example, see
 [Forward a message with its attachments](guides.md#forward-a-message-with-its-attachments).
+
+### `reply_email`
+
+Replies to a message identified by its mailbox and UID. Prefer it over
+`send_email` for replies: the server derives the threading headers itself, so a
+caller cannot send a reply that looks threaded but is not.
+
+| Parameter           | Default  | Description                                           |
+| ------------------- | -------- | ----------------------------------------------------- |
+| `account_name`      | Required | Configured account identifier.                        |
+| `source_mailbox`    | Required | Mailbox that contains the source message.             |
+| `original_email_id` | Required | UID of the source message in `source_mailbox`.        |
+| `recipients`        | Required | Every intended recipient, supplied explicitly.        |
+| `body`              | Required | Reply body in Markdown, or raw HTML with `html=true`. |
+| `reply_mode`        | Required | `reply` or `reply-all`; never inferred.               |
+| `cc`                | None     | CC recipients; `reply-all` only.                      |
+| `attachments`       | None     | File paths available to the server process.           |
+| `html`              | `false`  | Treat `body` as pre-formatted raw HTML.               |
+| `draft_mailbox`     | None     | Save to this IMAP folder instead of sending.          |
+
+Recipients are exactly the supplied list: the source's To and Cc are never
+added. `reply` permits one recipient and no CC; `reply-all` permits several
+recipients and CC. The recipient allowlist is checked before the source is read,
+and the sender allowlist applies to the source as in `forward_email`.
+
+The server reads the source's raw headers with `BODY.PEEK` by UID, without
+setting `\Seen`. It sets `In-Reply-To` to the source's Message-ID, sets
+`References` to the source's `References` (or its single `In-Reply-To`) plus that
+Message-ID, and adds `Re:` to the subject unless it already starts with that
+prefix in any letter case. The source's body and attachments are not copied.
+
+The call fails before any SMTP or APPEND effect when the source is missing or
+blocked, or when its headers are incomplete, larger than 64 KiB, malformed,
+duplicated, or use Message-ID syntax beyond the simple form the server can
+normalize, such as comments. It does not fall back to an unthreaded message.
+
+Sending requires the `send` mutation class. Setting `draft_mailbox` requires
+`append` instead, and saves the message with the `\Draft` and `\Seen` flags like
+`save_to_mailbox`. SMTP delivery, the Sent copy, and result reporting are the
+same as for `send_email`, and draft reporting is the same as for
+`save_to_mailbox`. An ambiguous effect is never retried automatically.
 
 ### Markdown message bodies
 
