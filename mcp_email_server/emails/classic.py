@@ -13,15 +13,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email import encoders
 from email.header import Header
-from email.headerregistry import Address, AddressHeader
+from email.headerregistry import Address, AddressHeader, BaseHeader, HeaderRegistry, UnstructuredHeader
 from email.message import EmailMessage, Message
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
-from email.policy import SMTP as SMTP_POLICY
-from email.policy import SMTPUTF8 as SMTPUTF8_POLICY
-from email.policy import compat32, default
+from email.policy import SMTP, SMTPUTF8, Policy, compat32, default
 from html import escape as html_escape
 from itertools import pairwise
 from pathlib import Path
@@ -113,6 +111,31 @@ MAX_RAW_EMAIL_BYTES = MAX_TOTAL_ATTACHMENT_BYTES
 FORWARD_SOURCE_BODY_WINDOW = APPLICATION_LIMITS.body_bytes + 1
 SmtpDataTransport = Literal["7bit", "8bit", "binary", "invalid"]
 _HIGH_BIT_OCTET = re.compile(rb"[\x80-\xff]")
+
+
+class _ThreadIDHeader(UnstructuredHeader, BaseHeader):
+    """Fold a Message-ID list between whole identifiers.
+
+    CPython 3.11 and 3.12 refold an identifier of about 78 characters or more into
+    RFC 2047 encoded words, which receivers read as a different identifier.
+    """
+
+    def fold(self, *, policy: Policy) -> str:
+        first, *rest = str(self).split() or [""]
+        lines = [f"{self.name}: {first}"]
+        for token in rest:
+            if len(lines[-1]) + 1 + len(token) <= (policy.max_line_length or 78):
+                lines[-1] += f" {token}"
+            else:
+                lines.append(f" {token}")
+        return policy.linesep.join(lines) + policy.linesep
+
+
+_THREAD_HEADER_FACTORY = HeaderRegistry()
+_THREAD_HEADER_FACTORY.map_to_type("in-reply-to", _ThreadIDHeader)
+_THREAD_HEADER_FACTORY.map_to_type("references", _ThreadIDHeader)
+SMTP_POLICY = SMTP.clone(header_factory=_THREAD_HEADER_FACTORY)
+SMTPUTF8_POLICY = SMTPUTF8.clone(header_factory=_THREAD_HEADER_FACTORY)
 
 
 def _addresses_for_header(message: Message, field_name: str) -> list[Address]:

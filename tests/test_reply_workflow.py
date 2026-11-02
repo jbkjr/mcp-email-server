@@ -1,10 +1,15 @@
 """Regression coverage for environment Sent policy and server-derived reply threading."""
 
+from email.parser import BytesParser
+from email.policy import default
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 import tomli_w
 
 from mcp_email_server.adapters.management import LocalManagementBackend
 from mcp_email_server.config import CONFIG_PATH, Settings
+from mcp_email_server.emails.classic import EmailClient, _serialize_message_for_imap_append
 
 
 def environment_account(monkeypatch, name):
@@ -63,3 +68,38 @@ def test_current_config_wins_over_legacy_with_environment_credentials(monkeypatc
     assert selected == legacy
     monkeypatch.setitem(Settings.model_config, "toml_file", selected)
     assert Settings().get_account(email_settings.account_name).save_to_sent is True
+
+
+def smtp_session():
+    smtp = AsyncMock()
+    smtp.__aenter__.return_value = smtp
+    smtp.__aexit__.return_value = False
+    smtp.supports_extension = MagicMock(return_value=True)
+    return smtp
+
+
+@pytest.mark.parametrize("length", [65, 78, 79, 90, 250, 900])
+@pytest.mark.parametrize("stem", ["x", "CAJ+a_b-c=Z=w.q", "é"])
+async def test_long_thread_ids_stay_literal_on_smtp_and_append(email_server, length, stem):
+    """Long IDs in both headers must reach every wire path as whole, unencoded tokens."""
+    local_part = (stem * length).encode()[: length - 16].decode(errors="ignore")
+    ids = [f"<{local_part}{index}@example.test>" for index in range(4)]
+    client = EmailClient(email_server, sender="sender@example.test")
+    arguments = (["recipient@example.test"], "Re: Topic", "body")
+    smtp = smtp_session()
+    with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        delivery = await client.send_email_with_outcome(*arguments, in_reply_to=ids[-1], references=" ".join(ids))
+    smtp.data.assert_awaited_once()
+    draft = client.compose_message(*arguments, in_reply_to=ids[-1], references=" ".join(ids), include_bcc_header=True)
+    for raw in (
+        smtp.data.await_args.args[0],
+        _serialize_message_for_imap_append(delivery.sent_message),
+        _serialize_message_for_imap_append(draft),
+    ):
+        headers = raw.split(b"\r\n\r\n", 1)[0]
+        assert b"=?" not in headers
+        assert all(message_id.encode() in headers for message_id in ids)
+        assert all(len(line) <= 998 for line in headers.split(b"\r\n"))
+        parsed = BytesParser(policy=default).parsebytes(raw)
+        assert str(parsed["In-Reply-To"]).split() == [ids[-1]]
+        assert str(parsed["References"]).split() == ids
