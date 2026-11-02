@@ -384,7 +384,7 @@ async def test_reply_source_unfolds_a_folded_chain(email_server):
         b"Message-ID: <x@example.test>\r\nReferences: <a@example.test>\r\nReferences: <b@example.test>\r\n\r\n",
         b"Subject: one\r\nSubject: two\r\n\r\n",
         b"not a header\r\n\r\n",
-        b"X-Large: " + b"x" * 100000 + b"\r\n\r\n",
+        pytest.param(b"X-Large: " + b"x" * 100000 + b"\r\n\r\n", id="oversized"),
     ],
 )
 async def test_raw_reply_source_rejects_incomplete_ambiguous_or_large_headers(email_server, raw):
