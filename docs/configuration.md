@@ -813,15 +813,15 @@ an extra header into outgoing mail.
 
 ## Global settings
 
-| Setting                      | Default  | Description                                                                                          |
-| ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `credential_storage`         | `"auto"` | Select `auto`, `keyring`, or `plaintext` credential storage.                                         |
-| `enable_attachment_download` | `false`  | Allow `download_attachment` to write files.                                                          |
-| `enable_attachment_content`  | `false`  | Allow `get_attachment_content` to return attachment bytes through MCP.                               |
-| `allowed_recipients`         | `[]`     | Exact addresses or globs; `*` or an unset or empty list allows all.                                  |
-| `allowed_senders`            | `[]`     | Incoming `From` patterns; empty does not restrict reading.                                           |
-| `report_blocked_mutations`   | `false`  | Report blocked message IDs instead of returning privacy-preserving no-ops.                           |
-| `enable_folder_management`   | `false`  | Allow mailbox-shape mutations in legacy mode; always `false` in managed mode.                        |
+| Setting                      | Default  | Description                                                                   |
+| ---------------------------- | -------- | ----------------------------------------------------------------------------- |
+| `credential_storage`         | `"auto"` | Select `auto`, `keyring`, or `plaintext` credential storage.                  |
+| `enable_attachment_download` | `false`  | Allow `download_attachment` to write files.                                   |
+| `enable_attachment_content`  | `false`  | Allow `get_attachment_content` to return attachment bytes through MCP.        |
+| `allowed_recipients`         | `[]`     | Exact addresses or globs; `*` or an unset or empty list allows all.           |
+| `allowed_senders`            | `[]`     | Incoming `From` patterns; empty does not restrict reading.                    |
+| `report_blocked_mutations`   | `false`  | Report blocked message IDs instead of returning privacy-preserving no-ops.    |
+| `enable_folder_management`   | `false`  | Allow mailbox-shape mutations in legacy mode; always `false` in managed mode. |
 
 In managed mode, enable attachment content transfer with
 `mcp-email-server config update-policy --enable-attachment-content` and inspect
