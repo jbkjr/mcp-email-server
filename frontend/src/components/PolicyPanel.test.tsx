@@ -49,11 +49,11 @@ test('edits recipient and sender allowlists as individual items', async () => {
   expect(await screen.findByText('Safety settings saved.')).toBeVisible()
 })
 
-test('explains the distinct empty-list behavior', async () => {
+test('explains that empty lists do not restrict', async () => {
   const api = createMockApi()
   render(<PolicyPanel api={api} target={target} />)
 
-  expect(await screen.findByText(/Empty blocks sending and any supplied draft recipients/)).toBeVisible()
+  expect(await screen.findByText(/Empty means sending, forwarding, and drafts to any recipient are allowed/)).toBeVisible()
   expect(screen.getByText(/\* allows all recipients for sending, forwarding, and drafts/)).toBeVisible()
   expect(screen.getByText(/Empty means all senders may be read/)).toBeVisible()
   expect(screen.queryByRole('textbox')).not.toBeInTheDocument()

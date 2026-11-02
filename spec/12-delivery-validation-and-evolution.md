@@ -219,7 +219,7 @@ satisfied by mocks.
   Recipient policy evidence links `tests/test_mutation_application.py`,
   `tests/test_mcp_tools.py`, and `tests/e2e/test_stdio_greenmail.py` to the
   [configuration policy contract](04-configuration-and-managed-catalog.md):
-  empty-policy denial before provider effects, explicit glob authorization,
+  unrestricted empty policy, non-matching denial before provider effects, glob authorization,
   To/CC/BCC checks, current-policy revalidation, discovery wording, and
   managed/legacy stdio behavior. `tests/test_config.py`,
   `tests/test_application_management.py`, `tests/test_management_adapters.py`,
@@ -237,7 +237,7 @@ satisfied by mocks.
   duration.
 - Frontend: lint, typecheck, component/unit tests, email/password-first account
   flow, folded advanced and optional outgoing settings, no connection preview,
-  individual allowlist-item editing and distinct empty semantics, hidden no-action
+  individual allowlist-item editing and explicit empty semantics, hidden no-action
   empty/settled status, secret-state clearing, conflict review, accessibility semantics,
   and deterministic production build.
 - Agent integration: canonical skill validation, bounded JSON status/doctor

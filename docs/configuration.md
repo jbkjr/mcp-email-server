@@ -267,8 +267,8 @@ patterns; sender entries also accept glob patterns. Entries are trimmed and
 lowercased without losing glob syntax, and empty or duplicate entries are removed while
 preserving first occurrence order. `config update-policy` preserves omitted
 fields; pass an empty value to `--allowed-recipients` or `--allowed-senders` to
-clear that list. These empty values differ deliberately: empty allowed recipients
-disables sending, while empty allowed senders does not restrict reading. The Web
+clear that list. Neither empty value restricts anything: empty allowed recipients
+leaves sending unrestricted, and empty allowed senders leaves reading unrestricted. The Web
 UI represents each recipient or sender pattern as an individual add/edit/remove
 item rather than a comma-separated field. Every update requires the revision
 shown by `config policy`.
@@ -896,7 +896,7 @@ values are treated as false. Do not add surrounding whitespace to these values.
 | `MCP_EMAIL_SERVER_CONFIG_PATH`                      | `~/.config/mcp-email-server/config.toml` | Use a custom TOML path.                                                                                                                                                                                           |
 | `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD`       | `false`                                  | Override attachment file-download access.                                                                                                                                                                         |
 | `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT`        | `false`                                  | Override attachment MCP-content transfer access.                                                                                                                                                                  |
-| `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS`               | Empty                                    | Comma-separated recipients; empty disables sending.                                                                                                                                                               |
+| `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS`               | Empty                                    | Comma-separated recipients; empty leaves sending unrestricted.                                                                                                                                                    |
 | `MCP_EMAIL_SERVER_ALLOWED_SENDERS`                  | Empty                                    | Comma-separated sender globs; empty does not restrict reading.                                                                                                                                                    |
 | `MCP_EMAIL_SERVER_ALLOWED_MUTATIONS`                | All five classes                         | CSV global grants (`draft,organize,delete,send,append`); empty blocks writes for inheriting accounts.                                                                                                             |
 | `MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS`         | `false`                                  | Override blocked mutation reporting.                                                                                                                                                                              |

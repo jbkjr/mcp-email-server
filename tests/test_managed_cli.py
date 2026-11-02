@@ -269,7 +269,7 @@ def test_cli_policy_update_and_index_health_use_managed_services(monkeypatch, tm
     assert initial.exit_code == 0, initial.output
     assert "revision=1" in initial.output
     assert "enable_attachment_content=false" in initial.output
-    assert "allowed_recipients=none" in initial.output
+    assert "allowed_recipients=unrestricted" in initial.output
     assert updated.exit_code == 0, updated.output
     assert "revision 2" in updated.output
     assert shown.exit_code == 0, shown.output

@@ -249,9 +249,9 @@ actions MUST NOT rely on icon-only or color-only meaning. No runtime CDN or
 remote asset is permitted.
 
 Allowed-recipient and allowed-sender policy values are presented as individual
-items with add, edit, and remove actions. The empty states are explicit and must
-not be conflated: no allowed recipients disables sending, while no allowed
-senders means reading is unrestricted by sender.
+items with add, edit, and remove actions. The empty states are explicit: no allowed
+recipients means sending is unrestricted, and no allowed senders means reading is
+unrestricted by sender.
 
 The global policy editor exposes the five mutation classes defined by spec 04.
 The account editor exposes an inheritance choice versus an explicit class list

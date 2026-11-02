@@ -530,8 +530,8 @@ responsibility.
 
 ## Recipient allowlist
 
-Sending is disabled when the allowed-recipient collection is empty. Enable and
-restrict `send_email`, `forward_email`, and `save_to_mailbox` by adding exact
+Sending is unrestricted when the allowed-recipient collection is unset or empty.
+Restrict `send_email`, `forward_email`, and `save_to_mailbox` by adding exact
 addresses or bare glob patterns:
 
 ```toml
@@ -564,16 +564,15 @@ forwarding, and recipient-bound draft saves**, not just drafts. It does not
 bypass address validation, account capabilities, or other policies. Prefer a
 narrow domain pattern when possible; there is no separate draft-only allowlist.
 
-`list_allowed_recipients` is always visible in the static MCP tool catalog. An
-empty result means sending is disabled; it never means unrestricted sending.
+`list_allowed_recipients` is always visible in the static MCP tool catalog. It
+reports an unset or empty policy as `*`, because sending is then unrestricted.
 The Web UI edits recipients as individual add/edit/remove items and states this
-empty behavior explicitly. The restriction applies equally in managed and
-legacy mode and covers To, CC, and BCC. An initially empty policy is rejected
-before a provider is opened for recipient-bearing compose, including before a
-forward source is read. A recipientless `save_draft` is the explicit exception
-described below.
-Clearing the last recipient does not enable unrestricted sending. This policy
-is not a read-only mode: other mailbox mutations remain available.
+empty behavior explicitly. A non-empty restriction applies equally in managed and
+legacy mode and covers To, CC, and BCC. It rejects a non-matching address before
+a provider is opened for recipient-bearing compose, including before a forward
+source is read. A recipientless `save_draft` needs no match.
+Clearing the last recipient makes sending unrestricted. To stop an account
+sending, remove the `send` mutation grant or its outgoing configuration instead.
 
 ### Mutation grants and read-only accounts
 
@@ -659,7 +658,7 @@ report_blocked_mutations = true
 
 This is more explicit but reveals that a blocked message exists.
 `list_allowed_senders` is always visible in the static MCP tool catalog and
-returns an empty list when unrestricted. Unlike recipients, an empty
+returns an empty list when unrestricted. An empty
 allowed-sender collection does not restrict reading. The Web UI edits sender
 patterns as individual add/edit/remove items.
 

@@ -125,7 +125,7 @@ export function PolicyPanel({ api, target, onRevision }: { api: ManagementApi; t
             title="Allowed recipients"
             itemLabel="Recipient"
             addLabel="Add recipient"
-            help="Add addresses or glob patterns such as *@example.com. * allows all recipients for sending, forwarding, and drafts. Empty blocks sending and any supplied draft recipients; recipientless drafts remain allowed."
+            help="Add addresses or glob patterns such as *@example.com. * allows all recipients for sending, forwarding, and drafts. Empty means sending, forwarding, and drafts to any recipient are allowed; add an entry to restrict them."
             values={recipients}
             onChange={setRecipients}
           />

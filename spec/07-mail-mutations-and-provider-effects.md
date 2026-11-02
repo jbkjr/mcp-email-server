@@ -125,7 +125,7 @@ APPEND implementation with `save_to_mailbox` and Sent-copy saving. It requires
 `draft`, not `append` or SMTP capability. Its compose fields allow an explicit
 empty recipient list and optional CC/BCC, subject, body, attachments, and threading
 headers. All supplied recipients require the existing recipient policy; no
-recipients is a valid draft even with an empty allowlist. Attachment preflight
+recipients is always a valid draft. Attachment preflight
 and reads occur only after account and policy authorization.
 
 It exposes no target mailbox or flags. Resolve the account's optional

@@ -589,7 +589,7 @@ def config_policy(json_output: JsonOutput = False) -> None:
     typer.echo(f"enable_attachment_download={str(policy.enable_attachment_download).lower()}")
     typer.echo(f"enable_attachment_content={str(policy.enable_attachment_content).lower()}")
     typer.echo("allowed_mutations=" + (",".join(policy.allowed_mutations) or "none"))
-    typer.echo("allowed_recipients=" + (",".join(policy.allowed_recipients) or "none"))
+    typer.echo("allowed_recipients=" + (",".join(policy.allowed_recipients) or "unrestricted"))
     typer.echo("allowed_senders=" + (",".join(policy.allowed_senders) or "none"))
     typer.echo(f"report_blocked_mutations={str(policy.report_blocked_mutations).lower()}")
 
@@ -726,7 +726,7 @@ def _echo_legacy_import_plan(plan: LegacyImportPlan) -> None:
     typer.echo(f"policy={plan.policy_action} target_revision={plan.target_policy_revision}")
     typer.echo(f"  attachment_download={str(policy.enable_attachment_download).lower()}")
     typer.echo(f"  attachment_content={str(policy.enable_attachment_content).lower()}")
-    typer.echo("  allowed_recipients=" + (",".join(policy.allowed_recipients) or "none"))
+    typer.echo("  allowed_recipients=" + (",".join(policy.allowed_recipients) or "unrestricted"))
     typer.echo("  allowed_senders=" + (",".join(policy.allowed_senders) or "none"))
     typer.echo(f"  report_blocked_mutations={str(policy.report_blocked_mutations).lower()}")
     for provider_name in plan.unsupported_provider_names:

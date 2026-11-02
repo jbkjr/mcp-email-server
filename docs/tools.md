@@ -535,7 +535,7 @@ as `utf8-append-unsupported` without changing the successful SMTP outcome.
 Composes and saves a draft without SMTP. It requires `draft`, not `append`.
 Pass the account and compose fields (recipients, subject, body, optional CC/BCC,
 attachments and threading headers). An explicit empty recipient list is allowed;
-every supplied recipient must match the recipient allowlist.
+under a non-empty recipient allowlist, every supplied recipient must match it.
 
 This tool has no mailbox or flags parameter. It uses the account's optional
 `drafts_mailbox`, or the unique mailbox advertising special-use `\Drafts`,
@@ -1170,7 +1170,7 @@ unrestricted, and `list_allowed_recipients` reports it as `*`. An empty sender l
 does not restrict reading. A recipientless `save_draft` remains permitted by `draft`;
 under a non-empty list any supplied recipient requires a match. Recipient entries support case-insensitive, whole-address glob
 matching (`*`, `?`, and bracket expressions), such as `*@example.com`.
-`*` or `*@*` explicitly permits all valid recipients for sending, forwarding,
+`*` or `*@*` permits all valid recipients for sending, forwarding,
 and draft saves; this is not draft-only permission. Recipient denial errors
 direct users to configure allowed addresses or patterns through the user-operated CLI/UI; this does not require
 sharing credentials with the agent. Each list is limited to 1,000

@@ -67,7 +67,7 @@ Changes to the management UI run three layers in the regular suite:
    account setup, progressive disclosure of advanced and optional outgoing mail,
    absence of a redundant connection preview, domain-based editable connection
    suggestions, synchronized untouched security ports, individual
-   recipient/sender item editing with distinct empty semantics, hidden no-action
+   recipient/sender item editing with explicit empty semantics, hidden no-action
    empty/settled status, task-language conflict presentation, explicit checkbox-bound
    import confirmation, password-state lifetime, and cleanup recovery after the
    last active account is removed), and deterministic Vite staging

@@ -108,9 +108,9 @@ On first use:
    available in the Web UI;
 4. under **Settings & help**, add recipient addresses or glob patterns (for
    example `*@example.com`) and optional sender patterns as individual items.
-   `*` explicitly allows every recipient for sending, forwarding, and drafts.
-   No recipients disables sending and general saves; recipientless `save_draft`
-   is still allowed by its mutation grant. No senders leaves reading unrestricted;
+   `*` allows every recipient for sending, forwarding, and drafts.
+   No recipients leaves sending and saves unrestricted, so add entries to
+   restrict them. No senders leaves reading unrestricted;
    choose global mutation permissions in this panel and inheritance or an
    explicit override in the account editor. Omitted settings retain all five
    write classes; choose an empty list for read-only. Set the optional draft
