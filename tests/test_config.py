@@ -624,19 +624,48 @@ def test_allowed_recipients_defaults_to_empty(tmp_path, monkeypatch):
         config_module._settings = None
 
 
-def test_allowed_recipients_toml_normalised(tmp_path, monkeypatch):
+@pytest.mark.parametrize("use_environment", [False, True])
+def test_allowed_recipients_toml_normalised(tmp_path, monkeypatch, use_environment):
     import tomli_w
 
     import mcp_email_server.config as config_module
     from mcp_email_server.config import Settings
 
-    toml_data = {"allowed_recipients": ["Alice <Alice@Example.com>", "BOB@example.com", "alice@example.com"]}
+    patterns = [
+        "Alice <Alice@Example.com>",
+        "BOB@example.com",
+        "alice@example.com",
+        " * ",
+        "*@*",
+        "*@EXAMPLE.COM",
+        "user?@example.com",
+        "user[0-9]@example.com",
+    ]
+    expected = [
+        "alice@example.com",
+        "bob@example.com",
+        "*",
+        "*@*",
+        "*@example.com",
+        "user?@example.com",
+        "user[0-9]@example.com",
+    ]
+    toml_data = {"allowed_recipients": ["ignored@example.com"] if use_environment else patterns}
+    if use_environment:
+        monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS", ",".join(patterns))
     cfg = tmp_path / "config.toml"
     cfg.write_bytes(tomli_w.dumps(toml_data).encode())
     monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
     config_module._settings = None
     try:
-        assert config_module.get_settings(reload=True).allowed_recipients == ["alice@example.com", "bob@example.com"]
+        settings = config_module.get_settings(reload=True)
+        assert settings.allowed_recipients == expected
+        persisted = Settings.load_for_migration()
+        expected_persisted = ["ignored@example.com"] if use_environment else expected
+        assert persisted.allowed_recipients == expected_persisted
+        persisted.store()
+        assert tomllib.loads(cfg.read_text())["allowed_recipients"] == expected_persisted
+        assert config_module.get_settings(reload=True).allowed_recipients == expected
     finally:
         config_module._settings = None
 
@@ -962,6 +991,28 @@ def test_missing_reset_leaves_parent_ready_for_secure_managed_initialization(
 
     assert catalog.catalog_revision() == 1
     assert bootstrap.db_path == catalog_path
+
+
+def test_attachment_content_env_overrides_independently_from_download(tmp_path, monkeypatch):
+    import tomli_w
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_bytes(
+        tomli_w.dumps({
+            "enable_attachment_download": True,
+            "enable_attachment_content": False,
+        }).encode()
+    )
+    monkeypatch.delenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD", raising=False)
+    monkeypatch.setenv("MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_CONTENT", "true")
+    monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
+    config_module._settings = None
+    try:
+        settings = get_settings(reload=True)
+        assert settings.enable_attachment_download is True
+        assert settings.enable_attachment_content is True
+    finally:
+        config_module._settings = None
 
 
 def test_report_blocked_mutations_env_overrides_toml(tmp_path, monkeypatch):

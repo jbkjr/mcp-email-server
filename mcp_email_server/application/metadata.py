@@ -1,23 +1,32 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
-from dataclasses import dataclass
+import binascii
+from collections.abc import Awaitable, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from typing import Literal, Protocol, TypeVar
 
 from mcp_email_server.application.limits import (
     APPLICATION_LIMITS,
+    metadata_snapshot_row_limit,
     validate_controlled_string,
     validate_optional_controlled_string,
     validate_serialized_result,
 )
-from mcp_email_server.config import sender_allowed
+from mcp_email_server.config import (
+    ImapSearchMode,
+    imap_search_mode,
+    sender_allowed,
+)
+from mcp_email_server.emails.charsets import install_gb2312_superset_aliases
 from mcp_email_server.emails.models import EmailMetadata, EmailMetadataPageResponse, MailboxInfo
-from mcp_email_server.log import logger
+from mcp_email_server.imap_keywords import ImapKeywordRegistry, ImapKeywordTag
+from mcp_email_server.log import log_safe_failure, logger
 
 RuntimeMode = Literal["legacy", "managed"]
-MAX_METADATA_SNAPSHOT_ROWS = APPLICATION_LIMITS.metadata_snapshot_rows
 ProviderResultT = TypeVar("ProviderResultT")
 
 
@@ -36,13 +45,50 @@ class MetadataProviderObservationError(RuntimeError):
 class MetadataProviderError(RuntimeError):
     """A provider request failed without exposing transport-controlled detail."""
 
+    def __init__(self, message: str, *, diagnostic: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
-async def _bounded_provider_call(operation: Awaitable[ProviderResultT]) -> ProviderResultT:
+
+class _DefaultProviderTimeout:
+    """Use the shared provider deadline, read when the call starts."""
+
+
+_DEFAULT_PROVIDER_TIMEOUT = _DefaultProviderTimeout()
+
+
+async def _bounded_provider_call(
+    operation: Awaitable[ProviderResultT],
+    *,
+    timeout: float | _DefaultProviderTimeout | None = _DEFAULT_PROVIDER_TIMEOUT,
+) -> ProviderResultT:
+    """Bound one provider call.
+
+    A metadata snapshot passes ``timeout=None``. Each of its UID batches applies
+    ``MCP_EMAIL_SERVER_METADATA_REFRESH_TIMEOUT_SECONDS`` on its own, so one
+    60-second deadline cannot cancel a refresh that has already stored progress.
+    """
+
+    limit = APPLICATION_LIMITS.provider_timeout_seconds if isinstance(timeout, _DefaultProviderTimeout) else timeout
     try:
-        async with asyncio.timeout(APPLICATION_LIMITS.provider_timeout_seconds):
+        if limit is None:
             return await operation
-    except TimeoutError:
-        raise MetadataProviderError("provider request timed out") from None
+        async with asyncio.timeout(limit):
+            return await operation
+    except TimeoutError as exc:
+        raise MetadataProviderError("provider request timed out", diagnostic=exc) from None
+
+
+def normalize_datetime_boundary(value: datetime | None, *, field_name: str) -> datetime | None:
+    """Return one timezone-aware query boundary as a UTC instant."""
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must include a timezone offset")
+    try:
+        return value.astimezone(UTC)
+    except (OverflowError, ValueError):
+        raise ValueError(f"{field_name} cannot be represented in UTC") from None
 
 
 @dataclass(frozen=True)
@@ -63,6 +109,9 @@ class ListEmailMetadataQuery:
     body: str | None = None
     text: str | None = None
     has_attachment: bool | None = None
+    semantic_tags: tuple[str, ...] = ()
+    tag_match: Literal["all", "any"] = "all"
+    provider_keywords: tuple[str, ...] = ()
 
     def validate(self) -> None:
         validate_controlled_string(
@@ -76,6 +125,8 @@ class ListEmailMetadataQuery:
             raise ValueError("page_size must be between 1 and 100")
         if self.order not in ("asc", "desc"):
             raise ValueError("order must be 'asc' or 'desc'")
+        normalize_datetime_boundary(self.before, field_name="before")
+        normalize_datetime_boundary(self.since, field_name="since")
         validate_controlled_string(
             self.mailbox,
             field_name="mailbox",
@@ -86,6 +137,18 @@ class ListEmailMetadataQuery:
             field_name="subject query",
             maximum_bytes=APPLICATION_LIMITS.query_bytes,
         )
+        if len(self.semantic_tags) > APPLICATION_LIMITS.flags:
+            raise ValueError(f"semantic_tags must contain at most {APPLICATION_LIMITS.flags} values")
+        if len({tag.casefold() for tag in self.semantic_tags}) != len(self.semantic_tags):
+            raise ValueError("semantic_tags must not contain duplicates, ignoring case")
+        for tag in self.semantic_tags:
+            validate_controlled_string(
+                tag,
+                field_name="semantic_tags item",
+                maximum_bytes=APPLICATION_LIMITS.flag_bytes,
+            )
+        if self.tag_match not in ("all", "any"):
+            raise ValueError("tag_match must be 'all' or 'any'")
         validate_optional_controlled_string(
             self.from_address,
             field_name="from_address query",
@@ -111,7 +174,7 @@ class ListEmailMetadataQuery:
     def index_supported(self) -> bool:
         # Provider text/date matching and mutable flag filters remain on IMAP
         # until equivalent projection semantics and invalidation are proven.
-        return all(
+        return not self.provider_keywords and all(
             value is None
             for value in (
                 self.before,
@@ -134,12 +197,25 @@ class MetadataAccountSnapshot:
     account_name: str
     mode: RuntimeMode
     allowed_senders: tuple[str, ...]
+    tag_registry: ImapKeywordRegistry = field(default_factory=ImapKeywordRegistry)
+    # Host is recorded for diagnostics. Header search does not route on it.
+    imap_host: str = ""
+    # None inherits MCP_EMAIL_SERVER_IMAP_SEARCH_MODE (default ``server``).
+    imap_search_mode: ImapSearchMode | None = None
 
 
 @dataclass(frozen=True)
 class MailboxState:
-    uidvalidity: int
-    uidnext: int
+    """Provider mailbox qualification.
+
+    ``uidvalidity`` and ``uidnext`` stay ``None`` when STATUS and SELECT omit
+    them. A missing UIDVALIDITY is not a hash of the UID set and cannot qualify
+    cached or retained rows. A missing UIDNEXT is not ``max(uid) + 1``; coverage
+    uses the UID inventory, including gaps left by expunged messages.
+    """
+
+    uidvalidity: int | None
+    uidnext: int | None
     message_count: int
 
 
@@ -150,6 +226,28 @@ class MailboxMetadataSnapshot:
     emails: tuple[dict[str, object], ...]
     complete: bool
     observed_at: datetime
+
+
+@dataclass(frozen=True)
+class MetadataIncrementalBaseline:
+    """One complete same-epoch projection that can accept newer UIDs."""
+
+    state: MailboxState
+    high_uid: int | None
+    mailbox: MailboxInfo
+    emails: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class MailboxUidDelta:
+    """UIDs observed strictly above a cached high-water mark."""
+
+    state: MailboxState
+    mailbox: MailboxInfo
+    emails: tuple[dict[str, object], ...]
+    observed_at: datetime
+    uidvalidity_changed: bool
+    resumable: bool
 
 
 class MetadataAccountAuthority(Protocol):
@@ -170,7 +268,23 @@ class MetadataProvider(Protocol):
 
     async def mailbox_state(self, mailbox: str) -> MailboxState: ...
 
-    async def mailbox_snapshot(self, mailbox: str) -> MailboxMetadataSnapshot: ...
+    async def mailbox_snapshot(
+        self,
+        mailbox: str,
+        *,
+        retained_emails: tuple[dict[str, object], ...] = (),
+        retained_uidvalidity: int | None = None,
+    ) -> MailboxMetadataSnapshot: ...
+
+    async def mailbox_uid_delta(
+        self,
+        mailbox: str,
+        minimum_exclusive_uid: int,
+        *,
+        maximum_new_messages: int,
+    ) -> MailboxUidDelta: ...
+
+    async def flags_for(self, mailbox: str, email_ids: tuple[str, ...]) -> dict[str, list[str]]: ...
 
 
 @dataclass(frozen=True)
@@ -190,6 +304,18 @@ class MetadataProjection(Protocol):
         state: MailboxState,
     ) -> list[dict[str, object]] | None: ...
 
+    async def read_incremental_baseline(
+        self,
+        mailbox: str,
+        uidvalidity: int,
+    ) -> MetadataIncrementalBaseline | None: ...
+
+    async def read_partial_emails(
+        self,
+        mailbox: str,
+        uidvalidity: int,
+    ) -> tuple[dict[str, object], ...] | None: ...
+
     async def write_snapshot(self, mailbox: str, snapshot: MailboxMetadataSnapshot) -> None: ...
 
 
@@ -197,13 +323,18 @@ class MetadataProjectionFactory(Protocol):
     async def open(self, account: MetadataAccountSnapshot) -> MetadataProjection: ...
 
 
-def _validate_snapshot(query: ListEmailMetadataQuery, snapshot: MailboxMetadataSnapshot) -> None:
+def _validate_snapshot(  # noqa: C901 - validate every independent provider-observation bound
+    query: ListEmailMetadataQuery,
+    snapshot: MailboxMetadataSnapshot,
+) -> None:
     state = snapshot.state
-    if state.uidvalidity < 1 or state.uidnext < 1 or state.message_count < 0:
+    if state.message_count < 0 or (state.uidvalidity is not None and state.uidvalidity < 1):
+        raise MetadataProviderObservationError("Provider metadata state is invalid")
+    if state.uidnext is not None and state.uidnext < 1:
         raise MetadataProviderObservationError("Provider metadata state is invalid")
     if snapshot.mailbox.name != query.mailbox:
         raise MetadataProviderObservationError("Provider metadata mailbox does not match the request")
-    if len(snapshot.emails) > MAX_METADATA_SNAPSHOT_ROWS:
+    if len(snapshot.emails) > metadata_snapshot_row_limit():
         raise MetadataProviderObservationError("Provider metadata snapshot exceeds the retention bound")
     raw_uids = [email.get("email_id") for email in snapshot.emails]
     if any(not isinstance(uid, str) or not uid.isdigit() for uid in raw_uids):
@@ -213,10 +344,27 @@ def _validate_snapshot(query: ListEmailMetadataQuery, snapshot: MailboxMetadataS
         raise MetadataProviderObservationError("Provider metadata UIDs are invalid")
     if snapshot.complete and (
         len(uids) != state.message_count
-        or any(uid >= state.uidnext for uid in uids)
+        or (state.uidnext is not None and any(uid >= state.uidnext for uid in uids))
         or any(not isinstance(email.get("_internal_date"), datetime) for email in snapshot.emails)
     ):
         raise MetadataProviderObservationError("Complete provider metadata is inconsistent with mailbox state")
+    for email in snapshot.emails:
+        flags = email.get("_flags", [])
+        if (
+            not isinstance(flags, list)
+            or len(flags) > APPLICATION_LIMITS.flags
+            or any(not isinstance(flag, str) for flag in flags)
+        ):
+            raise MetadataProviderObservationError("Provider metadata flags are invalid")
+        try:
+            for flag in flags:
+                validate_controlled_string(
+                    flag,
+                    field_name="provider flag",
+                    maximum_bytes=APPLICATION_LIMITS.flag_bytes,
+                )
+        except ValueError:
+            raise MetadataProviderObservationError("Provider metadata flags are invalid") from None
 
 
 def _sort_key(email: dict[str, object], *, descending: bool) -> tuple[bool, datetime, int]:
@@ -228,6 +376,134 @@ def _sort_key(email: dict[str, object], *, descending: bool) -> tuple[bool, date
         return (descending, normalized.astimezone(UTC), uid)
     boundary = datetime.min.replace(tzinfo=UTC) if descending else datetime.max.replace(tzinfo=UTC)
     return (not descending, boundary, uid)
+
+
+def _email_flag_set(email: dict[str, object]) -> set[str]:
+    raw = email.get("_flags", [])
+    if not isinstance(raw, list) or any(not isinstance(flag, str) for flag in raw):
+        raise MetadataProviderObservationError("Provider metadata flags are invalid")
+    return set(raw)
+
+
+def _is_header_text_query(query: ListEmailMetadataQuery) -> bool:
+    """Subject, From, and To can be answered from snapshot headers.
+
+    Body, full text, dates, flags, tags, and attachment heuristics are not
+    header substrings, so those queries stay on IMAP SEARCH.
+    """
+
+    if not any((query.subject, query.from_address, query.to_address)):
+        return False
+    if query.semantic_tags or query.provider_keywords:
+        return False
+    return all(
+        value is None
+        for value in (
+            query.before,
+            query.since,
+            query.seen,
+            query.flagged,
+            query.answered,
+            query.body,
+            query.text,
+            query.has_attachment,
+        )
+    )
+
+
+def _decoded_header_text(value: object) -> str:
+    """Return header text with RFC 2047 encoded words decoded.
+
+    Snapshot rows already pass through the email parser, which decodes encoded
+    words when it can. Rows that still carry a raw ``=?charset?...?=`` token,
+    including GB2312-labelled Chinese subjects, are decoded before matching.
+    """
+
+    if not isinstance(value, str) or not value:
+        return ""
+    if "=?" not in value:
+        return value
+    install_gb2312_superset_aliases()
+    try:
+        return str(make_header(decode_header(value)))
+    except (HeaderParseError, LookupError, UnicodeError, ValueError, binascii.Error):
+        return value
+
+
+def _joined_header_text(value: object) -> str:
+    if isinstance(value, str):
+        return _decoded_header_text(value)
+    if isinstance(value, list):
+        return "\n".join(_decoded_header_text(item) for item in value if isinstance(item, str))
+    return ""
+
+
+def _header_text_matches(query: ListEmailMetadataQuery, email: dict[str, object]) -> bool:
+    """Case-insensitive substring match for Subject, From, and To.
+
+    To uses ``to_addresses`` only. The display ``to`` list also contains Cc and
+    must not satisfy a To predicate. A row without ``to_addresses`` cannot match
+    To; callers refresh those rows instead of reporting an exact miss.
+    """
+
+    subject = _joined_header_text(email.get("subject", ""))
+    sender = _joined_header_text(email.get("from", ""))
+    if query.subject and query.subject.casefold() not in subject.casefold():
+        return False
+    if query.from_address and query.from_address.casefold() not in sender.casefold():
+        return False
+    if not query.to_address:
+        return True
+    if "to_addresses" not in email:
+        return False
+    return query.to_address.casefold() in _joined_header_text(email.get("to_addresses")).casefold()
+
+
+def _configured_header_search(account: MetadataAccountSnapshot) -> ImapSearchMode:
+    if account.imap_search_mode is not None:
+        return account.imap_search_mode
+    return imap_search_mode()
+
+
+def _local_header_search_rejected(query: ListEmailMetadataQuery) -> bool:
+    """Local mode must not drop or silently reroute a mixed predicate."""
+
+    has_header_predicate = bool(query.subject or query.from_address or query.to_address)
+    return has_header_predicate and not _is_header_text_query(query)
+
+
+def _projection_can_answer(query: ListEmailMetadataQuery, emails: Sequence[dict[str, object]]) -> bool:
+    """Cached rows answer To only when they stored the To header separately."""
+
+    if not query.to_address:
+        return True
+    return all("to_addresses" in email for email in emails)
+
+
+def _provider_epoch_observed(state: MailboxState) -> bool:
+    """Reusable cache qualification needs the provider's own UIDVALIDITY and UIDNEXT."""
+
+    return state.uidvalidity is not None and state.uidnext is not None
+
+
+def _reusable_header_rows(
+    query: ListEmailMetadataQuery,
+    rows: Sequence[dict[str, object]],
+) -> tuple[dict[str, object], ...]:
+    if not query.to_address:
+        return tuple(rows)
+    return tuple(row for row in rows if "to_addresses" in row)
+
+
+_LOCAL_HEADER_SEARCH_UNSUPPORTED = "local header search supports only subject, from, and to filters"
+_LOCAL_COVERAGE_ERROR = "query_too_broad: local header search cannot prove complete mailbox coverage"
+
+
+def _rows_for_query(query: ListEmailMetadataQuery, emails: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+    rows = [dict(email) for email in emails]
+    if not _is_header_text_query(query):
+        return rows
+    return [email for email in rows if _header_text_matches(query, email)]
 
 
 def _validate_metadata_response(
@@ -254,6 +530,8 @@ def _validate_metadata_response(
         + len(email.sender.encode("utf-8"))
         + sum(len(value.encode("utf-8")) for value in email.recipients)
         + sum(len(value.encode("utf-8")) for value in email.attachments)
+        + sum(len(value.encode("utf-8")) for value in email.provider_keywords)
+        + sum(len(value.encode("utf-8")) for value in email.semantic_tags)
         for email in response.emails
     )
     if header_bytes > APPLICATION_LIMITS.aggregate_header_bytes:
@@ -273,6 +551,17 @@ def _page_response(
     warnings: tuple[Literal["projection_write_failed"], ...] = (),
 ) -> EmailMetadataPageResponse:
     visible = [email for email in emails if sender_allowed(str(email.get("from", "")), list(allowed_senders))]
+    if query.provider_keywords:
+        requested = set(query.provider_keywords)
+        visible = [
+            email
+            for email in visible
+            if (
+                requested.issubset(_email_flag_set(email))
+                if query.tag_match == "all"
+                else bool(requested.intersection(_email_flag_set(email)))
+            )
+        ]
     visible.sort(key=lambda email: _sort_key(email, descending=query.order == "desc"), reverse=query.order == "desc")
     start = (query.page - 1) * query.page_size
     page = visible[start : start + query.page_size]
@@ -299,6 +588,87 @@ def _with_projection_warning(
     return _validate_metadata_response(query, response.model_copy(update={"warnings": warnings}))
 
 
+def _log_projection_refresh_failure(exc: BaseException, *, incremental: bool) -> None:
+    """Record the causal exception type and value-free traceback locations."""
+
+    diagnostic: BaseException = exc
+    if isinstance(exc, MetadataProviderError) and exc.diagnostic is not None:
+        diagnostic = exc.diagnostic
+    if incremental:
+        message = "Incremental metadata sync failed; refreshing the full snapshot"
+    else:
+        message = "Metadata projection refresh failed; using bounded provider fallback"
+    log_safe_failure(message, diagnostic)
+
+
+def _merge_append_only_snapshot(  # noqa: C901 - explicit append-only UID and coverage checks
+    mailbox: str,
+    baseline: MetadataIncrementalBaseline,
+    delta: MailboxUidDelta,
+) -> MailboxMetadataSnapshot | None:
+    """Extend a complete projection only when new UIDs prove an append-only epoch.
+
+    UIDVALIDITY must be unchanged. Every new UID must be above the cached high
+    water mark, and the provider message count must equal the cached count plus
+    those new UIDs. A deletion, a gap, or a mailbox that no longer fits the row
+    ceiling returns None so the caller performs a full bounded refresh.
+    """
+
+    if not delta.resumable or delta.uidvalidity_changed:
+        return None
+    baseline_uidvalidity = baseline.state.uidvalidity
+    delta_uidvalidity = delta.state.uidvalidity
+    delta_uidnext = delta.state.uidnext
+    # Append-only reuse needs a real epoch and the provider allocation counter.
+    # A UID inventory with gaps is handled by a full refresh instead.
+    if baseline_uidvalidity is None or delta_uidvalidity is None or delta_uidnext is None:
+        return None
+    if delta.mailbox.name != mailbox or delta_uidvalidity != baseline_uidvalidity:
+        return None
+    if baseline.state.message_count != len(baseline.emails):
+        return None
+    if any(not isinstance(email.get("_internal_date"), datetime) for email in baseline.emails):
+        return None
+    floor = 0 if baseline.high_uid is None else baseline.high_uid
+    seen: set[int] = set()
+    for email in baseline.emails:
+        raw_uid = email.get("email_id")
+        if not isinstance(raw_uid, str) or not raw_uid.isdigit():
+            return None
+        uid = int(raw_uid)
+        if uid <= 0 or uid in seen or uid > floor:
+            return None
+        seen.add(uid)
+    if baseline.emails and (baseline.high_uid is None or max(seen) != baseline.high_uid):
+        return None
+    if not baseline.emails and baseline.high_uid is not None:
+        return None
+    new_emails: list[dict[str, object]] = []
+    for email in delta.emails:
+        raw_uid = email.get("email_id")
+        if not isinstance(raw_uid, str) or not raw_uid.isdigit():
+            return None
+        uid = int(raw_uid)
+        if uid <= floor or uid >= delta_uidnext or uid in seen:
+            return None
+        if not isinstance(email.get("_internal_date"), datetime):
+            return None
+        seen.add(uid)
+        new_emails.append(dict(email))
+    if delta.state.message_count != baseline.state.message_count + len(new_emails):
+        return None
+    if len(seen) > metadata_snapshot_row_limit():
+        return None
+    merged = tuple(dict(email) for email in baseline.emails) + tuple(new_emails)
+    return MailboxMetadataSnapshot(
+        state=delta.state,
+        mailbox=delta.mailbox,
+        emails=merged,
+        complete=True,
+        observed_at=delta.observed_at,
+    )
+
+
 class MetadataQueryService:
     """Own metadata index eligibility, qualification, refresh, and fallback."""
 
@@ -312,17 +682,213 @@ class MetadataQueryService:
         self._providers = providers
         self._projections = projections
 
+    def list_tags(self, account_name: str) -> tuple[ImapKeywordTag, ...]:
+        return self._accounts.resolve(account_name).tag_registry.tags
+
+    def _decorate(
+        self,
+        query: ListEmailMetadataQuery,
+        response: EmailMetadataPageResponse,
+        registry: ImapKeywordRegistry,
+    ) -> EmailMetadataPageResponse:
+        decorated = response.model_copy(
+            update={
+                "emails": [
+                    email.model_copy(update={"semantic_tags": registry.semantic_names(email.provider_keywords)})
+                    for email in response.emails
+                ]
+            }
+        )
+        return _validate_metadata_response(query, decorated)
+
+    async def _refresh_cached_tags(
+        self,
+        query: ListEmailMetadataQuery,
+        response: EmailMetadataPageResponse,
+        provider: MetadataProvider,
+    ) -> EmailMetadataPageResponse:
+        if not response.emails:
+            return response
+        email_ids = tuple(email.email_id for email in response.emails)
+        current_flags = await _bounded_provider_call(provider.flags_for(query.mailbox, email_ids))
+        if set(current_flags) != set(email_ids):
+            raise MetadataProviderObservationError("Provider returned incomplete flag metadata")
+        for flags in current_flags.values():
+            if len(flags) > APPLICATION_LIMITS.flags:
+                raise MetadataProviderObservationError("Provider metadata flags are invalid")
+            try:
+                for flag in flags:
+                    validate_controlled_string(
+                        flag,
+                        field_name="provider flag",
+                        maximum_bytes=APPLICATION_LIMITS.flag_bytes,
+                    )
+            except ValueError:
+                raise MetadataProviderObservationError("Provider metadata flags are invalid") from None
+        emails = [
+            email.model_copy(
+                update={
+                    "provider_keywords": [flag for flag in current_flags[email.email_id] if not flag.startswith("\\")]
+                }
+            )
+            for email in response.emails
+        ]
+        return response.model_copy(update={"emails": emails})
+
     def _open_provider(self, query: ListEmailMetadataQuery, mode: RuntimeMode) -> MetadataProviderAccess:
         return self._providers.open(query.account_name, expected_mode=mode)
+
+    @staticmethod
+    def _resolve_tags_for_access(
+        query: ListEmailMetadataQuery,
+        access: MetadataProviderAccess,
+    ) -> ListEmailMetadataQuery:
+        if not query.semantic_tags:
+            return query
+        return replace(
+            query,
+            provider_keywords=access.account.tag_registry.resolve(query.semantic_tags),
+        )
 
     async def _provider_fallback(
         self,
         query: ListEmailMetadataQuery,
         mode: RuntimeMode,
-    ) -> EmailMetadataPageResponse:
+    ) -> tuple[EmailMetadataPageResponse, MetadataAccountSnapshot]:
         access = self._open_provider(query, mode)
-        response = await _bounded_provider_call(access.provider.list_metadata(query, access.account))
-        return _validate_metadata_response(query, response)
+        current_query = self._resolve_tags_for_access(query, access)
+        response = await _bounded_provider_call(access.provider.list_metadata(current_query, access.account))
+        return _validate_metadata_response(current_query, response), access.account
+
+    async def _load_mailbox_snapshot(  # noqa: C901 - explicit refresh, resume, and fallback branches
+        self,
+        query: ListEmailMetadataQuery,
+        account: MetadataAccountSnapshot,
+        projection: MetadataProjection,
+        access: MetadataProviderAccess,
+        state: MailboxState,
+        *,
+        require_provider_evidence: bool = False,
+    ) -> tuple[MailboxMetadataSnapshot, bool, bool] | None:
+        """Refresh one mailbox, preferring UIDs above a complete cached epoch.
+
+        Returns the snapshot, whether it was an append-only extension, and
+        whether resumed rows need a fresh flag read. None means the full refresh
+        failed after its exception was logged and the caller should use the
+        bounded provider fallback. ``query_too_broad`` still propagates.
+
+        ``require_provider_evidence`` keeps a local header search on the fresh
+        read when the projection cannot be reused. A missing UIDVALIDITY skips
+        retained rows entirely. A missing UIDNEXT skips append-only extension
+        and uses the full UID inventory instead of a manufactured counter.
+        """
+
+        uidvalidity = state.uidvalidity
+        retained: tuple[dict[str, object], ...] = ()
+        if uidvalidity is None:
+            return await self._fetch_mailbox_snapshot(
+                query,
+                access,
+                retained=(),
+                retained_uidvalidity=None,
+                require_provider_evidence=require_provider_evidence,
+            )
+
+        try:
+            baseline = await projection.read_incremental_baseline(query.mailbox, uidvalidity)
+        except MetadataProjectionError:
+            if require_provider_evidence:
+                logger.warning("Operational metadata index read failed; reading headers for local search")
+                baseline = None
+            elif account.mode == "managed":
+                raise
+            else:
+                logger.warning("Operational metadata index read failed; using bounded provider fallback")
+                return None
+        if (
+            baseline is not None
+            and state.uidnext is not None
+            and baseline.state.uidvalidity == uidvalidity
+            and baseline.state.uidnext is not None
+            and baseline.state.message_count < metadata_snapshot_row_limit()
+        ):
+            remaining = metadata_snapshot_row_limit() - baseline.state.message_count
+            try:
+                delta = await _bounded_provider_call(
+                    access.provider.mailbox_uid_delta(
+                        query.mailbox,
+                        0 if baseline.high_uid is None else baseline.high_uid,
+                        maximum_new_messages=remaining,
+                    )
+                )
+            except MetadataQueryTooBroadError:
+                raise
+            except Exception as exc:
+                _log_projection_refresh_failure(exc, incremental=True)
+            else:
+                merged = _merge_append_only_snapshot(query.mailbox, baseline, delta)
+                if merged is not None and _projection_can_answer(query, merged.emails):
+                    logger.info(f"Incremental metadata sync added {len(delta.emails)} UIDs")
+                    return merged, True, False
+        if baseline is not None:
+            retained = tuple(baseline.emails)
+        else:
+            try:
+                partial_rows = await projection.read_partial_emails(query.mailbox, uidvalidity)
+            except MetadataProjectionError:
+                if require_provider_evidence:
+                    logger.warning("Operational metadata index read failed; reading headers for local search")
+                    partial_rows = None
+                elif account.mode == "managed":
+                    raise
+                else:
+                    logger.warning("Operational metadata index read failed; using bounded provider fallback")
+                    return None
+            retained = partial_rows or ()
+        retained = _reusable_header_rows(query, retained)
+        return await self._fetch_mailbox_snapshot(
+            query,
+            access,
+            retained=retained,
+            retained_uidvalidity=uidvalidity if retained else None,
+            require_provider_evidence=require_provider_evidence,
+        )
+
+    async def _fetch_mailbox_snapshot(
+        self,
+        query: ListEmailMetadataQuery,
+        access: MetadataProviderAccess,
+        *,
+        retained: tuple[dict[str, object], ...],
+        retained_uidvalidity: int | None,
+        require_provider_evidence: bool,
+    ) -> tuple[MailboxMetadataSnapshot, bool, bool] | None:
+        try:
+            # Batches inside the snapshot carry the refresh timeout. One outer
+            # deadline would cancel a large mailbox before a later batch starts.
+            snapshot = await _bounded_provider_call(
+                access.provider.mailbox_snapshot(
+                    query.mailbox,
+                    retained_emails=retained,
+                    retained_uidvalidity=retained_uidvalidity,
+                ),
+                timeout=None,
+            )
+        except MetadataQueryTooBroadError:
+            raise
+        except Exception as exc:
+            _log_projection_refresh_failure(exc, incremental=False)
+            if require_provider_evidence:
+                raise
+            return None
+        if isinstance(snapshot, MailboxMetadataSnapshot):
+            if snapshot.complete:
+                logger.info(f"Metadata snapshot complete ({snapshot.state.message_count} messages)")
+            else:
+                logger.info(
+                    f"Metadata snapshot partial ({len(snapshot.emails)} of {snapshot.state.message_count} messages)"
+                )
+        return snapshot, False, bool(retained)
 
     async def execute(  # noqa: C901 - explicit bounded workflow branches
         self,
@@ -330,59 +896,122 @@ class MetadataQueryService:
     ) -> EmailMetadataPageResponse:
         query.validate()
         account = self._accounts.resolve(query.account_name)
-        if not query.index_supported:
-            return await self._provider_fallback(query, account.mode)
+        if query.semantic_tags:
+            query = replace(
+                query,
+                provider_keywords=account.tag_registry.resolve(query.semantic_tags),
+            )
+        header_search = _configured_header_search(account)
+        if header_search == "local" and _local_header_search_rejected(query):
+            raise ValueError(_LOCAL_HEADER_SEARCH_UNSUPPORTED)
+        use_local = header_search == "local" and _is_header_text_query(query)
+        if not query.index_supported and not use_local:
+            response, current_account = await self._provider_fallback(query, account.mode)
+            return self._decorate(query, response, current_account.tag_registry)
 
+        projection: MetadataProjection | None
         try:
             projection = await self._projections.open(account)
         except MetadataProjectionError:
-            if account.mode == "managed":
+            if use_local:
+                # The projection is a cache. Local search can still read headers.
+                logger.warning("Operational metadata index is unavailable; reading headers for local search")
+                projection = None
+            elif account.mode == "managed":
                 raise
-            logger.warning("Operational metadata index is unavailable; using bounded provider fallback")
-            return await self._provider_fallback(query, account.mode)
+            else:
+                logger.warning("Operational metadata index is unavailable; using bounded provider fallback")
+                response, current_account = await self._provider_fallback(query, account.mode)
+                return self._decorate(query, response, current_account.tag_registry)
 
         # Re-resolve lifecycle authority immediately before each provider access.
         access = self._open_provider(query, account.mode)
+        current_query = self._resolve_tags_for_access(query, access)
         try:
-            state = await _bounded_provider_call(access.provider.mailbox_state(query.mailbox))
+            state = await _bounded_provider_call(access.provider.mailbox_state(current_query.mailbox))
         except Exception:
-            logger.warning("Metadata index qualification failed; using bounded provider fallback")
-            return await self._provider_fallback(query, account.mode)
-
-        try:
-            indexed = await projection.read_complete(query.mailbox, state)
-        except MetadataProjectionError:
-            if account.mode == "managed":
+            if use_local:
                 raise
-            logger.warning("Operational metadata index read failed; using bounded provider fallback")
-            return await self._provider_fallback(query, account.mode)
+            logger.warning("Metadata index qualification failed; using bounded provider fallback")
+            response, current_account = await self._provider_fallback(query, account.mode)
+            return self._decorate(query, response, current_account.tag_registry)
+
+        indexed: list[dict[str, object]] | None = None
+        if projection is not None and _provider_epoch_observed(state):
+            try:
+                indexed = await projection.read_complete(query.mailbox, state)
+            except MetadataProjectionError:
+                if use_local:
+                    logger.warning("Operational metadata index read failed; reading headers for local search")
+                    indexed = None
+                elif account.mode == "managed":
+                    raise
+                else:
+                    logger.warning("Operational metadata index read failed; using bounded provider fallback")
+                    response, current_account = await self._provider_fallback(query, account.mode)
+                    return self._decorate(query, response, current_account.tag_registry)
+        if indexed is not None and not _projection_can_answer(current_query, indexed):
+            indexed = None
         if indexed is not None:
-            return _page_response(query, indexed, access.account.allowed_senders)
+            cached = _page_response(
+                current_query,
+                _rows_for_query(current_query, indexed),
+                access.account.allowed_senders,
+            )
+            refreshed = await self._refresh_cached_tags(current_query, cached, access.provider)
+            return self._decorate(current_query, refreshed, access.account.tag_registry)
 
         access = self._open_provider(query, account.mode)
-        try:
-            snapshot = await _bounded_provider_call(access.provider.mailbox_snapshot(query.mailbox))
-        except MetadataQueryTooBroadError:
-            raise
-        except Exception:
-            logger.warning("Metadata projection refresh failed; using bounded provider fallback")
-            return await self._provider_fallback(query, account.mode)
+        current_query = self._resolve_tags_for_access(query, access)
+        if projection is None:
+            loaded = await self._fetch_mailbox_snapshot(
+                current_query,
+                access,
+                retained=(),
+                retained_uidvalidity=None,
+                require_provider_evidence=True,
+            )
+        else:
+            loaded = await self._load_mailbox_snapshot(
+                current_query,
+                account,
+                projection,
+                access,
+                state,
+                require_provider_evidence=use_local,
+            )
+        if loaded is None:
+            if use_local:
+                raise MetadataProviderError("local header search could not read mailbox headers")
+            response, current_account = await self._provider_fallback(query, account.mode)
+            return self._decorate(query, response, current_account.tag_registry)
+        snapshot, incremental, refresh_flags = loaded
 
-        _validate_snapshot(query, snapshot)
+        _validate_snapshot(current_query, snapshot)
         projection_write_failed = False
-        try:
-            await projection.write_snapshot(query.mailbox, snapshot)
-        except Exception:
-            # The validated provider observation already satisfies mail-read
-            # authority. Rebuildable projection persistence cannot erase it.
-            projection_write_failed = True
-            logger.warning("Metadata projection write failed; returning bounded provider observation")
-        if snapshot.complete:
-            return _page_response(
-                query,
-                [dict(email) for email in snapshot.emails],
+        if projection is not None and _provider_epoch_observed(snapshot.state):
+            try:
+                await projection.write_snapshot(query.mailbox, snapshot)
+            except Exception:
+                # The validated provider observation already satisfies mail-read
+                # authority. Rebuildable projection persistence cannot erase it.
+                projection_write_failed = True
+                logger.warning("Metadata projection write failed; returning bounded provider observation")
+        answered = snapshot.complete and _projection_can_answer(current_query, snapshot.emails)
+        if answered:
+            observed = _page_response(
+                current_query,
+                _rows_for_query(current_query, snapshot.emails),
                 access.account.allowed_senders,
                 warnings=("projection_write_failed",) if projection_write_failed else (),
             )
-        response = await self._provider_fallback(query, account.mode)
-        return _with_projection_warning(query, response) if projection_write_failed else response
+            if incremental or refresh_flags:
+                # Older projected rows can carry stale keywords. Refresh only
+                # the returned page, matching a later complete-cache hit.
+                observed = await self._refresh_cached_tags(current_query, observed, access.provider)
+            return self._decorate(current_query, observed, access.account.tag_registry)
+        if use_local:
+            raise MetadataQueryTooBroadError(_LOCAL_COVERAGE_ERROR)
+        response, current_account = await self._provider_fallback(query, account.mode)
+        response = _with_projection_warning(query, response) if projection_write_failed else response
+        return self._decorate(query, response, current_account.tag_registry)

@@ -1,7 +1,11 @@
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
+
+from mcp_email_server.application.limits import APPLICATION_LIMITS
+
+EmailTag = Annotated[str, Field(max_length=APPLICATION_LIMITS.flag_bytes)]
 
 
 class EmailMetadata(BaseModel):
@@ -14,6 +18,8 @@ class EmailMetadata(BaseModel):
     recipients: list[str]  # Recipient list
     date: datetime
     attachments: list[str]
+    provider_keywords: list[EmailTag] = Field(default_factory=list, max_length=APPLICATION_LIMITS.flags)
+    semantic_tags: list[EmailTag] = Field(default_factory=list, max_length=APPLICATION_LIMITS.flags)
 
     @classmethod
     def from_email(cls, email: dict[str, Any]):
@@ -25,6 +31,9 @@ class EmailMetadata(BaseModel):
             recipients=email.get("to", []),
             date=email["date"],
             attachments=email["attachments"],
+            provider_keywords=[
+                flag for flag in email.get("_flags", []) if isinstance(flag, str) and not flag.startswith("\\")
+            ],
         )
 
 
@@ -86,6 +95,18 @@ class LabelInfo(BaseModel):
     full_path: str
     delimiter: str
     flags: list[str]
+
+
+class CreateMailboxResult(BaseModel):
+    """Outcome of an explicit mailbox creation request"""
+
+    mailbox: str = Field(description="The exact mailbox name that was requested.")
+    status: Literal["created", "already_exists", "unknown"] = Field(
+        description="created: CREATE succeeded; already_exists: no change; unknown: the effect may have happened."
+    )
+    reconciliation_needed: bool = Field(
+        description="True when status is unknown; verify with list_mailboxes before retrying."
+    )
 
 
 class AttachmentDownloadResponse(BaseModel):

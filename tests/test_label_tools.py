@@ -481,7 +481,7 @@ async def test_mutation_adapter_forwards_the_derived_label_mailbox_and_policy() 
     client.remove_label_with_outcome = AsyncMock(
         return_value=BatchMutationOutcome((TargetMutationOutcome("42", "succeeded"),))
     )
-    provider = ClassicMutationProvider(SimpleNamespace(incoming_client=client))  # pyright: ignore[reportArgumentType]
+    provider = ClassicMutationProvider(SimpleNamespace(incoming_client=client, outgoing_client=None))  # pyright: ignore[reportArgumentType]
     account = MutationAccountSnapshot(
         account_name="work",
         mode="managed",
@@ -786,6 +786,56 @@ async def test_remove_label_expunges_every_copy_of_one_message(email_client) -> 
     assert outcome.targets("succeeded") == ["42"]
     assert _uid_calls(fake, "store") == [("900,901", "Labels/Work")]
     assert _uid_calls(fake, "expunge") == [("900,901", "Labels/Work")]
+
+
+def _revoked_after(calls: int) -> MagicMock:
+    """An authority guard that allows ``calls`` checks, then raises as if revoked."""
+    guard = MagicMock()
+    guard.side_effect = [None] * calls + [PermissionError("revoked")] * 10
+    return guard
+
+
+def _two_label_targets() -> _LabelMailboxFake:
+    second = "<second@example.test>"
+    return _LabelMailboxFake(
+        message_ids={"42": MESSAGE_ID, "43": second},
+        label_uids={MESSAGE_ID: ["900"], second: ["901"]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_label_rechecks_authority_before_every_store(email_client) -> None:
+    fake = _two_label_targets()
+    email_client.mutation_guard = _revoked_after(1)
+
+    with patch.object(email_client, "imap_class", return_value=fake):
+        outcome = await email_client.remove_label_with_outcome(["42", "43"], "Labels/Work", "INBOX")
+
+    # 42 was flagged before the revocation but never expunged, so its effect is
+    # unknown; 43 was never touched.
+    assert outcome.outcomes == (
+        TargetMutationOutcome("42", "unknown", "expunge-not-attempted"),
+        TargetMutationOutcome("43", "failed", "mutation-policy"),
+    )
+    assert _uid_calls(fake, "store") == [("900", "Labels/Work")]
+    assert _uid_calls(fake, "expunge") == []
+
+
+@pytest.mark.asyncio
+async def test_remove_label_rechecks_authority_before_the_expunge(email_client) -> None:
+    fake = _two_label_targets()
+    email_client.mutation_guard = _revoked_after(2)
+
+    with patch.object(email_client, "imap_class", return_value=fake):
+        outcome = await email_client.remove_label_with_outcome(["42", "43"], "Labels/Work", "INBOX")
+
+    assert outcome.outcomes == (
+        TargetMutationOutcome("42", "unknown", "expunge-not-attempted"),
+        TargetMutationOutcome("43", "unknown", "expunge-not-attempted"),
+    )
+    assert [uids for uids, _ in _uid_calls(fake, "store")] == ["900", "901"]
+    assert _uid_calls(fake, "expunge") == []
+    assert email_client.mutation_guard.call_count == 3
 
 
 @pytest.mark.asyncio

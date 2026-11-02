@@ -320,7 +320,7 @@ def _snapshot(allowed_senders: tuple[str, ...] = ()) -> MutationAccountSnapshot:
         account_name="test",
         mode="legacy",
         allowed_senders=allowed_senders,
-        allowed_recipients=(),
+        allowed_recipients=("alice@example.com",),
         report_blocked_mutations=False,
         can_send=True,
     )
@@ -345,7 +345,7 @@ class _StubProvider:
     async def send(self, command: SendCommand, account: MutationAccountSnapshot):
         del account
         self.sent = command
-        return MagicMock(outcomes=(), sent_message=None, has_accepted_recipient=False)
+        return MagicMock(outcomes=(), sent_message=None, has_accepted_recipient=False, message_id=None)
 
 
 def _service_with(provider: _StubProvider) -> SendService:

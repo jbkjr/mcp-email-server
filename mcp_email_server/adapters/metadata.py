@@ -14,7 +14,9 @@ from mcp_email_server.application.metadata import (
     ListEmailMetadataQuery,
     MailboxMetadataSnapshot,
     MailboxState,
+    MailboxUidDelta,
     MetadataAccountSnapshot,
+    MetadataIncrementalBaseline,
     MetadataProjection,
     MetadataProjectionError,
     MetadataProviderAccess,
@@ -26,12 +28,12 @@ from mcp_email_server.application.metadata import (
 from mcp_email_server.bootstrap import process_bootstrap
 from mcp_email_server.config import AccountAttributes, EmailSettings, Settings, get_settings
 from mcp_email_server.emails.classic import (
-    MAX_INDEXED_UID_WINDOW,
     ClassicEmailHandler,
     MetadataPayloadTooLargeError,
 )
-from mcp_email_server.emails.models import EmailMetadata, EmailMetadataPageResponse
-from mcp_email_server.metadata_index import MetadataIndex, MetadataIndexError
+from mcp_email_server.emails.models import EmailMetadata, EmailMetadataPageResponse, MailboxInfo
+from mcp_email_server.imap_keywords import ImapKeywordRegistry
+from mcp_email_server.metadata_index import IndexedIncrementalBaseline, MetadataIndex, MetadataIndexError
 
 _T = TypeVar("_T")
 
@@ -43,8 +45,33 @@ async def _bounded_provider_call(awaitable: Awaitable[_T]) -> _T:
         raise
     except (MetadataPayloadTooLargeError, MetadataProviderObservationError, MetadataQueryTooBroadError):
         raise
-    except Exception:
-        raise MetadataProviderError("provider_failure: metadata provider request failed") from None
+    except Exception as exc:
+        raise MetadataProviderError(
+            "provider_failure: metadata provider request failed",
+            diagnostic=exc,
+        ) from None
+
+
+def _incremental_baseline(
+    mailbox: str,
+    baseline: IndexedIncrementalBaseline | None,
+) -> MetadataIncrementalBaseline | None:
+    if baseline is None:
+        return None
+    return MetadataIncrementalBaseline(
+        state=MailboxState(
+            uidvalidity=baseline.uidvalidity,
+            uidnext=baseline.uidnext,
+            message_count=baseline.message_count,
+        ),
+        high_uid=baseline.high_uid,
+        mailbox=MailboxInfo(
+            name=mailbox,
+            delimiter=baseline.delimiter or "",
+            flags=list(baseline.attributes),
+        ),
+        emails=tuple(dict(email) for email in baseline.emails),
+    )
 
 
 @dataclass(frozen=True)
@@ -82,6 +109,8 @@ class ClassicMetadataProvider:
                 body=query.body,
                 text=query.text,
                 has_attachment=query.has_attachment,
+                tag_keywords=list(query.provider_keywords),
+                tag_match=query.tag_match,
                 allowed_senders=list(account.allowed_senders),
             )
         )
@@ -98,13 +127,40 @@ class ClassicMetadataProvider:
     async def mailbox_state(self, mailbox: str) -> MailboxState:
         return await _bounded_provider_call(self._handler.incoming_client.get_mailbox_state(mailbox))
 
-    async def mailbox_snapshot(self, mailbox: str) -> MailboxMetadataSnapshot:
-        return await _bounded_provider_call(
-            self._handler.incoming_client.get_mailbox_metadata_snapshot(
+    async def mailbox_snapshot(
+        self,
+        mailbox: str,
+        *,
+        retained_emails: tuple[dict[str, object], ...] = (),
+        retained_uidvalidity: int | None = None,
+    ) -> MailboxMetadataSnapshot:
+        if retained_emails:
+            operation = self._handler.incoming_client.get_mailbox_metadata_snapshot(
                 mailbox,
-                maximum_window=MAX_INDEXED_UID_WINDOW,
+                retained_emails=retained_emails,
+                retained_uidvalidity=retained_uidvalidity,
+            )
+        else:
+            operation = self._handler.incoming_client.get_mailbox_metadata_snapshot(mailbox)
+        return await _bounded_provider_call(operation)
+
+    async def mailbox_uid_delta(
+        self,
+        mailbox: str,
+        minimum_exclusive_uid: int,
+        *,
+        maximum_new_messages: int,
+    ) -> MailboxUidDelta:
+        return await _bounded_provider_call(
+            self._handler.incoming_client.get_mailbox_uid_delta(
+                mailbox,
+                minimum_exclusive_uid,
+                maximum_new_messages=maximum_new_messages,
             )
         )
+
+    async def flags_for(self, mailbox: str, email_ids: tuple[str, ...]) -> dict[str, list[str]]:
+        return await _bounded_provider_call(self._handler.incoming_client.get_email_flags(list(email_ids), mailbox))
 
 
 class SQLiteMetadataProjection:
@@ -119,13 +175,18 @@ class SQLiteMetadataProjection:
         mailbox: str,
         state: MailboxState,
     ) -> list[dict[str, object]] | None:
+        uidvalidity = state.uidvalidity
+        uidnext = state.uidnext
+        if uidvalidity is None or uidnext is None:
+            # Missing provider identity cannot qualify a stored epoch.
+            return None
         try:
             snapshot = await asyncio.to_thread(
                 self._index.read_complete,
                 self._operational_account_id,
                 mailbox,
-                uidvalidity=state.uidvalidity,
-                uidnext=state.uidnext,
+                uidvalidity=uidvalidity,
+                uidnext=uidnext,
                 message_count=state.message_count,
             )
         except MetadataIndexError as exc:
@@ -134,7 +195,45 @@ class SQLiteMetadataProjection:
             return None
         return [dict(email) for email in snapshot.emails]
 
+    async def read_incremental_baseline(
+        self,
+        mailbox: str,
+        uidvalidity: int,
+    ) -> MetadataIncrementalBaseline | None:
+        try:
+            baseline = await asyncio.to_thread(
+                self._index.read_incremental_baseline,
+                self._operational_account_id,
+                mailbox,
+                uidvalidity=uidvalidity,
+            )
+        except MetadataIndexError as exc:
+            raise MetadataProjectionError("Operational metadata projection read failed") from exc
+        return _incremental_baseline(mailbox, baseline)
+
+    async def read_partial_emails(
+        self,
+        mailbox: str,
+        uidvalidity: int,
+    ) -> tuple[dict[str, object], ...] | None:
+        try:
+            emails = await asyncio.to_thread(
+                self._index.read_partial_emails,
+                self._operational_account_id,
+                mailbox,
+                uidvalidity=uidvalidity,
+            )
+        except MetadataIndexError as exc:
+            raise MetadataProjectionError("Operational metadata projection read failed") from exc
+        if emails is None:
+            return None
+        return tuple(dict(email) for email in emails)
+
     async def write_snapshot(self, mailbox: str, snapshot: MailboxMetadataSnapshot) -> None:
+        uidvalidity = snapshot.state.uidvalidity
+        uidnext = snapshot.state.uidnext
+        if uidvalidity is None or uidnext is None:
+            raise MetadataProjectionError("Mailbox observation omitted UIDVALIDITY or UIDNEXT and cannot be reused")
         try:
             await asyncio.to_thread(
                 self._index.write_snapshot,
@@ -142,8 +241,8 @@ class SQLiteMetadataProjection:
                 mailbox,
                 delimiter=snapshot.mailbox.delimiter or None,
                 attributes=snapshot.mailbox.flags,
-                uidvalidity=snapshot.state.uidvalidity,
-                uidnext=snapshot.state.uidnext,
+                uidvalidity=uidvalidity,
+                uidnext=uidnext,
                 message_count=snapshot.state.message_count,
                 emails=[dict(email) for email in snapshot.emails],
                 complete=snapshot.complete,
@@ -175,6 +274,9 @@ class LocalMetadataBackend:
                 account_name=resolved.account.account_name,
                 mode=resolved.mode,
                 allowed_senders=tuple(resolved.settings.allowed_senders),
+                tag_registry=ImapKeywordRegistry.from_tags(resolved.account.tags),
+                imap_host=resolved.account.incoming.host,
+                imap_search_mode=resolved.account.imap_search_mode,
             ),
         )
 

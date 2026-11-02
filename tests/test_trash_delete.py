@@ -25,6 +25,7 @@ from mcp_email_server.application.mutations import (
     MutationProviderAccess,
     MutationProviderError,
     MutationServices,
+    PermanentDeleteNotRequestedError,
     TargetMutationOutcome,
 )
 from mcp_email_server.config import EmailServer, EmailSettings
@@ -258,11 +259,11 @@ async def test_delete_moves_to_the_discovered_trash_mailbox() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delete_falls_back_to_permanent_removal_without_a_trash_mailbox() -> None:
+async def test_permanent_true_removes_permanently_without_a_trash_mailbox() -> None:
     provider = _provider(None)
     services, factory, projection = _services(provider)
 
-    result = await services.delete.execute(DeleteCommand("primary", ("7",)))
+    result = await services.delete.execute(DeleteCommand("primary", ("7",), permanent=True))
 
     provider.delete.assert_awaited_once()
     provider.move.assert_not_awaited()
@@ -274,16 +275,46 @@ async def test_delete_falls_back_to_permanent_removal_without_a_trash_mailbox() 
 
 
 @pytest.mark.asyncio
-async def test_deleting_from_trash_is_permanent() -> None:
-    """The provider answers "nowhere further to move to", and the workflow honours it."""
+async def test_permanent_true_deletes_from_trash_permanently() -> None:
+    """The provider answers "nowhere further to move to", and the caller said to go ahead."""
     provider = _provider(None)
     services, _, _ = _services(provider)
 
-    result = await services.delete.execute(DeleteCommand("primary", ("7",), "Trash"))
+    result = await services.delete.execute(DeleteCommand("primary", ("7",), "Trash", permanent=True))
 
     provider.find_trash_mailbox.assert_awaited_once_with("Trash")
     provider.delete.assert_awaited_once()
     assert result.trash_mailbox is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mailbox", ["INBOX", "Trash"], ids=["no-trash-mailbox", "source-is-trash"])
+async def test_permanent_delete_without_permanent_true_refuses_and_touches_nothing(mailbox: str) -> None:
+    provider = _provider(None)
+    services, factory, projection = _services(provider)
+
+    with pytest.raises(PermanentDeleteNotRequestedError, match="permanent=true") as refusal:
+        await services.delete.execute(DeleteCommand("primary", ("7",), mailbox))
+
+    assert "Nothing was deleted" in str(refusal.value)
+    provider.delete.assert_not_awaited()
+    provider.move.assert_not_awaited()
+    projection.invalidate.assert_not_awaited()
+    # Only discovery ran: no authority was opened for an effect.
+    assert factory.open.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_permanent_true_still_moves_to_an_available_trash_mailbox() -> None:
+    """The flag permits permanent removal where it's the only option; it doesn't skip Trash."""
+    provider = _provider("Trash")
+    services, _, _ = _services(provider)
+
+    result = await services.delete.execute(DeleteCommand("primary", ("7",), permanent=True))
+
+    provider.move.assert_awaited_once()
+    provider.delete.assert_not_awaited()
+    assert result.trash_mailbox == "Trash"
 
 
 @pytest.mark.asyncio
@@ -431,3 +462,34 @@ async def test_an_invalid_command_is_rejected_before_any_discovery() -> None:
 
     factory.open.assert_not_called()
     provider.find_trash_mailbox.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Mutation grants (upstream #261)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trash_first_move_is_authorized_by_the_delete_grant() -> None:
+    """An account granted delete but not organize can still delete into Trash."""
+    provider = _provider("Trash")
+    services, _, _ = _services(provider, account=_account(allowed_mutations=("delete",)))
+
+    await services.delete.execute(DeleteCommand("primary", ("7",)))
+
+    provider.move.assert_awaited_once()
+    assert provider.move.await_args.kwargs == {"grant": "delete"}
+
+
+@pytest.mark.asyncio
+async def test_delete_without_the_delete_grant_touches_nothing() -> None:
+    provider = _provider("Trash")
+    services, factory, _ = _services(provider, account=_account(allowed_mutations=("organize",)))
+
+    with pytest.raises(PermissionError, match="'delete' is not allowed"):
+        await services.delete.execute(DeleteCommand("primary", ("7",)))
+
+    factory.open.assert_not_called()
+    provider.find_trash_mailbox.assert_not_awaited()
+    provider.move.assert_not_awaited()
+    provider.delete.assert_not_awaited()

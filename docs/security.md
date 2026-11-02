@@ -9,11 +9,34 @@ An email MCP server can read private messages, modify mailboxes, send messages,
 and access local files. Review the controls on this page before exposing it to
 an MCP client or network.
 
+## Advanced protocol command authority
+
+`email_command` is a deliberately broad, per-account opt-in, disabled by default.
+It is not implied by mutation grants and cannot be enabled through MCP. IMAP
+requires organize/delete/append, no sender filter and attachment-content access;
+SMTP requires send permission and explicit `*` recipient access. Incompatible
+policy fails closed rather than silently bypassing a sender/recipient filter.
+
+Enabling it permits server-authorized mailbox DELETE, broad EXPUNGE/CLOSE and
+arbitrary protocol flags/keywords. Semantic tag mappings and focused-tool
+mailbox protections do not apply to this channel. Prefer focused tools whenever
+possible; they retain their existing protections. The protocol channel cannot
+choose another endpoint, access local files, execute programs or supply login
+credentials. The server authenticates only the selected role and rechecks current
+account identity and admission before each command and APPEND/DATA payload.
+
+Each call has a dedicated bounded connection. There is no retry, compensation or
+implicit cleanup expunge. A timeout/disconnect after transmission may leave an
+unknown outcome; do not replay automatically. Responses and mail are untrusted
+content, not instructions. See [configuration](configuration.md#advanced-protocol-access)
+and [tool semantics](tools.md#email_command-advanced-protocol-operations).
+
 ## Local management UI security
 
 `mcp-email-server ui` is a foreground, single-user local adapter. It binds
 exactly to IPv4 `127.0.0.1`; port `0` is the default and selects an ephemeral
-port. The command exposes no host, wildcard, share, daemon, debug, reload, CORS,
+port. On Windows the listener claims its port exclusively, so another local
+socket cannot bind the same address and receive UI connections. The command exposes no host, wildcard, share, daemon, debug, reload, CORS,
 or remote mode. Its process-unique route serves only packaged same-origin React
 assets and explicit management use cases. There is no provider-connectivity
 control or route, mail, arbitrary file, generic RPC, OpenAPI, metrics, or
@@ -96,6 +119,12 @@ does not enable a message-content dump. MCP send results may expose only reviewe
 fixed delivery tags; an unrecognized detail is omitted rather than copied from a
 provider response.
 
+Metadata refresh failures log a fixed operation label, the causal exception
+class, and at most 20 function-name/line-number traceback locations. They omit
+exception text and chains, source lines, filesystem paths, and frame locals,
+including when a Loguru sink enables diagnostic tracebacks. Batch failures use
+the same redacted format when keeping a partial snapshot.
+
 ## Managed credential storage
 
 Managed mode never falls back to TOML plaintext. Its default managed secret
@@ -113,6 +142,19 @@ the managed catalog is a secret-bearing database: file copies, snapshots, and
 backups include plaintext `managed_secret.secret_value` values. Keep every copy
 under protection equivalent to the private original; do not upload, share, or
 treat it as a non-secret account database.
+
+The declared v3/v4/v5/v6-to-v7 catalog migration runs only after the existing catalog
+and sidecars pass the same private-file checks as a normal managed open. One
+bounded SQLite write transaction validates the exact source schema and adds
+a nullable To-only projection field. Sources before v6 receive default-disabled
+protocol access. Sources before v5 also receive fixed-five global
+grants, inheriting account overrides, and an unset draft mailbox; v3 additionally
+receives default-disabled attachment content and empty tag mappings. It validates
+the resulting v7 schema and invariants and records version 7 last. It neither
+resolves nor copies secret values; failure rolls back without changing the
+advertised source version. Older runtimes reject v7. Stop all catalog users and
+retain a private, consistent backup before the first new-version open; see
+[managed catalog upgrades](configuration.md#upgrading-a-managed-catalog-to-v7).
 
 A create or rotation stores a new immutable value and commits it as active only
 if the reviewed account revision still matches. On Linux and Windows, inserting
@@ -312,6 +354,24 @@ reader, directory listing, remote URL, or arbitrary path lookup is exposed by
 this feature. Only connect a local MCP client whose own filesystem tools may
 legitimately inspect paths returned by the server.
 
+## Semantic tags and embedded attachments
+
+Semantic tag mappings are non-secret account configuration, but their names and
+provider keywords can reveal mailbox organization. Legacy mode stores them with
+the account in the private TOML configuration; managed mode stores them with the
+account in the private catalog. Tag writes require `writable=true` and accept
+semantic names only. The workflow never modifies standard flags, read-only
+configured tags, or unrelated provider keywords.
+
+`get_attachment_content` does not create a local artifact, but it transfers the
+original decoded bytes through MCP and therefore exposes private message content
+to the connected MCP client. It has an independent
+`enable_attachment_content=true` policy and rechecks current authority after
+fetch. Enabling `download_attachment` does not enable content transfer. Use the
+content mode for a trusted remote client, such as a ChatGPT app, that cannot read
+server-local paths. The complete encoded tool result remains subject to the
+existing global serialized-result ceiling.
+
 ## Indexed metadata privacy
 
 The operational SQLite projection contains no message bodies, raw MIME,
@@ -402,6 +462,13 @@ container platform. If a literal secret must be stored in a client
 configuration, restrict that file to the account running the client and keep it
 out of version control and diagnostic output.
 
+The checked-in container build uses an allowlisted Docker context and copies only
+the non-editable installed environment into the runtime image. It does not embed
+repository `.env`, `config.toml`, database, source, test, or cache files. Keep
+credentials out of Docker build arguments and derived image layers; inject them
+only at runtime through a protected env file, secret provider, or private
+configuration mount.
+
 Neither MCP nor ordinary local-UI account forms read legacy environment secrets.
 Treat environment-composited accounts as runtime compatibility inputs and copy
 them only through the explicit, reviewed import flow; the environment value is
@@ -463,9 +530,9 @@ responsibility.
 
 ## Recipient allowlist
 
-Sending is disabled when the allowed-recipient collection is empty. Enable and
-restrict `send_email`, `forward_email`, and `save_to_mailbox` by adding exact
-addresses:
+Sending is unrestricted when the allowed-recipient collection is unset or empty.
+Restrict `send_email`, `forward_email`, and `save_to_mailbox` by adding exact
+addresses or bare glob patterns:
 
 ```toml
 allowed_recipients = [
@@ -481,12 +548,69 @@ MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS='alice@example.com,bob@example.com'
 ```
 
 Every To, CC, and BCC address must be allowed. Matching is case-insensitive and
-understands display-name forms such as `Alice <alice@example.com>`.
+understands display-name forms such as `Alice <alice@example.com>`. Patterns
+match the entire extracted address, not the display name, using the same glob
+syntax as sender policy: `*`, `?`, and bracket expressions such as `[0-9]`.
+For example, `*@example.com` permits that domain, not `example.com.evil`.
 
-`list_allowed_recipients` is always visible in the static MCP tool catalog. An
-empty result means sending is disabled; it never means unrestricted sending.
+To explicitly allow dynamic recipients, configure:
+
+```toml
+allowed_recipients = ["*"]
+```
+
+`["*@*"]` also allows all valid recipients. **This permits unrestricted sending,
+forwarding, and recipient-bound draft saves**, not just drafts. It does not
+bypass address validation, account capabilities, or other policies. Prefer a
+narrow domain pattern when possible; there is no separate draft-only allowlist.
+
+`list_allowed_recipients` is always visible in the static MCP tool catalog. It
+reports an unset or empty policy as `*`, because sending is then unrestricted.
 The Web UI edits recipients as individual add/edit/remove items and states this
-empty behavior explicitly.
+empty behavior explicitly. A non-empty restriction applies equally in managed and
+legacy mode and covers To, CC, and BCC. It rejects a non-matching address before
+a provider is opened for recipient-bearing compose, including before a forward
+source is read. A recipientless `save_draft` needs no match.
+Clearing the last recipient makes sending unrestricted. To stop an account
+sending, remove the `send` mutation grant or its outgoing configuration instead.
+
+### Mutation grants and read-only accounts
+
+Mail writes require an effective `allowed_mutations` class independently of
+recipient/sender restrictions. Omitted global fields retain all five classes
+(`draft`, `organize`, `delete`, `send`, `append`) for both new and old settings;
+there is no deny-by-default conversion. An omitted/null account override inherits;
+an explicit list replaces the global list. Set `[]` explicitly for read-only.
+See [configuration](configuration.md#mail-mutation-permissions) and the
+[effect mapping](tools.md#mail-mutation-permissions).
+
+Effective permissions and account authority are checked freshly at independent
+effect boundaries. Revoking `send` after SMTP acceptance prevents a subsequent
+Sent copy but never erases delivery success or causes resubmission. `send`
+authorizes only that successful message's Sent copy, not general APPEND.
+`organize` cannot expunge unrelated deleted messages. `draft` authorizes only
+`save_draft` with a configured or unique special-use draft destination and fixed
+`\Draft` flag; the caller cannot choose a mailbox or flags. No mailbox is
+created or guessed by these workflows; mailbox creation happens only through the
+explicit `create_mailbox` tool under `organize`. These restrictions need no approval tokens or extra ledger.
+
+A recipientless `save_draft` is always valid.
+Under a non-empty recipient allowlist, every supplied To/CC/BCC address requires a match before attachments are
+read or the message is appended. This exception does not allow recipientless
+SMTP submission or unrestricted `save_to_mailbox`. Read-only grants block
+implicit mark-read too; read without marking instead. Sender constraints,
+attachment protections, and provider capabilities remain unchanged. Permissions
+do not hide tools from the static MCP catalog.
+
+### Recipient policy upgrade note
+
+Upstream [#247](https://github.com/Wh1isper/mcp-email-server/issues/247) made an
+empty list deny `send_email`, `forward_email`, and `save_to_mailbox`. This fork
+keeps the earlier behaviour: an unset or empty list leaves all three unrestricted,
+the server says so at startup, and `list_allowed_recipients` reports it as `*`. A
+non-empty list restricts recipients to its entries. Existing entries containing glob
+syntax act as patterns rather than literal addresses. See
+[recipient-policy troubleshooting](troubleshooting.md#recipient-allowlist-errors).
 
 ## Sender allowlist
 
@@ -534,7 +658,7 @@ report_blocked_mutations = true
 
 This is more explicit but reveals that a blocked message exists.
 `list_allowed_senders` is always visible in the static MCP tool catalog and
-returns an empty list when unrestricted. Unlike recipients, an empty
+returns an empty list when unrestricted. An empty
 allowed-sender collection does not restrict reading. The Web UI edits sender
 patterns as individual add/edit/remove items.
 
@@ -654,7 +778,11 @@ execute.
 The separate `attachments` parameter on `send_email` and `save_to_mailbox`
 reads local file paths. Relative paths are likewise resolved against the server
 process's working directory. Only connect clients that should be trusted to
-request access to files visible to that process.
+request access to files visible to that process. Requests rejected by account,
+send-capability (for `send_email`), or recipient-allowlist checks never open,
+stat, or resolve caller-supplied attachment paths, including UNC or network
+paths. Once those checks pass, attachment size or file-access validation may
+still reject the request after filesystem access.
 
 ## TLS certificate verification
 
