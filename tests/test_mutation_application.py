@@ -259,6 +259,24 @@ async def test_archive_reopens_authority_between_discovery_and_move() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("gateway_provider", [None, "proton_bridge"])
+async def test_archive_non_gmail_still_rejects_same_mailbox_before_effect(gateway_provider) -> None:
+    provider = MagicMock()
+    provider.find_archive_mailbox = AsyncMock(return_value="INBOX")
+    provider.move = AsyncMock()
+    provider.archive_gmail = AsyncMock()
+    services, _, factory, projection = _services(account=_account(gateway_provider=gateway_provider), provider=provider)
+
+    with pytest.raises(ValueError, match="must differ"):
+        await services.archive.execute(ArchiveCommand("primary", ("11",)))
+
+    assert factory.open.call_count == 1
+    provider.move.assert_not_awaited()
+    provider.archive_gmail.assert_not_awaited()
+    projection.invalidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_send_preserves_partial_delivery_and_separate_sent_copy() -> None:
     provider = MagicMock()
     sent_message = object()

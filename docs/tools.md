@@ -853,10 +853,15 @@ Direct Gmail and Proton accounts retain the existing workflows and tool catalog.
 
 - Archive accepts INBOX only and removes `\Inbox` with incremental
   `-X-GM-LABELS`. It never transfers messages to an Archive/All Mail folder.
+  The internal archive outcome names INBOX and invalidates it once.
 - Move accepts at most 25 unique explicit UIDs. It adds the existing destination
   user label (or `\Inbox`), FETCH-confirms the same decimal-string X-GM-MSGID
   and destination membership, then removes only the source label. Spam can move
-  only to Inbox. Other user labels remain intact.
+  only to Inbox. Gmail may remove Spam membership immediately when Inbox is
+  added. Rescue confirms the same X-GM-MSGID in Inbox using bounded SEARCH ALL
+  and metadata FETCH, and skips source removal only when that identity's labels
+  show Spam is absent. System labels such as `\Inbox`/`\INBOX` compare without
+  case; user labels retain exact case. Other user labels remain intact.
 - Apply/remove labels use exact existing user label names, without adding
   `Labels/`. `get_email_labels` reads X-GM-LABELS from the selected UID; it never
   searches RFC Message-ID aliases or reuses a UID in another mailbox.

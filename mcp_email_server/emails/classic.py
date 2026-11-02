@@ -3658,6 +3658,35 @@ class EmailClient:
             raise ValueError("Ambiguous or oversized Gmail LIST")
         return mailboxes
 
+    async def _gmail_spam_rescue_confirmation(
+        self,
+        imap: Any,
+        source_mailbox: str,
+        destination_mailbox: str,
+        message_id: str,
+    ) -> dict[str, Any] | None:
+        """Find the same Gmail identity in Inbox using only proxy-permitted reads.
+
+        Adding Inbox can immediately remove the Spam UID. Search the destination
+        under the shared candidate bound, FETCH in groups of five, and compare
+        X-GM-MSGID rather than reusing a source UID or trusting a Message-ID.
+        Restore the source selection before processing another source UID.
+        """
+        selected = await imap.select(_quote_mailbox(destination_mailbox))
+        _raise_for_imap_error(selected, "SELECT Gmail rescue destination")
+        response = await imap.uid_search("ALL", charset=None)
+        _raise_for_imap_error(response, "SEARCH Gmail rescue destination")
+        uids = _normalize_search_uids(response[1])
+        confirmed = None
+        for start in range(0, len(uids), 5):
+            metadata = await self._gmail_metadata(imap, uids[start : start + 5])
+            confirmed = next((item for item in metadata.values() if item["gmail_message_id"] == message_id), None)
+            if confirmed is not None:
+                break
+        selected = await imap.select(_quote_mailbox(source_mailbox))
+        _raise_for_imap_error(selected, "SELECT Gmail rescue source")
+        return confirmed
+
     async def _gmail_mutate(  # noqa: C901 - ordered per-UID evidence for two distinct effects
         self,
         email_ids: list[str],
@@ -3738,15 +3767,38 @@ class EmailClient:
                         response = await imap.uid("store", uid, "-X-GM-LABELS" if remove else "+X-GM-LABELS", label_arg)
                         if _imap_effect_status(response) == "succeeded" and operation == "move":
                             detail = "destination-added-confirmation-unknown"
-                            confirmed = (await self._gmail_metadata(imap, [uid]))[uid]
+                            if source_role == "junk":
+                                confirmed = await self._gmail_spam_rescue_confirmation(
+                                    imap, source_mailbox, str(destination_mailbox), before["gmail_message_id"]
+                                )
+                            else:
+                                confirmed = (await self._gmail_metadata(imap, [uid]))[uid]
                             if (
-                                before["gmail_message_id"] != confirmed["gmail_message_id"]
-                                or destination_label not in confirmed["gmail_labels"]
+                                confirmed is None
+                                or before["gmail_message_id"] != confirmed["gmail_message_id"]
+                                or not any(
+                                    label.casefold() == destination_label.casefold()
+                                    if destination_label.startswith("\\")
+                                    else label == destination_label
+                                    for label in confirmed["gmail_labels"]
+                                )
                             ):
                                 outcomes[uid] = TargetMutationOutcome(
                                     uid, "unknown", "destination-added-identity-unconfirmed"
                                 )
                                 break
+                            if source_role == "junk":
+                                if r"\SPAM" not in {label.upper() for label in confirmed["gmail_labels"]}:
+                                    outcomes[uid] = TargetMutationOutcome(uid, "succeeded")
+                                    continue
+                                # Reselecting invalidates assumptions about the old
+                                # source UID. Check its identity before removing Spam.
+                                source = (await self._gmail_metadata(imap, [uid]))[uid]
+                                if source["gmail_message_id"] != before["gmail_message_id"]:
+                                    outcomes[uid] = TargetMutationOutcome(
+                                        uid, "unknown", "destination-added-identity-unconfirmed"
+                                    )
+                                    break
                             if source_mailbox == destination_mailbox or source_role == dest_role == "inbox":
                                 outcomes[uid] = TargetMutationOutcome(uid, "succeeded")
                                 continue

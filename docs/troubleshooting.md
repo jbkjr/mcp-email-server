@@ -603,6 +603,13 @@ write already happened; do not automatically repeat it. A draft save with unknow
 completion must not be re-APPENDed. Check Drafts through an independently operated
 mail client before composing a replacement.
 
+Spam rescue checks the destination's X-GM-MSGID because Gmail can remove the
+source UID immediately after adding Inbox. Confirmation uses at most 10,000
+candidate Inbox UIDs, fetched five at a time, within the provider time limit.
+If the search exceeds that bound or the same identity and Inbox membership
+cannot be confirmed, the result remains unknown even if the message moved.
+Inspect current labels before taking further action.
+
 Use LIST flags rather than English folder names for localized Drafts/Trash. Draft
 discard refusals can reflect absent MOVE/UIDPLUS, changed UIDVALIDITY, an edited
 draft, another label alias, missing proxy provenance, or the proxy's disabled

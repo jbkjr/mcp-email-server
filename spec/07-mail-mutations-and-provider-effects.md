@@ -354,12 +354,22 @@ An account's explicit `gmail_imap` discriminator overrides the historical
 folder-copy mutation contracts below. Omission and `proton_bridge` MUST preserve
 them. No hostname or reply-markup setting selects dispatch.
 
-Gmail archive MUST remove only Inbox membership from INBOX. Organizing writes
+Gmail archive MUST remove only Inbox membership from INBOX. Its application
+workflow MUST bypass distinct-mailbox move validation, preserve INBOX as the
+archive outcome mailbox, and deduplicate projection invalidation. Organizing writes
 MUST be incremental label changes over at most 25 explicit unique UIDs. Moves
 MUST add the exact existing destination label/Inbox, confirm destination and the
 same decimal-string X-GM-MSGID at the selected mailbox UID, then remove only the
 source label. Trash/Drafts overlaps MUST be rejected; Spam allows only Inbox
-rescue. Label reads MUST use X-GM-LABELS rather than RFC Message-ID alias searches.
+rescue. Spam rescue MUST confirm the same X-GM-MSGID and Inbox membership in the
+destination because Gmail can immediately remove the source UID. It MUST use
+proxy-permitted standard SEARCH within the shared candidate bound and metadata
+FETCH groups of at most five; missing, oversized, failed, or ambiguous evidence
+MUST remain unknown without replaying the write. It MUST skip source removal
+only when the confirmed identity no longer carries Spam, otherwise reselect
+the source and revalidate its UID identity before removing Spam. System label
+membership comparisons MUST ignore case; user label comparisons MUST stay exact.
+Label reads MUST use X-GM-LABELS rather than RFC Message-ID alias searches.
 Special mailbox roles MUST come from unambiguous LIST flags.
 
 Draft APPEND MUST use one fresh ASCII Message-ID, one literal, exact Draft/Seen

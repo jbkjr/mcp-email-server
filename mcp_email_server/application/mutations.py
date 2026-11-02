@@ -1351,7 +1351,10 @@ class ArchiveService(_MutationWorkflow):
             source_mailbox=command.source_mailbox,
             destination_mailbox=archive_mailbox,
         )
-        move.validate()
+        # Gmail archive removes Inbox membership; its result names INBOX, not
+        # a distinct destination. Preserve move validation for other providers.
+        if account.gateway_provider != "gmail_imap":
+            move.validate()
         # Re-resolve selected-mode authority immediately before the move effect.
         access = self._providers.open(
             command.account_name,
@@ -1359,6 +1362,8 @@ class ArchiveService(_MutationWorkflow):
             purpose="incoming",
         )
         try:
+            if account.gateway_provider == "gmail_imap" and access.account.gateway_provider != "gmail_imap":
+                move.validate()
             operation = (
                 access.provider.archive_gmail(command, access.account)
                 if access.account.gateway_provider == "gmail_imap"

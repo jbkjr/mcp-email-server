@@ -259,8 +259,12 @@ possibility does not add placeholders or generic abstractions now.
 The explicit Gmail dispatch gate requires `tests/test_gateway_gmail.py`: synthetic
 alias UIDs, decimal-string identity, existing user labels, localized Drafts/Trash,
 protected overlap, partial two-step move, changed identity/epoch, edited draft,
-lost completion, and missing MOVE/UIDPLUS. With MCP_EMAIL_TEST_PROXY pointing to
-the reviewed gateway imap_proxy.py, the real Session class MUST admit worker wire
+lost completion, and missing MOVE/UIDPLUS. Archive service dispatch and deduplicated
+invalidation MUST be covered alongside Spam rescue with immediate source-UID
+removal, destination identity/membership confirmation, system-label casing,
+bounded reads, failure without replay, and restored source selection. With
+MCP_EMAIL_TEST_PROXY pointing to the reviewed gateway imap_proxy.py, the real
+Session class MUST admit worker wire
 commands and enforce draft provenance against an in-memory upstream. Socket-level
 and live draft-recoverability smoke remain separate deployment gates. Package
 gateway_gmail_contract.json only after these worker checks pass; it is a versioned
