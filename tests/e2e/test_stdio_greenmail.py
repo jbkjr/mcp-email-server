@@ -2842,3 +2842,80 @@ async def test_protocol_primitives_over_stdio_against_greenmail(tmp_path: Path) 
                 },
             )
             _wait_for_message(BOB, "INBOX", f"smtp-{subject}")
+
+
+@pytest.mark.parametrize("save_to_sent", [False, True])
+async def test_reply_email_threads_from_source_headers_and_environment_sent_policy(
+    tmp_path: Path, save_to_sent: bool
+) -> None:
+    """Real stdio + SMTP/IMAP exercise the complete reply and Sent-policy composition."""
+    _wait_until_ready()
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Sent", "Drafts"])
+    _ensure_empty_mailboxes(BOB, ["INBOX"])
+    subject = f"reply-source-{uuid.uuid4().hex}"
+    parent = EmailMessage()
+    parent["From"] = BOB[0]
+    parent["To"] = ALICE[0]
+    parent["Subject"] = subject
+    parent["Message-ID"] = "<" + uuid.uuid4().hex + "A" * 33 + "@example.test>"
+    parent["References"] = "<root@example.test> <middle@example.test>"
+    parent.set_content("Synthetic original")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=5) as smtp:
+        smtp.login(*BOB)
+        smtp.send_message(parent)
+    original = _wait_for_message(ALICE, "INBOX", subject)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        CONFIG_TEMPLATE.replace("save_to_sent = true", f"save_to_sent = {str(save_to_sent).lower()}")
+    )
+    config_path.chmod(0o600)
+    server_env = {key: value for key, value in os.environ.items() if not key.startswith("MCP_EMAIL_SERVER_")}
+    server_env.update({
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config_path),
+        "MCP_EMAIL_SERVER_CREDENTIAL_STORAGE": "plaintext",
+        "MCP_EMAIL_SERVER_LOG_LEVEL": "WARNING",
+        "MCP_EMAIL_SERVER_ACCOUNT_NAME": "alice",
+        "MCP_EMAIL_SERVER_EMAIL_ADDRESS": ALICE[0],
+        "MCP_EMAIL_SERVER_PASSWORD": ALICE[1],
+        "MCP_EMAIL_SERVER_IMAP_HOST": IMAP_HOST,
+        "MCP_EMAIL_SERVER_IMAP_PORT": str(IMAP_PORT),
+        "MCP_EMAIL_SERVER_IMAP_SSL": "false",
+        "MCP_EMAIL_SERVER_SMTP_HOST": SMTP_HOST,
+        "MCP_EMAIL_SERVER_SMTP_PORT": str(SMTP_PORT),
+        "MCP_EMAIL_SERVER_SMTP_SSL": "false",
+    })
+    server = StdioServerParameters(
+        command=str(Path(sys.executable).with_name("mcp-email-server")),
+        args=["stdio"],
+        env=server_env,
+        cwd=Path.cwd(),
+    )
+    arguments = {
+        "account_name": "alice",
+        "source_mailbox": "INBOX",
+        "original_email_id": original.uid,
+        "recipients": [BOB[0]],
+        "reply_mode": "reply",
+        "body": "Synthetic reply",
+    }
+    async with stdio_client(server) as (read, write):
+        async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=15)) as session:
+            await session.initialize()
+            rejected = await session.call_tool("reply_email", {**arguments, "original_email_id": "4294967295"})
+            assert rejected.isError
+            await _call_tool(session, "reply_email", {**arguments, "draft_mailbox": "Drafts"})
+            draft = _wait_for_message(ALICE, "Drafts", f"Re: {subject}")
+            assert _find_message(BOB, "INBOX", f"Re: {subject}") is None
+            await _call_tool(session, "reply_email", arguments)
+    delivered = _wait_for_message(BOB, "INBOX", f"Re: {subject}")
+    for observed in (draft, delivered):
+        for name, value in observed.message.raw_items():
+            if name.lower() in {"in-reply-to", "references"}:
+                assert "=?" not in value
+        assert str(observed.message["In-Reply-To"]) == str(parent["Message-ID"])
+        assert str(observed.message["References"]).split() == [*str(parent["References"]).split(), parent["Message-ID"]]
+    saved = _find_message(ALICE, "Sent", f"Re: {subject}")
+    assert (saved is not None) is save_to_sent
+    if saved is not None:
+        for name in ("Message-ID", "In-Reply-To", "References"):
+            assert str(saved.message[name]).split() == str(delivered.message[name]).split()
