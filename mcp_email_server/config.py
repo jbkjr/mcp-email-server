@@ -405,6 +405,11 @@ class AccountAttributes(BaseModel):
         return self.model_copy()
 
 
+def effective_save_to_sent(stored: bool = True) -> bool:
+    """Explicit environment policy wins; omission inherits the matching account."""
+    return _parse_bool_env(os.getenv("MCP_EMAIL_SERVER_SAVE_TO_SENT"), stored)
+
+
 class EmailSettings(AccountAttributes):
     full_name: str
     email_address: str
@@ -540,7 +545,7 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_SMTP_SSL (default: true)
         - MCP_EMAIL_SERVER_SMTP_START_SSL (default: false)
         - MCP_EMAIL_SERVER_SMTP_VERIFY_SSL (default: true)
-        - MCP_EMAIL_SERVER_SAVE_TO_SENT (default: true)
+        - MCP_EMAIL_SERVER_SAVE_TO_SENT (standalone default: true; Settings inherits matching TOML policy)
         - MCP_EMAIL_SERVER_SENT_FOLDER_NAME (default: auto-detect)
         - MCP_EMAIL_SERVER_EMAIL_SERVICE (default: auto-detect from the IMAP host)
         - MCP_EMAIL_SERVER_SMTP_USER_AGENT (default: mcp-email-server; empty omits the header)
@@ -750,6 +755,12 @@ class Settings(BaseSettings):
                 break
 
         if existing_account is not None:
+            # Environment credentials replace endpoints, but omitted Sent-copy
+            # policy must not silently enable a second copy on auto-saving servers.
+            stored = self.emails[existing_account]
+            env_email.save_to_sent = effective_save_to_sent(stored.save_to_sent)
+            if "MCP_EMAIL_SERVER_SENT_FOLDER_NAME" not in os.environ:
+                env_email.sent_folder_name = stored.sent_folder_name
             self.emails[existing_account] = env_email
             logger.info(f"Overriding email account '{env_email.account_name}' with environment variables")
         else:

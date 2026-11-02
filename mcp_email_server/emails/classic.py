@@ -13,15 +13,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email import encoders
 from email.header import Header
-from email.headerregistry import Address, AddressHeader
+from email.headerregistry import Address, AddressHeader, BaseHeader, HeaderRegistry, UnstructuredHeader
 from email.message import EmailMessage, Message
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
-from email.policy import SMTP as SMTP_POLICY
-from email.policy import SMTPUTF8 as SMTPUTF8_POLICY
-from email.policy import compat32, default
+from email.policy import SMTP, SMTPUTF8, Policy, compat32, default
 from html import escape as html_escape
 from itertools import pairwise
 from pathlib import Path
@@ -63,6 +61,7 @@ from mcp_email_server.application.mutations import (
     MailboxCreationStatus,
     MutableEmailFlag,
     MutationStatus,
+    ReplySource,
     SentCopyMutationOutcome,
     TargetMutationOutcome,
     normalize_thread_message_ids,
@@ -113,6 +112,31 @@ MAX_RAW_EMAIL_BYTES = MAX_TOTAL_ATTACHMENT_BYTES
 FORWARD_SOURCE_BODY_WINDOW = APPLICATION_LIMITS.body_bytes + 1
 SmtpDataTransport = Literal["7bit", "8bit", "binary", "invalid"]
 _HIGH_BIT_OCTET = re.compile(rb"[\x80-\xff]")
+
+
+class _ThreadIDHeader(UnstructuredHeader, BaseHeader):
+    """Fold a Message-ID list between whole identifiers.
+
+    CPython 3.11 and 3.12 refold an identifier of about 78 characters or more into
+    RFC 2047 encoded words, which receivers read as a different identifier.
+    """
+
+    def fold(self, *, policy: Policy) -> str:
+        first, *rest = str(self).split() or [""]
+        lines = [f"{self.name}: {first}"]
+        for token in rest:
+            if len(lines[-1]) + 1 + len(token) <= (policy.max_line_length or 78):
+                lines[-1] += f" {token}"
+            else:
+                lines.append(f" {token}")
+        return policy.linesep.join(lines) + policy.linesep
+
+
+_THREAD_HEADER_FACTORY = HeaderRegistry()
+_THREAD_HEADER_FACTORY.map_to_type("in-reply-to", _ThreadIDHeader)
+_THREAD_HEADER_FACTORY.map_to_type("references", _ThreadIDHeader)
+SMTP_POLICY = SMTP.clone(header_factory=_THREAD_HEADER_FACTORY)
+SMTPUTF8_POLICY = SMTPUTF8.clone(header_factory=_THREAD_HEADER_FACTORY)
 
 
 def _addresses_for_header(message: Message, field_name: str) -> list[Address]:
@@ -3067,6 +3091,56 @@ class EmailClient:
             "size": len(content),
             "saved_path": str(save_file.resolve()),
         }
+
+    async def fetch_reply_source(
+        self,
+        email_id: str,
+        mailbox: str,
+        allowed_senders: list[str] | None = None,
+    ) -> ReplySource:
+        """Read one message's raw threading headers by UID without setting Seen.
+
+        A blocked sender fails identically to a missing UID, and is checked before
+        any header is read. Fixed-shape errors keep header text out of the result.
+        """
+        validate_imap_uid(email_id)
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            select_response = await imap.select(_quote_mailbox(mailbox))
+            _raise_for_imap_error(select_response, f"SELECT mailbox {mailbox}")
+            await self._enforce_sender_allowlist(imap, email_id, allowed_senders)
+            response = await imap.uid("fetch", email_id, f"BODY.PEEK[HEADER]<0.{MAX_METADATA_HEADER_BYTES + 1}>")
+            _raise_for_imap_command_failure(response, "FETCH reply source headers")
+            blocks = list(_iter_fetched_header_blocks(response[1]))
+            if len(blocks) != 1 or blocks[0][0] != email_id:
+                raise ValueError("Reply source could not be resolved")
+            raw = blocks[0][1]
+            # A response shorter than the requested sentinel is complete. Some servers
+            # omit the header/body separator, so require only a complete final line.
+            if not raw or len(raw) > MAX_METADATA_HEADER_BYTES or not raw.endswith(b"\n"):
+                raise ValueError("Reply source headers are incomplete or oversized")
+            headers = BytesParser(policy=default).parsebytes(raw, headersonly=True)
+            if headers.defects:
+                raise ValueError("Reply source headers are malformed")
+            for name in ("From", "Message-ID", "References", "In-Reply-To", "Subject"):
+                values = headers.get_all(name, [])
+                if len(values) > 1 or any(value.defects for value in values):
+                    raise ValueError("Reply source headers are ambiguous or malformed")
+            return ReplySource(
+                message_id=str(headers.get("Message-ID", "")),
+                references=str(headers["References"]) if "References" in headers else None,
+                in_reply_to=str(headers["In-Reply-To"]) if "In-Reply-To" in headers else None,
+                # A folded Subject keeps its tab, which composing would refuse as a control character.
+                subject=re.sub(r"[\t\r\n]+", " ", str(headers.get("Subject", ""))),
+                sender=str(headers.get("From", "")),
+            )
+        finally:
+            try:
+                await imap.logout()
+            except Exception:
+                logger.info("IMAP logout failed")
 
     async def fetch_forward_source(
         self,

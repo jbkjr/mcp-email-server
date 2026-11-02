@@ -42,6 +42,7 @@ from mcp_email_server.application.mutations import (
     RecipientPolicyDeniedError,
     RemoveLabelCommand,
     RenameFolderCommand,
+    ReplyCommand,
     SaveDraftCommand,
     SaveToMailboxCommand,
     SendCommand,
@@ -108,6 +109,10 @@ async def send_email_command(command: SendCommand) -> SendMutationOutcome:
 
 async def forward_email_command(command: ForwardCommand) -> SendMutationOutcome:
     return await get_application_runtime().mutations.forward.execute(command)
+
+
+async def reply_email_command(command: ReplyCommand) -> SendMutationOutcome | AppendMutationOutcome:
+    return await get_application_runtime().mutations.reply.execute(command)
 
 
 async def save_to_mailbox_command(command: SaveToMailboxCommand) -> AppendMutationOutcome:
@@ -237,6 +242,16 @@ def _reported_message_id(outcome: SendMutationOutcome) -> str:
     records an empty identifier instead of one the server cannot vouch for.
     """
     return f". Message-Id: {outcome.message_id}" if outcome.message_id else ""
+
+
+def _append_result(outcome: AppendMutationOutcome, mailbox: str) -> str:
+    """One owner for save_to_mailbox and reply draft reporting."""
+    if outcome.status == "succeeded" and not outcome.reconciliation_needed:
+        email_id = outcome.uid or "unknown"
+        return f"Email saved to '{mailbox}' successfully. Message-Id: {outcome.message_id}, email_id: {email_id}"
+    detail = f" ({outcome.detail})" if outcome.detail in _PUBLIC_APPEND_DETAILS else ""
+    warning = "; warning: reconciliation needed" if outcome.reconciliation_needed else ""
+    return f"Email save [{outcome.status}{detail}: {mailbox}; Message-Id: {outcome.message_id}{warning}]"
 
 
 def _tagged_send_result(outcome: SendMutationOutcome) -> str:
@@ -875,6 +890,112 @@ async def forward_email(
 
 
 @mcp.tool(
+    description=(
+        "Reply to a message identified by its mailbox and UID. The source's raw headers are read over IMAP first: "
+        "In-Reply-To and References are derived from them and the subject gains 'Re:' without stacking a second "
+        "prefix. If the source cannot be read or its headers are missing, malformed, or ambiguous, the call fails "
+        "before any SMTP or APPEND effect, so a reply is never sent unthreaded. Recipients are exactly the ones "
+        "supplied; the source's To and Cc are never added. reply_mode is required: reply permits one recipient and "
+        "no cc, and reply-all permits several. The body is written in Markdown unless html=true; the source's body "
+        "and attachments are not copied. Set draft_mailbox to save the threaded message there instead of sending. "
+        "Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the "
+        "independent Sent-copy outcome separately; ambiguous effects are not retried automatically. The response "
+        "names the delivered message's RFC Message-Id once the provider accepts the message data."
+    ),
+    annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
+)
+async def reply_email(
+    account_name: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.account_name_bytes,
+            description="The name of the email account to reply from.",
+        ),
+    ],
+    source_mailbox: Annotated[
+        str,
+        Field(max_length=APPLICATION_LIMITS.mailbox_bytes, description="The mailbox that contains the source message."),
+    ],
+    original_email_id: Annotated[UidInput, Field(description="UID of the source message in source_mailbox.")],
+    recipients: Annotated[
+        list[AddressInput],
+        Field(
+            min_length=1,
+            max_length=APPLICATION_LIMITS.recipients,
+            description="Every intended recipient, supplied explicitly.",
+        ),
+    ],
+    body: Annotated[
+        str,
+        Field(
+            max_length=APPLICATION_LIMITS.body_bytes,
+            description="The reply body, written in Markdown. It is rendered to email-safe HTML automatically.",
+        ),
+    ],
+    reply_mode: Annotated[
+        Literal["reply", "reply-all"],
+        Field(description="Explicit choice: reply permits one recipient and no cc; reply-all permits several."),
+    ],
+    cc: Annotated[
+        list[AddressInput] | None,
+        Field(default=None, max_length=APPLICATION_LIMITS.recipients, description="A list of CC email addresses."),
+    ] = None,
+    attachments: Annotated[
+        list[AttachmentPathInput] | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.attachments,
+            description="A list of file paths to attach. Relative paths are resolved against the server process working directory; absolute paths are recommended.",
+        ),
+    ] = None,
+    html: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Set True only when body is already pre-formatted raw HTML, which suppresses Markdown rendering.",
+        ),
+    ] = False,
+    draft_mailbox: Annotated[
+        str | None,
+        Field(
+            default=None,
+            max_length=APPLICATION_LIMITS.mailbox_bytes,
+            description="Save the threaded message to this IMAP folder instead of sending it.",
+        ),
+    ] = None,
+) -> str:
+    try:
+        outcome = await reply_email_command(
+            ReplyCommand(
+                account_name=account_name,
+                recipients=tuple(recipients),
+                subject="",
+                body=body,
+                cc=tuple(cc or ()),
+                html=html,
+                attachments=tuple(attachments or ()),
+                source_email_id=original_email_id,
+                source_mailbox=source_mailbox,
+                reply_mode=reply_mode,
+                draft_mailbox=draft_mailbox,
+            )
+        )
+    except RecipientPolicyDeniedError as exc:
+        raise ValueError(
+            "Recipient(s) not in allowlist; configure allowed recipients through the user-operated CLI/UI "
+            "before sending or saving."
+        ) from exc
+    if isinstance(outcome, AppendMutationOutcome):
+        return _append_result(outcome, draft_mailbox or "")
+    if _send_outcome_is_clean(outcome):
+        attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
+        return (
+            f"Email reply sent successfully to {', '.join(recipients)}{attachment_info}{_reported_message_id(outcome)}"
+        )
+    return f"Email reply [{_tagged_send_result(outcome)}]"
+
+
+@mcp.tool(
     description="Compose an email and save it to an IMAP folder (e.g., Drafts). "
     "Shares recipient, body, attachment, and threading parameters with send_email; "
     "adds mailbox and flags, and does not support reply_to. "
@@ -976,12 +1097,7 @@ async def save_to_mailbox(
             "Recipient(s) not in allowlist; configure allowed recipients through the user-operated CLI/UI "
             "before sending or saving."
         ) from exc
-    if outcome.status == "succeeded" and not outcome.reconciliation_needed:
-        email_id = outcome.uid or "unknown"
-        return f"Email saved to '{mailbox}' successfully. Message-Id: {outcome.message_id}, email_id: {email_id}"
-    detail = f" ({outcome.detail})" if outcome.detail in _PUBLIC_APPEND_DETAILS else ""
-    warning = "; warning: reconciliation needed" if outcome.reconciliation_needed else ""
-    return f"Email save [{outcome.status}{detail}: {mailbox}; Message-Id: {outcome.message_id}{warning}]"
+    return _append_result(outcome, mailbox)
 
 
 @mcp.tool(

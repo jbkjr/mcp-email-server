@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 import aiosmtplib
@@ -49,6 +50,7 @@ from mcp_email_server.config import (
     Settings,
     compose_legacy_policy_environment,
     delete_settings,
+    effective_save_to_sent,
     get_settings,
 )
 from mcp_email_server.emails.classic import ClassicEmailHandler, ImapAuthenticationError
@@ -405,6 +407,15 @@ class LocalManagementBackend:
             return tuple(accounts)
         for index, account in enumerate(accounts):
             if account.name == environment_account.name:
+                environment_account = replace(
+                    environment_account,
+                    save_to_sent=effective_save_to_sent(account.save_to_sent),
+                    sent_folder_name=(
+                        environment_account.sent_folder_name
+                        if "MCP_EMAIL_SERVER_SENT_FOLDER_NAME" in os.environ
+                        else account.sent_folder_name
+                    ),
+                )
                 accounts[index] = environment_account
                 return tuple(accounts)
         return (environment_account, *accounts)
