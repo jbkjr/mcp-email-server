@@ -128,7 +128,8 @@ Execution additionally requires current compatible effective policy:
 - IMAP: an incoming endpoint, organize/delete/append grants, no sender allowlist,
   and attachment-content access enabled.
 - SMTP: an outgoing endpoint, send grant, and an explicit universal `*` recipient
-  pattern. An empty recipient allowlist denies rather than allows sending.
+  pattern. An empty recipient allowlist does not admit raw SMTP, although focused
+  tools treat it as unrestricted.
 
 An incompatible profile is rejected as a whole, even for an individually benign
 command. Never broaden settings automatically. Existing focused tools remain
@@ -244,19 +245,19 @@ Both are trimmed, lowercased, empty-filtered, and stably deduplicated; sender gl
 trimmed, lowercased, empty-filtered, and stably deduplicated. Managed updates and
 legacy composition use the same canonicalizers. The UI presents each allowed
 recipient and sender as an individual add/edit/remove item rather than a
-comma-separated field. Empty collections have deliberately different semantics:
-an empty allowed-recipient collection denies `send_email`, `forward_email`, and
-`save_to_mailbox` in both managed and legacy mode, while an empty allowed-sender
-collection does not restrict reading. Every To, CC, and BCC address requires an
+comma-separated field. Empty collections do not restrict in either direction: an
+unset or empty allowed-recipient collection leaves `send_email`, `forward_email`, and
+`save_to_mailbox` unrestricted in both managed and legacy mode (this fork reverts
+upstream #248), and `list_allowed_recipients` reports it as `*`. An empty allowed-sender
+collection does not restrict reading. With a non-empty list, every To, CC, and BCC address requires an
 case-insensitive whole-address glob match (`*`, `?`, and bracket expressions,
 as for sender policy). A literal `*` or `*@*` explicitly permits all valid
-recipients for all three operations, not just drafts; no implicit unrestricted
-mode exists. Patterns apply to the extracted address, never the display name.
-An initially empty recipient policy is rejected for recipient-bearing compose
-requests before opening a provider,
+recipients for all three operations, not just drafts. Patterns apply to the extracted
+address, never the display name. A non-empty policy rejects a non-matching recipient
+before opening a provider,
 including before a forward source is read. `save_draft` also permits an explicit
 recipientless draft: no To, CC, or BCC addresses means no recipient match is
-required, even with an empty allowlist. Any supplied recipient must match the
+required. Any recipient supplied under a non-empty policy must match the
 same policy; recipientless permission is not permission to send. Permissive changes do not bypass
 capability or input validation. Restrictive changes take effect on the next
 independent effect because authority is revalidated at operation boundaries.
@@ -450,8 +451,8 @@ SQL, raw provider responses, or reusable locators.
    rejects stale revisions with a bounded current summary; account and policy
    cardinality limits are enforced on both read and write boundaries, including
    the full 1,000-entry recipient and sender policy limit. Empty recipient policy
-   denies send, forward, and mailbox saves in both runtime modes, including
-   after policy is cleared between independent provider effects. Explicit glob
+   leaves send, forward, and mailbox saves unrestricted in both runtime modes. A
+   policy narrowed between independent provider effects applies to the next effect. Explicit glob
    authority works for all three operations without bypassing address validation;
    glob syntax survives managed updates, legacy TOML/environment, and import.
 4. Soft removal disables provider work and permanently reserves the normalized

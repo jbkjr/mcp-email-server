@@ -32,7 +32,7 @@ mcp-email-server-plugin
 `config update-policy --allowed-recipients` accepts comma-separated exact
 addresses or glob patterns. Quote patterns, for example `--allowed-recipients
 '*@example.com'`. `--allowed-recipients '*'` explicitly permits every recipient
-for sending, forwarding, and draft saves; an empty value denies all three.
+for sending, forwarding, and draft saves, as does an empty value.
 Supply the current `--expected-revision` from `config policy`.
 
 ### Mutation grants and draft destination

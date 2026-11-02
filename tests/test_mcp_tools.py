@@ -848,6 +848,13 @@ class TestMcpTools:
         assert result == ["alice@example.com", "bob@example.com"]
 
     @pytest.mark.asyncio
+    async def test_list_allowed_recipients_reports_empty_policy_as_unrestricted(self):
+        configuration = EffectiveConfiguration(accounts=(), allowed_recipients=(), allowed_senders=())
+        with patch("mcp_email_server.app.effective_configuration", return_value=configuration):
+            result = await list_allowed_recipients()
+        assert result == ["*"]
+
+    @pytest.mark.asyncio
     async def test_send_email_no_allowlist_allows_any_recipient(self):
         command_handler = AsyncMock(
             return_value=SendMutationOutcome(

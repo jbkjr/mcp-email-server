@@ -1162,11 +1162,11 @@ in `serverInfo.version`, not the MCP SDK dependency version. The tool list is
 static for the lifetime of a server process. `send_email`,
 `list_allowed_recipients`, `list_allowed_senders`, and `download_attachment` are
 always advertised. Account existence, enabled state, SMTP capability, and
-current policies are enforced when each tool is called. The allowlist tools have
-distinct empty semantics: an empty recipient list denies `send_email`,
-`forward_email`, and `save_to_mailbox`, while an empty sender list does not
-restrict reading. A recipientless `save_draft` remains permitted by `draft`;
-any supplied recipient requires a match. Recipient entries support case-insensitive, whole-address glob
+current policies are enforced when each tool is called. An unset or empty
+recipient list leaves `send_email`, `forward_email`, and `save_to_mailbox`
+unrestricted, and `list_allowed_recipients` reports it as `*`. An empty sender list
+does not restrict reading. A recipientless `save_draft` remains permitted by `draft`;
+under a non-empty list any supplied recipient requires a match. Recipient entries support case-insensitive, whole-address glob
 matching (`*`, `?`, and bracket expressions), such as `*@example.com`.
 `*` or `*@*` explicitly permits all valid recipients for sending, forwarding,
 and draft saves; this is not draft-only permission. Recipient denial errors

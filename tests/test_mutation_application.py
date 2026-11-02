@@ -106,7 +106,7 @@ def _services(
 @pytest.mark.parametrize(
     ("recipient", "allowed", "expected"),
     [
-        ("recipient@example.test", (), False),
+        ("recipient@example.test", (), True),
         ("recipient@example.test", ("recipient@example.test",), True),
         ("Recipient <RECIPIENT@Example.Test>", ("recipient@example.test",), True),
         ("other@example.test", ("recipient@example.test",), False),
@@ -121,7 +121,7 @@ def _services(
         ("", ("*",), False),
     ],
 )
-def test_recipient_policy_requires_explicit_pattern_match(
+def test_recipient_policy_matches_non_empty_lists_and_empty_is_unrestricted(
     recipient: str, allowed: tuple[str, ...], expected: bool
 ) -> None:
     assert mutations_module._recipient_policy_allows(recipient, allowed) is expected
@@ -132,31 +132,51 @@ def test_recipient_policy_requires_explicit_pattern_match(
 @pytest.mark.parametrize(
     "command",
     [
-        SendCommand("primary", ("recipient@example.test",), "Subject", "body"),
-        SaveToMailboxCommand("primary", ("recipient@example.test",), "Subject", "body"),
-        ForwardCommand("primary", ("recipient@example.test",), "", "", source_email_id="42"),
+        SendCommand("primary", ("anyone@example.test",), "Subject", "body"),
+        SaveToMailboxCommand("primary", ("anyone@example.test",), "Subject", "body"),
+        ForwardCommand("primary", ("anyone@example.test",), "", "", source_email_id="42"),
     ],
     ids=["send", "save", "forward"],
 )
-@pytest.mark.parametrize("stage", ["resolve", "open"])
-async def test_empty_recipient_policy_denies_before_provider_effect(
-    mode: str, command: SendCommand | SaveToMailboxCommand | ForwardCommand, stage: str
+async def test_empty_recipient_policy_is_unrestricted(
+    mode: str, command: SendCommand | SaveToMailboxCommand | ForwardCommand
 ) -> None:
-    account = _account(mode=mode, allowed_recipients=() if stage == "resolve" else ("recipient@example.test",))
-    provider = MagicMock()
-    services, _, factory, projection = _services(account=account, provider=provider)
-    factory.open.return_value = MutationProviderAccess(replace(account, allowed_recipients=()), provider)
+    """An unset or empty allowlist keeps the fork's behaviour from before upstream #248."""
+    account = _account(mode=mode, allowed_recipients=())
+    provider = _forward_provider(
+        delivery=DeliveryMutationOutcome((TargetMutationOutcome("anyone@example.test", "succeeded"),), object())
+    )
+    provider.send = provider.forward
+    provider.save_to_mailbox = AsyncMock(
+        return_value=AppendMutationOutcome("succeeded", "<id@example.test>", mailbox="Drafts")
+    )
+    services, _, _, _ = _services(account=account, provider=provider)
+
     if isinstance(command, ForwardCommand):
-        operation = services.forward.execute(command)
+        await services.forward.execute(command)
+        provider.forward.assert_awaited_once()
     elif isinstance(command, SaveToMailboxCommand):
-        operation = services.save_to_mailbox.execute(command)
+        await services.save_to_mailbox.execute(command)
+        provider.save_to_mailbox.assert_awaited_once()
     else:
-        operation = services.send.execute(command)
+        await services.send.execute(command)
+        provider.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recipient_policy_tightened_after_resolve_denies_before_provider_effect() -> None:
+    """An empty list at resolution doesn't outlive a restrictive list at the fresh check."""
+    provider = MagicMock()
+    account = _account(allowed_recipients=())
+    services, _, factory, projection = _services(account=account, provider=provider)
+    factory.open.return_value = MutationProviderAccess(
+        replace(account, allowed_recipients=("other@example.test",)), provider
+    )
 
     with pytest.raises(RecipientPolicyDeniedError):
-        await operation
+        await services.send.execute(SendCommand("primary", ("anyone@example.test",), "Subject", "body"))
 
-    assert factory.open.call_count == (0 if stage == "resolve" else 1)
+    factory.open.assert_called_once()
     assert provider.mock_calls == []
     projection.invalidate.assert_not_called()
 
@@ -1345,17 +1365,14 @@ async def test_forward_send_capability_loss_after_open_fails_before_retrieval() 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("allowed", [(), ("allowed@example.test",)])
-async def test_forward_recipient_policy_denial_before_delivery_fails_after_retrieval(
-    allowed: tuple[str, ...],
-) -> None:
+async def test_forward_recipient_policy_denial_before_delivery_fails_after_retrieval() -> None:
     provider = _forward_provider()
     services, _, factory, _ = _services(
         account=_account(allowed_recipients=("blocked@example.test",)), provider=provider
     )
     factory.open.side_effect = [
         factory.open.return_value,
-        MutationProviderAccess(_account(allowed_recipients=allowed), provider),
+        MutationProviderAccess(_account(allowed_recipients=("allowed@example.test",)), provider),
     ]
 
     with pytest.raises(RecipientPolicyDeniedError):

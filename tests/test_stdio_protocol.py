@@ -426,3 +426,62 @@ async def test_raw_stdio_eof_cancels_inflight_tool_and_cleans_runtime(tmp_path: 
     artifact = Path((tmp_path / "artifact-path").read_text(encoding="utf-8"))
     assert not artifact.exists()
     assert not artifact.parent.exists()
+
+
+@pytest.mark.parametrize(
+    ("policy_line", "expected"),
+    [
+        ("", "recipients unrestricted"),
+        ("allowed_recipients = []", "recipients unrestricted"),
+        ('allowed_recipients = ["*@example.test", "bob@example.test"]', "restricted to 2 pattern(s)"),
+    ],
+    ids=["unset", "empty", "non-empty"],
+)
+def test_stdio_startup_logs_recipient_policy_without_opening_the_keyring(
+    tmp_path: Path, policy_line: str, expected: str
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"""
+{policy_line}
+
+[[emails]]
+account_name = "synthetic"
+full_name = "Synthetic"
+email_address = "synthetic@example.test"
+created_at = "2026-01-01T00:00:00+00:00"
+updated_at = "2026-01-01T00:00:00+00:00"
+
+[emails.incoming]
+user_name = "synthetic"
+password = "__KEYRING__"
+host = "127.0.0.1"
+port = 1
+""".lstrip(),
+        encoding="utf-8",
+    )
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith(("MCP_EMAIL_SERVER_", "FASTMCP_"))
+    }
+    environment |= {
+        "HOME": str(tmp_path),
+        "MCP_EMAIL_SERVER_CONFIG_PATH": str(config),
+        # Any keyring access at startup would raise here instead of prompting.
+        "PYTHON_KEYRING_BACKEND": "keyring.backends.fail.Keyring",
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-c", "from mcp_email_server.cli import app; app()", "stdio"],
+        input=b"",
+        capture_output=True,
+        cwd=tmp_path,
+        env=environment,
+        timeout=30,
+        check=False,
+    )
+
+    stderr = completed.stderr.decode("utf-8")
+    assert completed.returncode == 0, stderr
+    assert completed.stdout == b""
+    assert expected in stderr
+    assert "@example.test" not in stderr

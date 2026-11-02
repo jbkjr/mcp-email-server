@@ -209,8 +209,8 @@ After restarting the client:
    account email address in `MAIL FROM`, and resets the transaction without
    `RCPT TO` or `DATA`; success does not prove final delivery. This CLI diagnostic
    remains available even though the Web UI has no Test connection action or
-   route. Add the intended address to the allowed-recipient policy first; an empty recipient collection
-   disables sending. `send_email` is always present in the static MCP tool
+   route. A non-empty allowed-recipient policy must include the intended address; an empty one
+   leaves sending unrestricted. `send_email` is always present in the static MCP tool
    catalog.
 
 If the account is listed but a mail operation fails, check the IMAP or SMTP

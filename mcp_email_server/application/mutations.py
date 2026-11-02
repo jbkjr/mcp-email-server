@@ -971,7 +971,7 @@ def _validate_optional_header(name: str, value: str | None) -> None:
 
 
 def _recipient_policy_allows(recipient: str, allowed: tuple[str, ...]) -> bool:
-    """Match explicit recipient glob authority; an empty allowlist denies all."""
+    """Match recipient glob authority; an unset or empty allowlist leaves recipients unrestricted."""
     # Re-parse the validated single-address value for normalized matching shared
     # by MCP and direct application callers. Input validation still applies to '*'.
     from email.utils import getaddresses
@@ -980,7 +980,7 @@ def _recipient_policy_allows(recipient: str, allowed: tuple[str, ...]) -> bool:
     from mcp_email_server.config import normalize_address
 
     if not allowed:
-        return False
+        return True
     addresses = [normalize_address(address) for _, address in getaddresses([recipient]) if address]
     return bool(addresses) and all(
         any(fnmatchcase(address, pattern.lower()) for pattern in allowed) for address in addresses

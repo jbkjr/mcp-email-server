@@ -320,7 +320,6 @@ def _snapshot(allowed_senders: tuple[str, ...] = ()) -> MutationAccountSnapshot:
         account_name="test",
         mode="legacy",
         allowed_senders=allowed_senders,
-        # An empty recipient allowlist denies every send (upstream #248).
         allowed_recipients=("alice@example.com",),
         report_blocked_mutations=False,
         can_send=True,

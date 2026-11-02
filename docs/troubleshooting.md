@@ -58,11 +58,10 @@ To/CC/BCC addresses are supplied, all must match the recipient allowlist.
 ## Recipient allowlist errors
 
 If sending or saving reports `Recipient(s) not in allowlist`, check that every
-To, CC, and BCC address matches an entry in `allowed_recipients`. An empty list
-blocks `send_email`, `forward_email`, and `save_to_mailbox`, even when SMTP or
-IMAP credentials work. Recipientless `save_draft` is permitted when the account
-has `draft`; supplied draft recipients still require a match. This applies in both managed and legacy mode. Earlier
-implementations incorrectly allowed any recipient for an empty list; see the
+To, CC, and BCC address matches an entry in `allowed_recipients`. An unset or empty
+list leaves `send_email`, `forward_email`, and `save_to_mailbox` unrestricted, so this
+error means the list is non-empty. Recipientless `save_draft` is permitted when the account
+has `draft`. This applies in both managed and legacy mode; see the
 [upgrade note](security.md#recipient-policy-upgrade-note).
 
 In managed mode, add the intended addresses or glob patterns in the Web UI policy panel, or run
@@ -73,8 +72,8 @@ mcp-email-server config update-policy --expected-revision <revision> --allowed-r
 ```
 
 This replaces the whole recipient list, so include any existing addresses that
-should remain allowed. Clearing the list disables these three operations; it
-never enables unrestricted sending. In legacy mode, configure `allowed_recipients`
+should remain allowed. Clearing the list makes these three operations
+unrestricted. In legacy mode, configure `allowed_recipients`
 in TOML or `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS` in the server environment and
 restart. An explicitly empty environment value overrides a non-empty TOML list.
 `list_allowed_recipients` shows the effective policy without exposing credentials.
@@ -83,7 +82,7 @@ For changing draft recipients, add `*@example.com` for an allowed domain, or
 explicitly use `*` (or `*@*`) for all valid recipients. For example, use
 `--allowed-recipients '*'` in the command above. Quote shell patterns. This also
 permits sending and forwarding to matching recipients; it is not a draft-only
-permission. Leaving the list empty is not an allow-all shortcut.
+permission.
 
 ## The server reports `Missing command`
 

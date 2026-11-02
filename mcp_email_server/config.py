@@ -1108,6 +1108,30 @@ class Settings(BaseSettings):
 _settings = None
 
 
+def describe_recipient_policy() -> str:
+    """Describe the recipient policy for the startup log without loading Settings.
+
+    Settings resolves keyring sentinels, and a server that hasn't been asked to do
+    anything yet shouldn't touch the keychain. The line carries a count, never an address.
+    """
+    try:
+        if process_bootstrap(CONFIG_PATH).mode == "managed":
+            return "Recipient policy: read from the managed catalog; an empty list there leaves recipients unrestricted"
+        override = os.getenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS")
+        if override is not None:
+            raw = override.split(",")
+        elif CONFIG_PATH.exists():
+            raw = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("allowed_recipients", [])
+        else:
+            raw = []
+        patterns = normalize_recipient_patterns(raw)
+    except Exception:  # A startup description must never stop the server starting.
+        return "Recipient policy: could not be read at startup; it is enforced on each send"
+    if not patterns:
+        return "Recipient policy: recipients unrestricted because allowed_recipients is unset or empty"
+    return f"Recipient policy: restricted to {len(patterns)} pattern(s) from allowed_recipients"
+
+
 def get_settings(reload: bool = False) -> Settings:
     global _settings
     if not _settings or reload:

@@ -111,8 +111,20 @@ async def test_recipientless_draft_only_uses_draft_and_fixed_target_flags():
     assert command.flags == (r"\Draft",)
     assert command.recipients == ()
     provider.find_drafts_mailbox.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_draft_recipients_must_match_a_non_empty_policy():
+    provider = MagicMock()
+    services, _, _, _ = _services(
+        account=_account(
+            allowed_mutations=("draft",), allowed_recipients=("allowed@example.test",), drafts_mailbox="My Drafts"
+        ),
+        provider=provider,
+    )
     with pytest.raises(PermissionError):
         await services.save_draft.execute(SaveDraftCommand("primary", ("blocked@example.test",), "subject", "body"))
+    assert provider.mock_calls == []
 
 
 @pytest.mark.asyncio
@@ -433,7 +445,7 @@ async def test_sent_copy_revalidates_recipients_without_append_grant(email_setti
     provider = ClassicMutationProvider(handler, fresh)
     message = MIMEText("body")
     message["To"] = "recipient@example.test"
-    fresh.return_value = replace(snapshot, allowed_recipients=())
+    fresh.return_value = replace(snapshot, allowed_recipients=("someone@elsewhere.test",))
     with pytest.raises(PermissionError):
         await provider.save_sent_copy(message, ())
     handler.incoming_client.append_to_sent_with_outcome.assert_not_awaited()

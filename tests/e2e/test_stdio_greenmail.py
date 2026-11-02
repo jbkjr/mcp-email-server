@@ -278,31 +278,27 @@ async def _call_tool(session: ClientSession, name: str, arguments: dict[str, Any
     return result.structuredContent
 
 
-async def _assert_empty_recipient_policy_blocks_compose(
+async def _assert_empty_recipient_policy_allows_compose(
     session: ClientSession, account_name: str, source_uid: str
 ) -> None:
-    assert (await _call_tool(session, "list_allowed_recipients", {}))["result"] == []
-    counts_before = (
-        _message_count(BOB, "INBOX"),
-        _message_count(ALICE, "Drafts"),
-        _message_count(ALICE, "INBOX"),
+    assert (await _call_tool(session, "list_allowed_recipients", {}))["result"] == ["*"]
+    send_subject = f"empty-policy-send-{uuid.uuid4().hex}"
+    await _call_tool(
+        session,
+        "send_email",
+        {"account_name": account_name, "recipients": [BOB[0]], "subject": send_subject, "body": "Synthetic body"},
     )
-    for tool_name, arguments in (
-        ("send_email", {"subject": "Denied send", "body": "Synthetic body"}),
-        ("forward_email", {"email_id": source_uid}),
-        ("save_to_mailbox", {"subject": "Denied draft", "body": "Synthetic body"}),
-    ):
-        result = await session.call_tool(
-            tool_name, arguments={"account_name": account_name, "recipients": [BOB[0]], **arguments}
-        )
-        assert result.isError is True
-        assert "An empty allowlist denies all recipients" in _text_content(result)
-        assert "CLI/UI" in _text_content(result)
-    assert (
-        _message_count(BOB, "INBOX"),
-        _message_count(ALICE, "Drafts"),
-        _message_count(ALICE, "INBOX"),
-    ) == counts_before
+    _wait_for_message(BOB, "INBOX", send_subject)
+    await _call_tool(
+        session, "forward_email", {"account_name": account_name, "recipients": [BOB[0]], "email_id": source_uid}
+    )
+    draft_subject = f"empty-policy-draft-{uuid.uuid4().hex}"
+    await _call_tool(
+        session,
+        "save_to_mailbox",
+        {"account_name": account_name, "recipients": [BOB[0]], "subject": draft_subject, "body": "Synthetic body"},
+    )
+    _wait_for_message(ALICE, "Drafts", draft_subject)
 
 
 async def _metadata_for_subject_in_mailbox(
@@ -455,9 +451,9 @@ async def test_managed_cli_setup_restart_and_stdio_list_mailboxes_against_greenm
                 assert connection.execute("SELECT completeness FROM index_coverage").fetchone()[0] == "COMPLETE"
 
             managed_uid = metadata["emails"][0]["email_id"]
-            await _assert_empty_recipient_policy_blocks_compose(session, "alice-managed", managed_uid)
+            await _assert_empty_recipient_policy_allows_compose(session, "alice-managed", managed_uid)
             # Policy changes must be visible in this same stdio session: default
-            # denial -> explicit permission -> clearing the last recipient.
+            # unrestricted -> explicit list -> clearing the last recipient.
             _update_recipient_policy(console_script, server_env, BOB[0])
             assert (await _call_tool(session, "list_allowed_recipients", {}))["result"] == [BOB[0]]
             allowed_subject = f"managed-allowed-{uuid.uuid4().hex}"
@@ -488,7 +484,7 @@ async def test_managed_cli_setup_restart_and_stdio_list_mailboxes_against_greenm
             )
             _wait_for_message(ALICE, "WildcardDrafts", wildcard_draft_subject)
             _update_recipient_policy(console_script, server_env, "")
-            await _assert_empty_recipient_policy_blocks_compose(session, "alice-managed", managed_uid)
+            await _assert_empty_recipient_policy_allows_compose(session, "alice-managed", managed_uid)
             _update_recipient_policy(console_script, server_env, BOB[0])
             mark = await _call_tool(
                 session,
@@ -1040,7 +1036,9 @@ async def test_metadata_index_paging_fallback_and_restart_reuse_against_greenmai
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("policy_source", ["unset", "empty-toml", "empty-env"])
-async def test_legacy_empty_recipient_policy_against_greenmail(tmp_path: Path, policy_source: str) -> None:
+async def test_legacy_empty_recipient_policy_is_unrestricted_against_greenmail(
+    tmp_path: Path, policy_source: str
+) -> None:
     _wait_until_ready()
     _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts"])
     _ensure_empty_mailboxes(BOB, ["INBOX"])
@@ -1073,7 +1071,7 @@ async def test_legacy_empty_recipient_policy_against_greenmail(tmp_path: Path, p
             await session.initialize()
             metadata = await _metadata_for_subject(session, "alice", subject)
             assert metadata["email_id"] == source.uid
-            await _assert_empty_recipient_policy_blocks_compose(session, "alice", source.uid)
+            await _assert_empty_recipient_policy_allows_compose(session, "alice", source.uid)
             assert r"\Seen" not in _wait_for_message(ALICE, "INBOX", subject).flags
 
 

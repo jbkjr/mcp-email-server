@@ -282,10 +282,9 @@ In legacy mode use `allowed_recipients = ["*"]` in TOML or
 apply equally to sending, forwarding, general saves, and any recipients supplied
 to `save_draft`, not just drafts.
 
-An empty recipient policy also denies `save_to_mailbox`; it is not just an SMTP
-switch. This applies in managed and legacy mode, including an omitted legacy
-setting or an explicit empty environment override. Older implementations
-incorrectly treated an empty list as unrestricted; see the
+An unset or empty recipient policy leaves sending, forwarding, and saves
+unrestricted. This applies in managed and legacy mode, including an omitted legacy
+setting or an explicit empty environment override; see the
 [recipient policy upgrade note](security.md#recipient-policy-upgrade-note).
 
 ## Mail mutation permissions
@@ -324,9 +323,9 @@ policy. Account overrides still replace the global list.
 
 `drafts_mailbox` names an existing mailbox exactly. If omitted, `save_draft`
 requires exactly one mailbox with the special-use `\Drafts` attribute; it does
-not guess a name or create a mailbox. `save_draft` permits a recipientless draft,
-including with an empty recipient allowlist. Every supplied To/CC/BCC address
-still requires a match. General `save_to_mailbox` continues to enforce its
+not guess a name or create a mailbox. `save_draft` permits a recipientless draft.
+Under a non-empty recipient allowlist, every supplied To/CC/BCC address requires
+a match. General `save_to_mailbox` continues to enforce its
 recipient policy and requires `append`, even when saving to a Drafts folder.
 
 Endpoint ports must be between 1 and 65535, and implicit TLS cannot be combined
@@ -819,7 +818,7 @@ an extra header into outgoing mail.
 | `credential_storage`         | `"auto"` | Select `auto`, `keyring`, or `plaintext` credential storage.                                         |
 | `enable_attachment_download` | `false`  | Allow `download_attachment` to write files.                                                          |
 | `enable_attachment_content`  | `false`  | Allow `get_attachment_content` to return attachment bytes through MCP.                               |
-| `allowed_recipients`         | `[]`     | Exact addresses or globs; `*` explicitly allows all; empty denies sending and recipient-bound saves. |
+| `allowed_recipients`         | `[]`     | Exact addresses or globs; `*` or an unset or empty list allows all.                                  |
 | `allowed_senders`            | `[]`     | Incoming `From` patterns; empty does not restrict reading.                                           |
 | `report_blocked_mutations`   | `false`  | Report blocked message IDs instead of returning privacy-preserving no-ops.                           |
 | `enable_folder_management`   | `false`  | Allow mailbox-shape mutations in legacy mode; always `false` in managed mode.                        |

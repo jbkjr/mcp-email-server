@@ -595,8 +595,8 @@ authorizes only that successful message's Sent copy, not general APPEND.
 created or guessed by these workflows; mailbox creation happens only through the
 explicit `create_mailbox` tool under `organize`. These restrictions need no approval tokens or extra ledger.
 
-A recipientless `save_draft` is valid even with an empty recipient allowlist.
-Every supplied To/CC/BCC address still requires a match before attachments are
+A recipientless `save_draft` is always valid.
+Under a non-empty recipient allowlist, every supplied To/CC/BCC address requires a match before attachments are
 read or the message is appended. This exception does not allow recipientless
 SMTP submission or unrestricted `save_to_mailbox`. Read-only grants block
 implicit mark-read too; read without marking instead. Sender constraints,
@@ -605,16 +605,12 @@ do not hide tools from the static MCP catalog.
 
 ### Recipient policy upgrade note
 
-Earlier implementations incorrectly permitted any recipient when this list was
-empty, despite the documented restriction and UI guidance. The fix for
-[#247](https://github.com/Wh1isper/mcp-email-server/issues/247) changes that
-behavior: an empty list now denies `send_email`, `forward_email`, and
-`save_to_mailbox`. This is a compatibility change in both managed and legacy
-mode. Before upgrading a workflow that relied on unrestricted recipients,
-configure its intended addresses or patterns explicitly. Use `"*"` only if you
-intend to allow every recipient for all three operations; there is no automatic
-unrestricted fallback. Existing entries containing glob syntax now act as
-patterns rather than literal addresses, so review them when upgrading. See
+Upstream [#247](https://github.com/Wh1isper/mcp-email-server/issues/247) made an
+empty list deny `send_email`, `forward_email`, and `save_to_mailbox`. This fork
+keeps the earlier behaviour: an unset or empty list leaves all three unrestricted,
+the server says so at startup, and `list_allowed_recipients` reports it as `*`. A
+non-empty list restricts recipients to its entries. Existing entries containing glob
+syntax act as patterns rather than literal addresses. See
 [recipient-policy troubleshooting](troubleshooting.md#recipient-allowlist-errors).
 
 ## Sender allowlist

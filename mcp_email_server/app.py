@@ -65,6 +65,7 @@ from mcp_email_server.application.reads import (
     ListLabelsQuery,
     ListMailboxesQuery,
 )
+from mcp_email_server.config import describe_recipient_policy
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     CreateMailboxResult,
@@ -74,6 +75,7 @@ from mcp_email_server.emails.models import (
     MailboxInfo,
 )
 from mcp_email_server.imap_keywords import ImapKeywordTag
+from mcp_email_server.log import logger
 from mcp_email_server.runtime import close_application_runtime, get_application_runtime
 
 MAX_IMAP_UID_CHARACTERS = len(str(APPLICATION_LIMITS.maximum_imap_uid))
@@ -261,6 +263,7 @@ def _tagged_send_result(outcome: SendMutationOutcome) -> str:
 
 @asynccontextmanager
 async def _application_lifespan(_server: FastMCP) -> AsyncIterator[dict[str, object]]:
+    logger.info(describe_recipient_policy())
     try:
         yield {}
     finally:
@@ -632,13 +635,14 @@ async def get_emails_content(
     description=(
         "List the configured recipient allowlist — the address patterns that send_email and forward_email are "
         "permitted to send to and save_to_mailbox is permitted to address. Matching is case-insensitive and "
-        "supports glob patterns such as *@example.com; * explicitly allows all recipients. An empty list "
-        "denies all recipients for these operations; configure patterns through the user-operated CLI/UI."
+        "supports glob patterns such as *@example.com; * allows all recipients. An unset or empty configured "
+        "list leaves recipients unrestricted and is reported here as *. A non-empty list restricts recipients "
+        "to its patterns; configure it through the user-operated CLI/UI."
     ),
     annotations=_READ_ONLY_LOCAL,
 )
 async def list_allowed_recipients() -> PolicyDiscoveryResult:
-    return list(effective_configuration().allowed_recipients)
+    return list(effective_configuration().allowed_recipients) or ["*"]
 
 
 @mcp.tool(
@@ -772,7 +776,7 @@ async def send_email(
     except RecipientPolicyDeniedError as exc:
         raise ValueError(
             "Recipient(s) not in allowlist; configure allowed recipients through the user-operated CLI/UI "
-            "before sending or saving. An empty allowlist denies all recipients."
+            "before sending or saving."
         ) from exc
     if _send_outcome_is_clean(outcome):
         recipient_str = ", ".join(recipients)
@@ -860,7 +864,7 @@ async def forward_email(
     except RecipientPolicyDeniedError as exc:
         raise ValueError(
             "Recipient(s) not in allowlist; configure allowed recipients through the user-operated CLI/UI "
-            "before sending or saving. An empty allowlist denies all recipients."
+            "before sending or saving."
         ) from exc
     if _send_outcome_is_clean(outcome):
         return f"Email forwarded successfully to {', '.join(recipients)}{_reported_message_id(outcome)}"
@@ -967,7 +971,7 @@ async def save_to_mailbox(
     except RecipientPolicyDeniedError as exc:
         raise ValueError(
             "Recipient(s) not in allowlist; configure allowed recipients through the user-operated CLI/UI "
-            "before sending or saving. An empty allowlist denies all recipients."
+            "before sending or saving."
         ) from exc
     if outcome.status == "succeeded" and not outcome.reconciliation_needed:
         email_id = outcome.uid or "unknown"
