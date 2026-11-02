@@ -261,8 +261,10 @@ alias UIDs, decimal-string identity, existing user labels, localized Drafts/Tras
 protected overlap, partial two-step move, changed identity/epoch, edited draft,
 lost completion, and missing MOVE/UIDPLUS. Archive service dispatch and deduplicated
 invalidation MUST be covered alongside Spam rescue with immediate source-UID
-removal, destination identity/membership confirmation, system-label casing,
-bounded reads, failure without replay, and restored source selection. With
+removal, a large Inbox with no SEARCH ALL, pre-write Message-ID retrieval,
+bounded HEADER search hits checked against X-GM-MSGID, missing Message-ID and
+same-Message-ID/different-X-GM-MSGID refusals, destination membership confirmation,
+system-label casing, failure without replay, and restored source selection. With
 MCP_EMAIL_TEST_PROXY pointing to the reviewed gateway imap_proxy.py, the real
 Session class MUST admit worker wire
 commands and enforce draft provenance against an in-memory upstream. Socket-level

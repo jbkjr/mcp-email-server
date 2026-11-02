@@ -181,6 +181,13 @@ class SpamRescueIMAP(FakeIMAP):
         self.labels = {r"\Spam", "keep"}
         self.auto_remove = auto_remove
         self.inbox_label = inbox_label
+        self.inbox_size = 20_001
+
+    async def uid_search(self, *criteria, charset=None):
+        if criteria == ("ALL",) and self.selected == "INBOX":
+            self.commands.append(("SEARCH", *criteria))
+            return "OK", [b" ".join(str(uid).encode() for uid in range(1, self.inbox_size + 1))]
+        return await super().uid_search(*criteria, charset=charset)
 
     def metadata(self, uid):
         labels = {label.upper() for label in self.labels}
@@ -284,6 +291,11 @@ async def test_spam_rescue_confirms_destination_identity_and_restores_selection(
     assert fake.labels == {inbox_label, "keep"}
     assert ("FETCH", "7", "(UID X-GM-MSGID X-GM-LABELS)") in fake.commands
     assert fake.selected == "Spam"
+    assert ("SEARCH", "HEADER", "Message-ID", '"<fixture@example.invalid>"') in fake.commands
+    assert ("SEARCH", "ALL") not in fake.commands
+    header_fetch = next(c for c in fake.commands if c[0] == "FETCH" and "HEADER.FIELDS (MESSAGE-ID)" in c[2])
+    assert header_fetch[1] == "13"
+    assert fake.commands.index(header_fetch) < next(i for i, c in enumerate(fake.commands) if c[0] == "STORE")
     writes = [c for c in fake.commands if c[0] == "STORE"]
     assert writes == [("STORE", "13", "+X-GM-LABELS", r"(\Inbox)")] + (
         [] if auto_remove else [("STORE", "13", "-X-GM-LABELS", r"(\Spam)")]
@@ -291,13 +303,13 @@ async def test_spam_rescue_confirms_destination_identity_and_restores_selection(
 
 
 @pytest.mark.asyncio
-async def test_spam_rescue_scans_destination_uids_in_proxy_sized_groups(monkeypatch):
+async def test_spam_rescue_checks_only_bounded_message_id_hits(monkeypatch):
     fake = SpamRescueIMAP()
-    fake.uid_search = AsyncMock(return_value=("OK", [b"1 2 3 4 5 7"]))
+    fake.uid_search = AsyncMock(return_value=("OK", [b"1 2 3 4 7"]))
     original = fake.metadata
 
     def metadata(uid):
-        if fake.selected == "INBOX" and uid in {"1", "2", "3", "4", "5"}:
+        if fake.selected == "INBOX" and uid in {"1", "2", "3", "4"}:
             return f"1 FETCH (UID {uid} X-GM-MSGID 55 X-GM-LABELS (\\INBOX))".encode()
         return original(uid)
 
@@ -308,27 +320,27 @@ async def test_spam_rescue_scans_destination_uids_in_proxy_sized_groups(monkeypa
 
     assert result.targets("succeeded") == ["13"]
     fetches = [c[1] for c in fake.commands if c[0] == "FETCH"]
-    assert fetches == ["13", "1,2,3,4,5", "7"]
+    assert fetches == ["13", "13", "1,2,3,4,7"]
+    fake.uid_search.assert_awaited_once_with("HEADER", "Message-ID", '"<fixture@example.invalid>"', charset=None)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    ["identity", "membership", "search", "oversized", "lost_store"],
+    ["same_message_id_different_gmail_id", "membership", "search", "no_hits", "oversized", "lost_store"],
 )
 async def test_spam_rescue_requires_real_evidence_and_never_replays(monkeypatch, failure):
-    import mcp_email_server.emails.classic as classic
-
     fake = SpamRescueIMAP()
-    if failure == "identity":
+    if failure == "same_message_id_different_gmail_id":
         fake.replace_identity = True
     elif failure == "membership":
         fake.inbox_label = "unrelated"
     elif failure == "search":
         fake.uid_search = AsyncMock(return_value=("NO", [b"rejected"]))
+    elif failure == "no_hits":
+        fake.uid_search = AsyncMock(return_value=("OK", [b""]))
     elif failure == "oversized":
-        monkeypatch.setattr(classic, "MAX_METADATA_CANDIDATES", 1)
-        fake.uid_search = AsyncMock(return_value=("OK", [b"7 8"]))
+        fake.uid_search = AsyncMock(return_value=("OK", [b"1 2 3 4 5 7"]))
     elif failure == "lost_store":
         fake.lose_store = True
     client = client_for(monkeypatch, fake)
@@ -339,6 +351,26 @@ async def test_spam_rescue_requires_real_evidence_and_never_replays(monkeypatch,
     assert result.outcomes[1].detail == "not-attempted"
     assert result.reconciliation_needed
     assert len([c for c in fake.commands if c[0] == "STORE"]) == 1
+    assert ("SEARCH", "ALL") not in fake.commands
+    if failure == "same_message_id_different_gmail_id":
+        assert ("SEARCH", "HEADER", "Message-ID", '"<fixture@example.invalid>"') in fake.commands
+    if failure == "oversized":
+        assert not any(c[0] == "FETCH" and c[1] != "13" for c in fake.commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", [b"", b"Message-ID: \r\n", b"Message-ID: <non-ascii-\xc3\xa9@example.invalid>\r\n"])
+async def test_spam_rescue_without_usable_message_id_stays_unknown_without_search(monkeypatch, header):
+    fake = SpamRescueIMAP()
+    fake.body = header + b"Subject: fixture\r\n\r\nbody\r\n"
+    client = client_for(monkeypatch, fake)
+
+    result = await client.move_emails_with_outcome(["13"], "Spam", "INBOX")
+
+    assert result.targets("unknown") == ["13"]
+    assert result.reconciliation_needed
+    assert not any(c[0] == "SEARCH" for c in fake.commands)
+    assert [c for c in fake.commands if c[0] == "STORE"] == [("STORE", "13", "+X-GM-LABELS", r"(\Inbox)")]
 
 
 @pytest.mark.asyncio
@@ -819,6 +851,8 @@ async def test_real_proxy_session_spam_rescue_after_source_disappears(monkeypatc
     assert proxy.fake.labels == {r"\INBOX", "keep"}
     writes = [wire for wire, _ in proxy.wire if " STORE " in wire]
     assert writes == [r"T UID STORE 13 +X-GM-LABELS (\Inbox)"]
-    assert ("T UID SEARCH ALL", None) in proxy.wire
+    assert ('T UID SEARCH HEADER Message-ID "<fixture@example.invalid>"', None) in proxy.wire
+    assert not any("SEARCH ALL" in wire for wire, _ in proxy.wire)
+    assert any("BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]" in wire for wire, _ in proxy.wire)
     assert not any(re.search(r"COPY|EXPUNGE|CLOSE|X-GM-RAW|ENABLE|\\Deleted", wire) for wire, _ in proxy.wire)
     proxy.server.appended_drafts.close()

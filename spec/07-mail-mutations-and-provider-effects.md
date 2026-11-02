@@ -363,8 +363,12 @@ same decimal-string X-GM-MSGID at the selected mailbox UID, then remove only the
 source label. Trash/Drafts overlaps MUST be rejected; Spam allows only Inbox
 rescue. Spam rescue MUST confirm the same X-GM-MSGID and Inbox membership in the
 destination because Gmail can immediately remove the source UID. It MUST use
-proxy-permitted standard SEARCH within the shared candidate bound and metadata
-FETCH groups of at most five; missing, oversized, failed, or ambiguous evidence
+proxy-permitted BODY.PEEK of the source MESSAGE-ID header before STORE, then
+UID SEARCH HEADER Message-ID with that safely quoted value in the destination.
+It MUST NOT issue SEARCH ALL or scan the whole Inbox. It MUST FETCH metadata
+for at most five search hits and accept only the original X-GM-MSGID with Inbox
+membership; an RFC Message-ID match alone MUST NOT prove identity. Missing or
+unusable Message-ID, no hits, more than five hits, failed, or ambiguous evidence
 MUST remain unknown without replaying the write. It MUST skip source removal
 only when the confirmed identity no longer carries Spam, otherwise reselect
 the source and revalidate its UID identity before removing Spam. System label

@@ -83,6 +83,7 @@ MAX_METADATA_HEADER_TOTAL_BYTES = APPLICATION_LIMITS.aggregate_header_bytes
 MAX_METADATA_HEADER_FETCH_UIDS = MAX_METADATA_HEADER_TOTAL_BYTES // (MAX_METADATA_HEADER_BYTES + 1)
 MAX_IMAP_UID = 2**32 - 1
 MAX_METADATA_UID_SEARCH_BYTES = MAX_METADATA_CANDIDATES * 11
+MAX_GMAIL_RESCUE_MATCHES = 5
 MAX_ATTACHMENT_BYTES = APPLICATION_LIMITS.attachment_bytes
 MAX_TOTAL_ATTACHMENT_BYTES = APPLICATION_LIMITS.total_attachment_bytes
 MAX_RAW_EMAIL_BYTES = MAX_TOTAL_ATTACHMENT_BYTES
@@ -3663,26 +3664,25 @@ class EmailClient:
         imap: Any,
         source_mailbox: str,
         destination_mailbox: str,
-        message_id: str,
+        gmail_message_id: str,
+        quoted_message_id: str | None,
     ) -> dict[str, Any] | None:
         """Find the same Gmail identity in Inbox using only proxy-permitted reads.
 
-        Adding Inbox can immediately remove the Spam UID. Search the destination
-        under the shared candidate bound, FETCH in groups of five, and compare
-        X-GM-MSGID rather than reusing a source UID or trusting a Message-ID.
+        Adding Inbox can immediately remove the Spam UID. Search only for the
+        source's previously read RFC Message-ID, FETCH at most five hits, and
+        compare X-GM-MSGID rather than trusting a Message-ID match alone.
         Restore the source selection before processing another source UID.
         """
+        if quoted_message_id is None:
+            return None
         selected = await imap.select(_quote_mailbox(destination_mailbox))
         _raise_for_imap_error(selected, "SELECT Gmail rescue destination")
-        response = await imap.uid_search("ALL", charset=None)
-        _raise_for_imap_error(response, "SEARCH Gmail rescue destination")
-        uids = _normalize_search_uids(response[1])
+        uids = await _search_message_id_uids(imap, quoted_message_id)
         confirmed = None
-        for start in range(0, len(uids), 5):
-            metadata = await self._gmail_metadata(imap, uids[start : start + 5])
-            confirmed = next((item for item in metadata.values() if item["gmail_message_id"] == message_id), None)
-            if confirmed is not None:
-                break
+        if len(uids) <= MAX_GMAIL_RESCUE_MATCHES:
+            metadata = await self._gmail_metadata(imap, uids)
+            confirmed = next((item for item in metadata.values() if item["gmail_message_id"] == gmail_message_id), None)
         selected = await imap.select(_quote_mailbox(source_mailbox))
         _raise_for_imap_error(selected, "SELECT Gmail rescue source")
         return confirmed
@@ -3756,6 +3756,12 @@ class EmailClient:
                         if protected and not (protected == {r"\SPAM"} and source_role == "junk"):
                             outcomes[uid] = TargetMutationOutcome(uid, "failed", "protected-label-overlap")
                             continue
+                        quoted_message_id = None
+                        if source_role == "junk":
+                            message_ids = await self._batch_fetch_message_ids(imap, [uid])
+                            # Missing/unusable headers cannot confirm a successful write.
+                            with suppress(ValueError):
+                                quoted_message_id = _quoted_imap_message_id(message_ids.get(uid, ""))
                         remove = operation in {"remove", "archive"}
                         detail = "label-store-unknown"
                         effect_started = True
@@ -3769,7 +3775,11 @@ class EmailClient:
                             detail = "destination-added-confirmation-unknown"
                             if source_role == "junk":
                                 confirmed = await self._gmail_spam_rescue_confirmation(
-                                    imap, source_mailbox, str(destination_mailbox), before["gmail_message_id"]
+                                    imap,
+                                    source_mailbox,
+                                    str(destination_mailbox),
+                                    before["gmail_message_id"],
+                                    quoted_message_id,
                                 )
                             else:
                                 confirmed = (await self._gmail_metadata(imap, [uid]))[uid]

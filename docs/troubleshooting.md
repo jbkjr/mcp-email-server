@@ -604,10 +604,12 @@ completion must not be re-APPENDed. Check Drafts through an independently operat
 mail client before composing a replacement.
 
 Spam rescue checks the destination's X-GM-MSGID because Gmail can remove the
-source UID immediately after adding Inbox. Confirmation uses at most 10,000
-candidate Inbox UIDs, fetched five at a time, within the provider time limit.
-If the search exceeds that bound or the same identity and Inbox membership
-cannot be confirmed, the result remains unknown even if the message moved.
+source UID immediately after adding Inbox. It reads the source RFC Message-ID
+before the write and searches Inbox for that header value, without scanning the
+whole Inbox. Confirmation checks at most five search hits for the original
+X-GM-MSGID and Inbox membership. A missing or unusable Message-ID, no hits, more
+than five hits, or unavailable identity evidence leaves the result unknown even
+if the message moved. Inbox size alone does not limit this lookup.
 Inspect current labels before taking further action.
 
 Use LIST flags rather than English folder names for localized Drafts/Trash. Draft

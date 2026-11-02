@@ -664,10 +664,12 @@ or expunge. It rejects unknown/system label targets, label creation, mailbox sha
 changes, and organizing messages that also carry Trash or Drafts labels. Spam
 permits only rescue to Inbox. Sender policy still applies.
 
-Spam rescue confirms the original X-GM-MSGID and Inbox membership through
-bounded destination reads, since adding Inbox can immediately remove the Spam
-UID. It skips the source-label STORE only when that identity's labels confirm
-Spam is absent; otherwise it reselects Spam and checks the source UID identity
+Spam rescue reads the source RFC Message-ID before the write, then searches the
+destination for that header value and checks at most five hits for the original
+X-GM-MSGID and Inbox membership. A Message-ID match alone never proves identity,
+and the worker never scans the whole Inbox. Adding Inbox can immediately remove
+the Spam UID. It skips the source-label STORE only when that identity's labels
+confirm Spam is absent; otherwise it reselects Spam and checks the source UID identity
 before removing the label. Unavailable confirmation remains unknown without
 retrying a write. System labels compare without case; user labels remain exact.
 

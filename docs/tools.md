@@ -858,10 +858,12 @@ Direct Gmail and Proton accounts retain the existing workflows and tool catalog.
   user label (or `\Inbox`), FETCH-confirms the same decimal-string X-GM-MSGID
   and destination membership, then removes only the source label. Spam can move
   only to Inbox. Gmail may remove Spam membership immediately when Inbox is
-  added. Rescue confirms the same X-GM-MSGID in Inbox using bounded SEARCH ALL
-  and metadata FETCH, and skips source removal only when that identity's labels
-  show Spam is absent. System labels such as `\Inbox`/`\INBOX` compare without
-  case; user labels retain exact case. Other user labels remain intact.
+  added. Rescue reads the source's RFC Message-ID before the write, searches
+  Inbox for that header value, and checks at most five hits for the same
+  X-GM-MSGID. It never scans the whole Inbox. Missing Message-ID or unavailable
+  confirmation remains unknown. It skips source removal only when that
+  identity's labels show Spam is absent. System labels such as `\Inbox`/`\INBOX`
+  compare without case; user labels retain exact case. Other user labels remain intact.
 - Apply/remove labels use exact existing user label names, without adding
   `Labels/`. `get_email_labels` reads X-GM-LABELS from the selected UID; it never
   searches RFC Message-ID aliases or reuses a UID in another mailbox.
