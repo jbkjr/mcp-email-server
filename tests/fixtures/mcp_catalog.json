@@ -1367,7 +1367,7 @@
         },
         {
             "name": "move_emails",
-            "description": "Move one or more emails between IMAP folders by email_id. Use list_emails_metadata and list_mailboxes first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried.",
+            "description": "Move one or more emails between IMAP folders by email_id. Use list_emails_metadata and list_mailboxes first. Gmail gateway accounts can restore from All Mail to INBOX without removing All Mail membership. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -1430,7 +1430,7 @@
         },
         {
             "name": "archive_emails",
-            "description": "Archive one or more emails by moving them to the account's Archive folder, auto-detected via the RFC 6154 \\Archive flag (falling back to common names like Archive or [Gmail]/All Mail). Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "description": "Archive one or more emails by moving them to the account's Archive folder, auto-detected via the RFC 6154 \\Archive flag (falling back to common names like Archive or [Gmail]/All Mail). Gmail gateway accounts instead remove the Inbox label, verified through All Mail. Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
             "inputSchema": {
                 "properties": {
                     "account_name": {

@@ -360,8 +360,27 @@ archive outcome mailbox, and deduplicate projection invalidation. Organizing wri
 MUST be incremental label changes over at most 25 explicit unique UIDs. Moves
 MUST add the exact existing destination label/Inbox, confirm destination and the
 same decimal-string X-GM-MSGID at the selected mailbox UID, then remove only the
-source label. Trash/Drafts overlaps MUST be rejected; Spam allows only Inbox
-rescue. Spam rescue MUST confirm the same X-GM-MSGID and Inbox membership in the
+source label. Archive, ordinary move source removal, and user-label removal MUST
+execute the removal in the unique LIST-resolved `\All` view, because removing
+the selected view's own label can answer OK without any effect. When crossing
+from another source view, the source RFC Message-ID MUST be read with BODY.PEEK
+before writing. A safely quoted UID SEARCH HEADER Message-ID in All Mail MUST
+yield at most five candidates; only one with
+the original X-GM-MSGID authorizes the All Mail UID. A missing usable Message-ID
+or unresolved identity MUST prevent the removal. After STORE, the same All Mail
+UID MUST be fetched again and its identity and label absence verified; a move
+MUST also retain confirmed destination membership. An OK response alone MUST NOT
+produce success. Existing user labels MUST be preserved except the requested
+removal. Unknown writes MUST NOT be replayed.
+
+For an already selected All Mail source, its own UID and fetched X-GM-MSGID
+provide the identity binding without a cross-view lookup.
+
+All Mail MUST be allowed as a move source only for INBOX restoration. This MUST
+add and confirm Inbox membership without removing All Mail membership, including
+messages with no user labels. A successful Gmail archive summary MUST describe
+Inbox-label removal, not a move to INBOX. Trash/Drafts overlaps MUST be rejected;
+Spam allows only Inbox rescue. Spam rescue MUST confirm the same X-GM-MSGID and Inbox membership in the
 destination because Gmail can immediately remove the source UID. It MUST use
 proxy-permitted BODY.PEEK of the source MESSAGE-ID header before STORE, then
 UID SEARCH HEADER Message-ID with that safely quoted value in the destination.
@@ -369,10 +388,12 @@ It MUST NOT issue SEARCH ALL or scan the whole Inbox. It MUST FETCH metadata
 for at most five search hits and accept only the original X-GM-MSGID with Inbox
 membership; an RFC Message-ID match alone MUST NOT prove identity. Missing or
 unusable Message-ID, no hits, more than five hits, failed, or ambiguous evidence
-MUST remain unknown without replaying the write. It MUST skip source removal
-only when the confirmed identity no longer carries Spam, otherwise reselect
-the source and revalidate its UID identity before removing Spam. System label
-membership comparisons MUST ignore case; user label comparisons MUST stay exact.
+MUST remain unknown without replaying the write. A matching fetched destination
+UID proves Inbox membership even though Gmail hides the selected view's label.
+Rescue MUST succeed only when Spam is absent. If Spam remains, the outcome MUST
+remain unknown without another STORE: selected-Spam removal can no-op and the
+proxy does not permit Spam removal from All Mail. System label membership
+comparisons MUST ignore case; user label comparisons MUST stay exact.
 Label reads MUST use X-GM-LABELS rather than RFC Message-ID alias searches.
 Special mailbox roles MUST come from unambiguous LIST flags.
 

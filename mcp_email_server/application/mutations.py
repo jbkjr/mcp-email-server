@@ -1332,6 +1332,7 @@ class MoveService(_MutationWorkflow):
 class ArchiveMutationOutcome:
     batch: BatchMutationOutcome
     archive_mailbox: str
+    gmail_archive: bool = False
 
 
 class ArchiveService(_MutationWorkflow):
@@ -1379,7 +1380,9 @@ class ArchiveService(_MutationWorkflow):
                     outcome.outcomes, reconciliation_needed=outcome.reconciliation_needed or not invalidated
                 )
             )
-        result = ArchiveMutationOutcome(outcome, archive_mailbox)
+        result = ArchiveMutationOutcome(
+            outcome, archive_mailbox, gmail_archive=access.account.gateway_provider == "gmail_imap"
+        )
         _validate_result_payload({
             "batch": {
                 "outcomes": [_outcome_payload(item) for item in outcome.outcomes],

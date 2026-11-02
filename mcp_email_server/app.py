@@ -956,7 +956,8 @@ async def mark_emails_as_read(
 @mcp.tool(
     description=(
         "Move one or more emails between IMAP folders by email_id. Use list_emails_metadata and list_mailboxes "
-        "first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried."
+        "first. Gmail gateway accounts can restore from All Mail to INBOX without removing All Mail membership. "
+        "Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried."
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1000,7 +1001,8 @@ async def move_emails(
 @mcp.tool(
     description="Archive one or more emails by moving them to the account's Archive folder, "
     "auto-detected via the RFC 6154 \\Archive flag (falling back to common names like Archive or "
-    "[Gmail]/All Mail). Use list_emails_metadata first. Partial or ambiguous effects report per-ID "
+    "[Gmail]/All Mail). Gmail gateway accounts instead remove the Inbox label, verified through All Mail. "
+    "Use list_emails_metadata first. Partial or ambiguous effects report per-ID "
     "succeeded/failed/unknown status and are not retried automatically.",
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1028,6 +1030,8 @@ async def archive_emails(
     outcome = await archive_emails_command(ArchiveCommand(account_name, tuple(email_ids), mailbox))
     succeeded = outcome.batch.targets("succeeded")
     if len(succeeded) == len(email_ids) and not outcome.batch.reconciliation_needed:
+        if outcome.gmail_archive:
+            return f"Successfully archived {len(succeeded)} email(s): removed the Inbox label"
         return f"Successfully archived {len(succeeded)} email(s) to {outcome.archive_mailbox}"
     return f"Archive result [{_tagged_batch_result(outcome.batch)}; mailbox: {outcome.archive_mailbox}]"
 

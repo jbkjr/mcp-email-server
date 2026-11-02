@@ -852,20 +852,28 @@ These rules apply only to explicitly configured `gmail_imap` gateway accounts.
 Direct Gmail and Proton accounts retain the existing workflows and tool catalog.
 
 - Archive accepts INBOX only and removes `\Inbox` with incremental
-  `-X-GM-LABELS`. It never transfers messages to an Archive/All Mail folder.
-  The internal archive outcome names INBOX and invalidates it once.
+  `-X-GM-LABELS` from the LIST-resolved `\All` view. It matches the original
+  X-GM-MSGID through an RFC Message-ID HEADER search, then re-fetches there to
+  confirm Inbox is absent. It never transfers messages to an Archive folder.
+  Success says the Inbox label was removed; user labels remain intact.
 - Move accepts at most 25 unique explicit UIDs. It adds the existing destination
   user label (or `\Inbox`), FETCH-confirms the same decimal-string X-GM-MSGID
-  and destination membership, then removes only the source label. Spam can move
-  only to Inbox. Gmail may remove Spam membership immediately when Inbox is
-  added. Rescue reads the source's RFC Message-ID before the write, searches
+  and destination membership, then removes only the source label from All Mail
+  and verifies its absence there. All Mail can be a source only for restoring
+  to INBOX: this adds Inbox and confirms it without removing All Mail membership.
+  Spam can move only to Inbox. Gmail may remove Spam membership immediately when
+  Inbox is added. Rescue reads the source's RFC Message-ID before the write, searches
   Inbox for that header value, and checks at most five hits for the same
   X-GM-MSGID. It never scans the whole Inbox. Missing Message-ID or unavailable
-  confirmation remains unknown. It skips source removal only when that
-  identity's labels show Spam is absent. System labels such as `\Inbox`/`\INBOX`
-  compare without case; user labels retain exact case. Other user labels remain intact.
+  confirmation remains unknown. Fetching the matching UID in Inbox proves Inbox
+  membership even though Gmail hides the selected view's label. Rescue succeeds
+  only when Spam is absent; retained Spam remains unknown without another STORE.
+  System labels such as `\Inbox`/`\INBOX` compare without case; user labels retain
+  exact case. Other user labels remain intact.
 - Apply/remove labels use exact existing user label names, without adding
-  `Labels/`. `get_email_labels` reads X-GM-LABELS from the selected UID; it never
+  `Labels/`. Removal uses the matched All Mail UID and verifies label absence,
+  including when the source is that label's own mailbox. `get_email_labels`
+  reads X-GM-LABELS from the selected UID; it never
   searches RFC Message-ID aliases or reuses a UID in another mailbox.
 - Save targets the exact LIST-discovered Drafts mailbox, with the default flags.
   Its internal append outcome preserves both APPENDUID UID and UIDVALIDITY.
@@ -880,6 +888,14 @@ Direct Gmail and Proton accounts retain the existing workflows and tool catalog.
   a `Successfully ...` summary and unresolved writes are not retried. Existing
   public summary/result schemas stay unchanged; Gmail identity evidence remains
   in the provider workflow rather than adding fields to the shared MCP catalog.
+
+All Mail identity lookups read the source RFC Message-ID before a write, use
+`UID SEARCH HEADER Message-ID`, and FETCH at most five hits, accepting only the
+original X-GM-MSGID. They never scan the whole mailbox or reuse a source UID in
+another view. A missing usable Message-ID or unresolved All Mail identity blocks
+a removal before its STORE; uncertainty after a destination was added remains
+an unknown partial move. Gmail can answer OK without removing the selected
+mailbox's own label, so an OK response alone never proves removal.
 
 ## Reply threading
 

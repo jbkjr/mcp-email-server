@@ -664,14 +664,25 @@ or expunge. It rejects unknown/system label targets, label creation, mailbox sha
 changes, and organizing messages that also carry Trash or Drafts labels. Spam
 permits only rescue to Inbox. Sender policy still applies.
 
+Gmail can hide the selected view's own label and answer OK without removing it.
+Archive, user-label removal, and ordinary moves therefore remove labels from the
+LIST-resolved All Mail view. A source RFC Message-ID HEADER search locates at most
+five candidates there; only the original X-GM-MSGID authorizes the removal UID.
+After STORE, the worker checks that identity again, verifies label absence, and
+for a move also verifies destination membership. A bare OK is insufficient.
+Restore from All Mail permits only adding Inbox, with identity and label
+confirmation; it never removes All Mail membership. User labels remain exact.
+
 Spam rescue reads the source RFC Message-ID before the write, then searches the
 destination for that header value and checks at most five hits for the original
-X-GM-MSGID and Inbox membership. A Message-ID match alone never proves identity,
+X-GM-MSGID. A fetched matching UID proves membership in the selected Inbox even
+when its own label is hidden. A Message-ID match alone never proves identity,
 and the worker never scans the whole Inbox. Adding Inbox can immediately remove
-the Spam UID. It skips the source-label STORE only when that identity's labels
-confirm Spam is absent; otherwise it reselects Spam and checks the source UID identity
-before removing the label. Unavailable confirmation remains unknown without
-retrying a write. System labels compare without case; user labels remain exact.
+the Spam UID. Rescue succeeds only when that identity's labels confirm Spam is
+absent. Retained Spam remains unknown: removing selected Spam can no-op, and the
+proxy forbids removing Spam from All Mail. Unavailable confirmation remains
+unknown without retrying a write. System labels compare without case; user labels
+remain exact.
 
 The sole MOVE is LIST-resolved Drafts to Trash, requiring MOVE and UIDPLUS.
 The gateway's IMAP policy proxy additionally owns durable draft provenance,

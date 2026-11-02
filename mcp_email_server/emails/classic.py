@@ -83,7 +83,7 @@ MAX_METADATA_HEADER_TOTAL_BYTES = APPLICATION_LIMITS.aggregate_header_bytes
 MAX_METADATA_HEADER_FETCH_UIDS = MAX_METADATA_HEADER_TOTAL_BYTES // (MAX_METADATA_HEADER_BYTES + 1)
 MAX_IMAP_UID = 2**32 - 1
 MAX_METADATA_UID_SEARCH_BYTES = MAX_METADATA_CANDIDATES * 11
-MAX_GMAIL_RESCUE_MATCHES = 5
+MAX_GMAIL_IDENTITY_MATCHES = 5
 MAX_ATTACHMENT_BYTES = APPLICATION_LIMITS.attachment_bytes
 MAX_TOTAL_ATTACHMENT_BYTES = APPLICATION_LIMITS.total_attachment_bytes
 MAX_RAW_EMAIL_BYTES = MAX_TOTAL_ATTACHMENT_BYTES
@@ -3676,16 +3676,127 @@ class EmailClient:
         """
         if quoted_message_id is None:
             return None
-        selected = await imap.select(_quote_mailbox(destination_mailbox))
-        _raise_for_imap_error(selected, "SELECT Gmail rescue destination")
-        uids = await _search_message_id_uids(imap, quoted_message_id)
-        confirmed = None
-        if len(uids) <= MAX_GMAIL_RESCUE_MATCHES:
-            metadata = await self._gmail_metadata(imap, uids)
-            confirmed = next((item for item in metadata.values() if item["gmail_message_id"] == gmail_message_id), None)
+        located = await self._gmail_locate_identity(imap, destination_mailbox, quoted_message_id, gmail_message_id)
         selected = await imap.select(_quote_mailbox(source_mailbox))
         _raise_for_imap_error(selected, "SELECT Gmail rescue source")
-        return confirmed
+        return located[1] if located is not None else None
+
+    async def _gmail_locate_identity(
+        self, imap: Any, mailbox: str, quoted_message_id: str, gmail_message_id: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Select a view and match one bounded HEADER hit by Gmail identity.
+
+        A successful UID FETCH also proves membership in the selected view,
+        whose own label Gmail omits from X-GM-LABELS. Leave that view selected.
+        """
+        selected = await imap.select(_quote_mailbox(mailbox))
+        _raise_for_imap_error(selected, "SELECT Gmail identity view")
+        uids = await _search_message_id_uids(imap, quoted_message_id)
+        if len(uids) > MAX_GMAIL_IDENTITY_MATCHES:
+            return None
+        metadata = await self._gmail_metadata(imap, uids)
+        matches = [(uid, item) for uid, item in metadata.items() if item["gmail_message_id"] == gmail_message_id]
+        return matches[0] if len(matches) == 1 else None
+
+    async def _gmail_organize_one(  # noqa: C901 - ordered evidence across two mailbox views
+        self,
+        imap: Any,
+        uid: str,
+        source_mailbox: str,
+        source_role: str,
+        destination_label: str,
+        operation: Literal["move", "add", "remove", "archive"],
+        before: dict[str, Any],
+        mailboxes: list[MailboxInfo],
+    ) -> TargetMutationOutcome:
+        """Remove labels from All Mail and confirm both identity and final labels.
+
+        Removing the selected view's own label can answer OK without an effect.
+        All Mail exposes Inbox and user labels, so it is the mutation and
+        confirmation view for these removals. Never replay an unresolved STORE.
+        """
+        effect_started = False
+        destination_added = False
+        detail = "identity-unavailable"
+        try:
+            all_mailbox = gmail.special_mailbox("all", mailboxes)
+            quoted_message_id = None
+            if source_role != "all":
+                message_ids = await self._batch_fetch_message_ids(imap, [uid])
+                try:
+                    quoted_message_id = _quoted_imap_message_id(message_ids.get(uid, ""))
+                except ValueError:
+                    return TargetMutationOutcome(uid, "failed", "message-id-unavailable")
+            identity = before["gmail_message_id"]
+            if operation == "move":
+                detail = "label-store-unknown"
+                effect_started = True
+                argument = (
+                    f"({destination_label})"
+                    if destination_label.startswith("\\")
+                    else f"({_quote_mailbox(destination_label)})"
+                )
+                response = await imap.uid("store", uid, "+X-GM-LABELS", argument)
+                status = _imap_effect_status(response)
+                if status != "succeeded":
+                    return TargetMutationOutcome(uid, status, "write-rejected" if status == "failed" else detail)
+                destination_added = True
+                detail = "destination-added-confirmation-unknown"
+                confirmed = (await self._gmail_metadata(imap, [uid]))[uid]
+                if confirmed["gmail_message_id"] != identity or not gmail.label_present(
+                    confirmed["gmail_labels"], destination_label
+                ):
+                    return TargetMutationOutcome(uid, "unknown", "destination-added-identity-unconfirmed")
+                # All Mail is a view, not a label to remove. Restore only adds Inbox.
+                if source_role == "all":
+                    return TargetMutationOutcome(uid, "succeeded")
+                removal_label = r"\Inbox" if source_role == "inbox" else source_mailbox
+            else:
+                removal_label = destination_label
+            if source_role == "all":
+                all_uid, current = uid, before
+            else:
+                if quoted_message_id is None:
+                    return TargetMutationOutcome(uid, "failed", "message-id-unavailable")
+                located = await self._gmail_locate_identity(imap, all_mailbox, quoted_message_id, identity)
+                if located is None:
+                    return TargetMutationOutcome(uid, "unknown" if effect_started else "failed", detail)
+                all_uid, current = located
+            if {label.upper() for label in current["gmail_labels"]} & {r"\TRASH", r"\DRAFTS", r"\DRAFT", r"\SPAM"}:
+                return TargetMutationOutcome(uid, "unknown" if effect_started else "failed", "protected-label-overlap")
+            if destination_added and not gmail.label_present(current["gmail_labels"], destination_label):
+                return TargetMutationOutcome(uid, "unknown", "destination-added-identity-unconfirmed")
+            argument = f"({removal_label})" if removal_label.startswith("\\") else f"({_quote_mailbox(removal_label)})"
+            detail = "destination-added-source-remove-unknown" if destination_added else "label-removal-unknown"
+            effect_started = True
+            response = await imap.uid("store", all_uid, "-X-GM-LABELS", argument)
+            status = _imap_effect_status(response)
+            if status != "succeeded":
+                return TargetMutationOutcome(
+                    uid,
+                    "unknown" if destination_added else status,
+                    "destination-added-source-retained"
+                    if destination_added and status == "failed"
+                    else "write-rejected"
+                    if status == "failed"
+                    else detail,
+                )
+            confirmed = (await self._gmail_metadata(imap, [all_uid]))[all_uid]
+            if confirmed["gmail_message_id"] != identity:
+                return TargetMutationOutcome(uid, "unknown", "label-removal-identity-unconfirmed")
+            if gmail.label_present(confirmed["gmail_labels"], removal_label):
+                return TargetMutationOutcome(
+                    uid,
+                    "unknown",
+                    "destination-added-source-retained" if destination_added else "label-removal-unconfirmed",
+                )
+            if destination_added and not gmail.label_present(confirmed["gmail_labels"], destination_label):
+                return TargetMutationOutcome(uid, "unknown", "destination-added-identity-unconfirmed")
+            return TargetMutationOutcome(uid, "succeeded")
+        except asyncio.CancelledError:
+            return TargetMutationOutcome(uid, "unknown" if effect_started else "failed", "provider-cancelled")
+        except Exception:
+            return TargetMutationOutcome(uid, "unknown" if effect_started else "failed", detail)
 
     async def _gmail_mutate(  # noqa: C901 - ordered per-UID evidence for two distinct effects
         self,
@@ -3726,9 +3837,11 @@ class EmailClient:
                 if operation in {"add", "remove"} and dest_role != "label":
                     raise ValueError("Gmail requires an exact existing user label")
                 if operation == "move" and (
-                    dest_role not in {"inbox", "label"} or source_role not in {"inbox", "label", "junk"}
+                    dest_role not in {"inbox", "label"} or source_role not in {"inbox", "label", "junk", "all"}
                 ):
                     raise ValueError("Unsupported Gmail move")
+                if operation == "move" and source_role == "all" and dest_role != "inbox":
+                    raise ValueError("Gmail All Mail permits restore to INBOX only")
                 if source_role == "junk" and not (operation == "move" and dest_role == "inbox"):
                     raise ValueError("Gmail Spam permits rescue to Inbox only")
                 destination_label = r"\Inbox" if dest_role == "inbox" else str(destination_mailbox)
@@ -3745,6 +3858,23 @@ class EmailClient:
                     before = (await self._gmail_metadata(imap, [uid]))[uid]
                     labels = {label.upper() for label in before["gmail_labels"]}
                     protected = labels & {r"\TRASH", r"\DRAFTS", r"\DRAFT", r"\SPAM"}
+                    if operation in {"archive", "remove"} or (
+                        operation == "move" and source_role not in {"junk", "drafts"}
+                    ):
+                        if protected:
+                            outcomes[uid] = TargetMutationOutcome(uid, "failed", "protected-label-overlap")
+                            continue
+                        outcomes[uid] = await self._gmail_organize_one(
+                            imap, uid, source_mailbox, source_role, destination_label, operation, before, mailboxes
+                        )
+                        if outcomes[uid].status == "unknown" or outcomes[uid].detail == "provider-cancelled":
+                            break
+                        try:
+                            selected = await imap.select(_quote_mailbox(source_mailbox))
+                            _raise_for_imap_error(selected, "SELECT Gmail source")
+                        except (asyncio.CancelledError, Exception):
+                            break  # Preserve proven effects; do not use another source UID.
+                        continue
                     if discard:
                         if labels != {r"\DRAFTS"}:
                             outcomes[uid] = TargetMutationOutcome(uid, "failed", "protected-label-overlap")
@@ -3762,7 +3892,6 @@ class EmailClient:
                             # Missing/unusable headers cannot confirm a successful write.
                             with suppress(ValueError):
                                 quoted_message_id = _quoted_imap_message_id(message_ids.get(uid, ""))
-                        remove = operation in {"remove", "archive"}
                         detail = "label-store-unknown"
                         effect_started = True
                         label_arg = (
@@ -3770,61 +3899,32 @@ class EmailClient:
                             if destination_label.startswith("\\")
                             else f"({_quote_mailbox(destination_label)})"
                         )
-                        response = await imap.uid("store", uid, "-X-GM-LABELS" if remove else "+X-GM-LABELS", label_arg)
+                        response = await imap.uid("store", uid, "+X-GM-LABELS", label_arg)
                         if _imap_effect_status(response) == "succeeded" and operation == "move":
                             detail = "destination-added-confirmation-unknown"
-                            if source_role == "junk":
-                                confirmed = await self._gmail_spam_rescue_confirmation(
-                                    imap,
-                                    source_mailbox,
-                                    str(destination_mailbox),
-                                    before["gmail_message_id"],
-                                    quoted_message_id,
-                                )
-                            else:
-                                confirmed = (await self._gmail_metadata(imap, [uid]))[uid]
-                            if (
-                                confirmed is None
-                                or before["gmail_message_id"] != confirmed["gmail_message_id"]
-                                or not any(
-                                    label.casefold() == destination_label.casefold()
-                                    if destination_label.startswith("\\")
-                                    else label == destination_label
-                                    for label in confirmed["gmail_labels"]
-                                )
-                            ):
+                            # Only Spam rescue remains here. Fetching a matching
+                            # destination UID proves Inbox membership even though
+                            # the selected Inbox label itself is hidden.
+                            confirmed = await self._gmail_spam_rescue_confirmation(
+                                imap,
+                                source_mailbox,
+                                str(destination_mailbox),
+                                before["gmail_message_id"],
+                                quoted_message_id,
+                            )
+                            if confirmed is None:
                                 outcomes[uid] = TargetMutationOutcome(
                                     uid, "unknown", "destination-added-identity-unconfirmed"
                                 )
                                 break
-                            if source_role == "junk":
-                                if r"\SPAM" not in {label.upper() for label in confirmed["gmail_labels"]}:
-                                    outcomes[uid] = TargetMutationOutcome(uid, "succeeded")
-                                    continue
-                                # Reselecting invalidates assumptions about the old
-                                # source UID. Check its identity before removing Spam.
-                                source = (await self._gmail_metadata(imap, [uid]))[uid]
-                                if source["gmail_message_id"] != before["gmail_message_id"]:
-                                    outcomes[uid] = TargetMutationOutcome(
-                                        uid, "unknown", "destination-added-identity-unconfirmed"
-                                    )
-                                    break
-                            if source_mailbox == destination_mailbox or source_role == dest_role == "inbox":
+                            if not gmail.label_present(confirmed["gmail_labels"], r"\Spam"):
                                 outcomes[uid] = TargetMutationOutcome(uid, "succeeded")
                                 continue
-                            source_label = {"inbox": r"\Inbox", "junk": r"\Spam"}.get(source_role, source_mailbox)
-                            source_arg = (
-                                f"({source_label})"
-                                if source_label.startswith("\\")
-                                else f"({_quote_mailbox(source_label)})"
-                            )
-                            detail = "destination-added-source-remove-unknown"
-                            response = await imap.uid("store", uid, "-X-GM-LABELS", source_arg)
-                            if _imap_effect_status(response) == "failed":
-                                outcomes[uid] = TargetMutationOutcome(
-                                    uid, "unknown", "destination-added-source-retained"
-                                )
-                                continue
+                            # Removing selected Spam can no-op too. The proxy
+                            # forbids -Spam from All Mail, so retain uncertainty
+                            # rather than issuing a write that cannot prove rescue.
+                            outcomes[uid] = TargetMutationOutcome(uid, "unknown", "destination-added-source-retained")
+                            break
                     status = _imap_effect_status(response)
                     outcomes[uid] = TargetMutationOutcome(
                         uid,

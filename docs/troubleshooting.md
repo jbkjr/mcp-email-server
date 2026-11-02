@@ -612,6 +612,26 @@ than five hits, or unavailable identity evidence leaves the result unknown even
 if the message moved. Inbox size alone does not limit this lookup.
 Inspect current labels before taking further action.
 
+Archive and ordinary move/remove operations perform label removal from All Mail,
+because removing a selected mailbox's own label can answer OK without changing
+membership. They confirm the original X-GM-MSGID and label absence after STORE.
+`label-removal-unconfirmed` or `destination-added-source-retained` can therefore
+mean STORE returned OK but the label remained. Neither is success. If Spam is
+still present after adding Inbox, rescue also remains unknown without another
+STORE. The proxy disallows removing Spam from All Mail.
+
+All Mail must be exposed by a unique `\All` LIST flag. A missing usable source
+Message-ID, unresolved identity, or more than five matching HEADER hits prevents
+removal before STORE. An archived message with no user labels can be restored
+using its All Mail UID as the source of `move_emails` to INBOX. That operation
+adds Inbox only. A gateway layered over the worker may need its own explicit
+All Mail-to-INBOX allowance; a generic protected-view rule can still block it.
+
+Literal Gmail label names such as `Labels/gateway-test-b` are valid source
+mailboxes. For a generic gateway message such as "The worker rejected the
+request", retain the underlying MCP error and the mailbox's LIST name/flags;
+the wrapper text alone does not identify the worker's reason.
+
 Use LIST flags rather than English folder names for localized Drafts/Trash. Draft
 discard refusals can reflect absent MOVE/UIDPLUS, changed UIDVALIDITY, an edited
 draft, another label alias, missing proxy provenance, or the proxy's disabled

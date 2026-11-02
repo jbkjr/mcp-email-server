@@ -5,6 +5,11 @@ import re
 from mcp_email_server.application.labels import mailbox_role, special_mailbox  # noqa: F401
 
 
+def label_present(labels: list[str], label: str) -> bool:
+    """Compare system labels without case and user labels exactly."""
+    return any(item.casefold() == label.casefold() if label.startswith("\\") else item == label for item in labels)
+
+
 def validate_uids(uids: list[str]) -> None:
     if not 1 <= len(uids) <= 25 or len(set(uids)) != len(uids):
         raise ValueError("Gmail requires at most 25 explicit unique UIDs")

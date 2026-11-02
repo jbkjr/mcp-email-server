@@ -29,6 +29,7 @@ from mcp_email_server.application.mutations import (
     ArchiveCommand,
     ArchiveService,
     CopyService,
+    MoveService,
     MutationAccountSnapshot,
     MutationProviderAccess,
     RemoveLabelCommand,
@@ -82,6 +83,11 @@ class FakeIMAP:
         self.lose_store = False
         self.lose_append = False
         self.replace_identity = False
+        self.auto_remove = True
+        self.writes = []
+        self.no_op_own_removals = 0
+        self.ignore_removals = False
+        self.all_mailbox = "All"
 
     async def login(self, *_):
         return "OK", []
@@ -109,6 +115,17 @@ class FakeIMAP:
             identity, labels = "55", self.draft_labels
         elif self.aliases.get(self.selected) == uid:
             identity, labels = self.identity, self.labels
+            system = {label.upper() for label in labels}
+            if self.selected == "INBOX" and r"\INBOX" not in system:
+                return None
+            if self.selected == "Spam" and r"\SPAM" not in system:
+                return None
+            if self.selected == self.all_mailbox and system & {r"\SPAM", r"\TRASH", r"\DRAFTS"}:
+                return None
+            if self.selected not in {"INBOX", "Spam", self.all_mailbox} and self.selected not in labels:
+                return None
+            own_label = {"INBOX": r"\INBOX", "Spam": r"\SPAM"}.get(self.selected, self.selected)
+            labels = {label for label in labels if (label.upper() if label.startswith("\\") else label) != own_label}
         else:
             return None
         label_list = " ".join(_quote_mailbox(label) for label in sorted(labels))
@@ -120,7 +137,13 @@ class FakeIMAP:
             message = self.draft if self.selected == DRAFTS else self.body
             searched = str(criteria[-1]).strip('"')
             found = message is not None and searched in message.decode()
-            return "OK", [b"11" if found and self.selected == DRAFTS else b"7" if found else b""]
+            return "OK", [
+                b"11"
+                if found and self.selected == DRAFTS
+                else self.aliases.get(self.selected, "").encode()
+                if found
+                else b""
+            ]
         return "OK", [self.aliases.get(self.selected, "").encode()]
 
     async def uid(self, operation, uid, *args):  # noqa: C901 - fake protocol dispatch
@@ -146,6 +169,7 @@ class FakeIMAP:
                     data.extend([f"1 FETCH (UID {item} BODY[{section}] {{{len(raw)}}}".encode(), bytearray(raw), b")"])
             return "OK", data
         if operation.lower() == "store":
+            self.writes.append((self.selected, uid, *args))
             label = args[1][1:-1]
             if label.startswith('"'):
                 label = label[1:-1].replace(r"\"", '"').replace("\\\\", "\\")
@@ -154,10 +178,20 @@ class FakeIMAP:
                 return "NO", [b"source retained"]
             if args[0] == "+X-GM-LABELS":
                 self.labels.add(label)
+                if self.selected == "Spam" and label == r"\Inbox" and self.auto_remove:
+                    self.labels.discard(r"\Spam")
                 if self.replace_identity:
                     self.identity = "56"
             else:
-                self.labels.discard(label)
+                own_label = {"INBOX": r"\Inbox", "Spam": r"\Spam"}.get(self.selected, self.selected)
+                if label.upper() == own_label.upper() if label.startswith("\\") else label == own_label:
+                    self.no_op_own_removals += 1
+                elif not self.ignore_removals:
+                    self.labels = {
+                        item
+                        for item in self.labels
+                        if (item.upper() != label.upper() if label.startswith("\\") else item != label)
+                    }
             if self.lose_store:
                 raise ConnectionError("lost completion")
             return "OK", []
@@ -216,15 +250,284 @@ def client_for(monkeypatch, imap, provider="gmail_imap"):
 
 
 @pytest.mark.asyncio
-async def test_archive_incremental_and_reject_non_inbox(monkeypatch):
+@pytest.mark.parametrize("inbox_label", [r"\Inbox", r"\INBOX"])
+async def test_archive_incremental_and_reject_non_inbox(monkeypatch, inbox_label):
     fake = FakeIMAP()
+    fake.labels = {inbox_label, "work", "keep"}
     client = client_for(monkeypatch, fake)
     outcome = await client._gmail_mutate(["7"], "INBOX", None, "archive")
     assert outcome.targets("succeeded") == ["7"]
-    assert ("STORE", "7", "-X-GM-LABELS", r"(\Inbox)") in fake.commands
+    assert fake.writes == [("All", "12", "-X-GM-LABELS", r"(\Inbox)")]
+    assert fake.no_op_own_removals == 0
     assert fake.labels == {"work", "keep"}
     with pytest.raises(ValueError, match="INBOX"):
         await client._gmail_mutate(["99"], "work", None, "archive")
+
+
+@pytest.mark.asyncio
+async def test_fake_models_hidden_selected_label_and_no_op_ok():
+    fake = FakeIMAP()
+    await fake.select('"INBOX"')
+    assert r"\Inbox" not in parse_metadata([fake.metadata("7")])["7"]["gmail_labels"]
+    assert (await fake.uid("store", "7", "-X-GM-LABELS", r"(\Inbox)"))[0] == "OK"
+    assert r"\Inbox" in fake.labels
+    await fake.select('"work"')
+    assert "work" not in parse_metadata([fake.metadata("99")])["99"]["gmail_labels"]
+    assert (await fake.uid("store", "99", "-X-GM-LABELS", '("work")'))[0] == "OK"
+    assert "work" in fake.labels
+
+
+@pytest.mark.asyncio
+async def test_archive_without_user_labels_can_be_restored_from_all_mail(monkeypatch):
+    fake = FakeIMAP()
+    fake.labels = {r"\Inbox"}
+    client = client_for(monkeypatch, fake)
+
+    archived = await client._gmail_mutate(["7"], "INBOX", None, "archive")
+
+    assert archived.targets("succeeded") == ["7"]
+    assert fake.labels == set()
+    assert fake.metadata("7") is None  # Source selection was restored, but its UID left.
+    restored = await client.move_emails_with_outcome(["12"], "All", "INBOX")
+    assert restored.targets("succeeded") == ["12"]
+    assert fake.labels == {r"\Inbox"}
+    assert fake.writes == [
+        ("All", "12", "-X-GM-LABELS", r"(\Inbox)"),
+        ("All", "12", "+X-GM-LABELS", r"(\Inbox)"),
+    ]
+    with pytest.raises(ValueError, match="restore to INBOX only"):
+        await client.move_emails_with_outcome(["12"], "All", "keep")
+
+
+@pytest.mark.asyncio
+async def test_archive_resolves_localized_all_mail_from_list_flags(monkeypatch):
+    localized = "[Gmail]/Tous les messages é"
+    monkeypatch.delitem(BOXES, "All")
+    monkeypatch.setitem(BOXES, localized, (r"\All",))
+    fake = FakeIMAP()
+    fake.all_mailbox = localized
+    fake.aliases[localized] = "50192"
+    client = client_for(monkeypatch, fake)
+
+    result = await client._gmail_mutate(["7"], "INBOX", None, "archive")
+
+    assert result.targets("succeeded") == ["7"]
+    assert fake.writes == [(localized, "50192", "-X-GM-LABELS", r"(\Inbox)")]
+    assert fake.labels == {"work", "keep"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["no_op_ok", "lost_store", "post_fetch", "post_identity"])
+async def test_archive_requires_post_condition_and_never_replays(monkeypatch, failure):
+    fake = FakeIMAP()
+    fake.ignore_removals = failure == "no_op_ok"
+    fake.lose_store = failure == "lost_store"
+    original = fake.metadata
+
+    def metadata(uid):
+        if fake.selected == "All" and fake.writes:
+            if failure == "post_fetch":
+                raise ConnectionError("lost confirmation")
+            if failure == "post_identity":
+                fake.identity = "56"
+        return original(uid)
+
+    fake.metadata = metadata
+    client = client_for(monkeypatch, fake)
+
+    result = await client._gmail_mutate(["7", "8"], "INBOX", None, "archive")
+
+    assert result.targets("unknown") == ["7"]
+    assert result.outcomes[1].detail == "not-attempted"
+    assert result.reconciliation_needed
+    assert fake.writes == [("All", "12", "-X-GM-LABELS", r"(\Inbox)")]
+    if failure == "no_op_ok":
+        assert result.outcomes[0].detail == "label-removal-unconfirmed"
+        assert r"\Inbox" in fake.labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_write", [False, True])
+async def test_archive_cancellation_stops_batch_without_more_writes(monkeypatch, after_write):
+    fake = FakeIMAP()
+    client = client_for(monkeypatch, fake)
+    if after_write:
+        original = fake.uid
+
+        async def uid(operation, uid, *args):
+            result = await original(operation, uid, *args)
+            if operation == "store":
+                raise asyncio.CancelledError
+            return result
+
+        fake.uid = uid
+    else:
+        monkeypatch.setattr(client, "_batch_fetch_message_ids", AsyncMock(side_effect=asyncio.CancelledError))
+
+    result = await client._gmail_mutate(["7", "8"], "INBOX", None, "archive")
+
+    assert result.outcomes[0].status == ("unknown" if after_write else "failed")
+    assert result.outcomes[0].detail == "provider-cancelled"
+    assert result.outcomes[1].detail == "not-attempted"
+    assert len(fake.writes) == int(after_write)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["message_id", "all_identity", "no_hits", "too_many_hits", "no_all"])
+async def test_archive_refuses_without_all_mail_identity_before_write(monkeypatch, failure):
+    fake = FakeIMAP()
+    if failure == "message_id":
+        fake.body = b"Subject: fixture\r\n\r\nbody\r\n"
+    elif failure == "all_identity":
+        original = fake.metadata
+
+        def metadata(uid):
+            data = original(uid)
+            return data.replace(MSGID.encode(), b"55") if fake.selected == "All" and data else data
+
+        fake.metadata = metadata
+    elif failure == "no_hits":
+        fake.uid_search = AsyncMock(return_value=("OK", [b""]))
+    elif failure == "too_many_hits":
+        fake.uid_search = AsyncMock(return_value=("OK", [b"1 2 3 4 5 12"]))
+    else:
+        monkeypatch.setitem(BOXES, "All", ())
+    client = client_for(monkeypatch, fake)
+
+    result = await client._gmail_mutate(["7"], "INBOX", None, "archive")
+
+    assert result.targets("failed") == ["7"]
+    assert not fake.writes
+    assert r"\Inbox" in fake.labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source,uid,destination,removed",
+    [
+        ("INBOX", "7", "keep", r"\Inbox"),
+        ("work", "99", "keep", "work"),
+        ("work", "99", "INBOX", "work"),
+    ],
+)
+async def test_move_removes_source_in_all_mail_and_preserves_other_labels(
+    monkeypatch, source, uid, destination, removed
+):
+    fake = FakeIMAP()
+    client = client_for(monkeypatch, fake)
+
+    result = await client.move_emails_with_outcome([uid], source, destination)
+
+    assert result.targets("succeeded") == [uid]
+    assert fake.labels == {r"\Inbox", "work", "keep"} - {removed}
+    assert fake.writes[-1][0:3] == ("All", "12", "-X-GM-LABELS")
+    assert fake.no_op_own_removals == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,uid,label", [("work", "99", "work"), ("INBOX", "7", "keep"), ("All", "12", "work")])
+async def test_remove_label_in_all_mail_confirms_absence(monkeypatch, source, uid, label):
+    fake = FakeIMAP()
+    client = client_for(monkeypatch, fake)
+
+    result = await client.remove_label_with_outcome([uid], label, source)
+
+    assert result.targets("succeeded") == [uid]
+    assert fake.labels == {r"\Inbox", "work", "keep"} - {label}
+    assert fake.writes == [("All", "12", "-X-GM-LABELS", f'("{label}")')]
+    assert fake.no_op_own_removals == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["move", "remove"])
+async def test_move_and_remove_never_accept_no_op_ok(monkeypatch, operation):
+    fake = FakeIMAP()
+    fake.ignore_removals = True
+    client = client_for(monkeypatch, fake)
+
+    result = await client._gmail_mutate(["99"], "work", "keep" if operation == "move" else "work", operation)
+
+    assert result.targets("unknown") == ["99"]
+    assert "work" in fake.labels
+    assert len(fake.writes) == (2 if operation == "move" else 1)
+    assert fake.writes[-1][0:3] == ("All", "12", "-X-GM-LABELS")
+
+
+@pytest.mark.asyncio
+async def test_move_never_removes_a_same_message_id_different_all_mail_identity(monkeypatch):
+    fake = FakeIMAP()
+    original = fake.metadata
+
+    def metadata(uid):
+        data = original(uid)
+        return data.replace(MSGID.encode(), b"55") if fake.selected == "All" and data else data
+
+    fake.metadata = metadata
+    client = client_for(monkeypatch, fake)
+
+    result = await client.move_emails_with_outcome(["99"], "work", "INBOX")
+
+    assert result.targets("unknown") == ["99"]
+    assert fake.writes == [("work", "99", "+X-GM-LABELS", r"(\Inbox)")]
+    assert "work" in fake.labels
+
+
+@pytest.mark.asyncio
+async def test_all_mail_restore_requires_inbox_post_condition(monkeypatch):
+    fake = FakeIMAP()
+    fake.labels = {"keep"}
+    original = fake.metadata
+
+    def metadata(uid):
+        if fake.writes:
+            fake.labels.discard(r"\Inbox")
+        return original(uid)
+
+    fake.metadata = metadata
+    client = client_for(monkeypatch, fake)
+
+    result = await client.move_emails_with_outcome(["12"], "All", "INBOX")
+
+    assert result.targets("unknown") == ["12"]
+    assert fake.writes == [("All", "12", "+X-GM-LABELS", r"(\Inbox)")]
+
+
+@pytest.mark.asyncio
+async def test_next_uid_is_read_in_restored_source_view(monkeypatch):
+    fake = FakeIMAP()
+    client = client_for(monkeypatch, fake)
+
+    result = await client.move_emails_with_outcome(["99", "12"], "work", "INBOX")
+
+    assert result.targets("succeeded") == ["99"]
+    assert result.targets("failed") == ["12"]  # All Mail's UID is not a source UID.
+    assert len(fake.writes) == 2
+
+
+@pytest.mark.asyncio
+async def test_literal_labels_prefix_move_uid_one_through_application(monkeypatch):
+    import mcp_email_server.app as app
+
+    label = "Labels/gateway-test-b"
+    monkeypatch.setitem(BOXES, label, ())
+    fake = FakeIMAP()
+    fake.aliases[label] = "1"
+    fake.labels = {label, "keep"}
+    client = client_for(monkeypatch, fake)
+    provider = ClassicMutationProvider(SimpleNamespace(incoming_client=client))
+    account = MutationAccountSnapshot("test", "legacy", (), (), True, False, gateway_provider="gmail_imap")
+    authority = SimpleNamespace(resolve=lambda *args, **kwargs: account)
+    factory = SimpleNamespace(open=lambda *args, **kwargs: MutationProviderAccess(account, provider))
+    projection = SimpleNamespace(invalidate=AsyncMock())
+    service = MoveService(authority, factory, SimpleNamespace(open=AsyncMock(return_value=projection)))
+    monkeypatch.setattr(app, "move_emails_command", service.execute)
+
+    summary = await app.move_emails("test", ["1"], "INBOX", label)
+
+    assert summary == "Successfully moved 1 email(s) to INBOX"
+    assert fake.labels == {r"\Inbox", "keep"}
+    assert fake.writes[-1] == ("All", "12", "-X-GM-LABELS", '("Labels/gateway-test-b")')
+    projection.invalidate.assert_awaited_once_with((label, "INBOX"))
 
 
 @pytest.mark.asyncio
@@ -251,7 +554,7 @@ async def test_alias_uid_is_mailbox_local_and_protected_overlap(monkeypatch):
     client = client_for(monkeypatch, fake)
     assert (await client._gmail_mutate(["99"], "work", "keep", "remove")).targets("succeeded") == ["99"]
     assert r"\Inbox" in fake.labels
-    assert not any(c[0] == "SEARCH" for c in fake.commands)
+    assert fake.writes == [("All", "12", "-X-GM-LABELS", '("keep")')]
     fake.labels.add(r"\Trash")
     result = await client.move_emails_with_outcome(["7"], "INBOX", "keep")
     assert result.outcomes[0].detail == "protected-label-overlap"
@@ -286,9 +589,9 @@ async def test_spam_rescue_confirms_destination_identity_and_restores_selection(
 
     result = await client.move_emails_with_outcome(["13"], "Spam", "INBOX")
 
-    assert result.targets("succeeded") == ["13"]
-    assert not result.reconciliation_needed
-    assert fake.labels == {inbox_label, "keep"}
+    assert result.targets("succeeded" if auto_remove else "unknown") == ["13"]
+    assert result.reconciliation_needed is not auto_remove
+    assert fake.labels == {inbox_label, "keep"} | (set() if auto_remove else {r"\Spam"})
     assert ("FETCH", "7", "(UID X-GM-MSGID X-GM-LABELS)") in fake.commands
     assert fake.selected == "Spam"
     assert ("SEARCH", "HEADER", "Message-ID", '"<fixture@example.invalid>"') in fake.commands
@@ -297,9 +600,7 @@ async def test_spam_rescue_confirms_destination_identity_and_restores_selection(
     assert header_fetch[1] == "13"
     assert fake.commands.index(header_fetch) < next(i for i, c in enumerate(fake.commands) if c[0] == "STORE")
     writes = [c for c in fake.commands if c[0] == "STORE"]
-    assert writes == [("STORE", "13", "+X-GM-LABELS", r"(\Inbox)")] + (
-        [] if auto_remove else [("STORE", "13", "-X-GM-LABELS", r"(\Spam)")]
-    )
+    assert writes == [("STORE", "13", "+X-GM-LABELS", r"(\Inbox)")]
 
 
 @pytest.mark.asyncio
@@ -463,7 +764,7 @@ async def test_reads_identity_chunks_and_byte_limit(monkeypatch):
     client = client_for(monkeypatch, fake)
     data = await client.get_email_body_by_id("7")
     assert data["gmail_message_id"] == MSGID and data["email_id"] == "7"
-    assert set(data["gmail_labels"]) == fake.labels
+    assert set(data["gmail_labels"]) == fake.labels - {r"\Inbox"}
     monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_FETCH_BYTES", "1")
     fake.commands.clear()
     assert await client.get_email_body_by_id("7") is None
@@ -626,11 +927,29 @@ async def test_archive_service_dispatches_gmail_and_invalidates_once(monkeypatch
     result = await ArchiveService(authority, factory, projections).execute(ArchiveCommand("test", ("7",), "INBOX"))
 
     assert result.archive_mailbox == "INBOX"
+    assert result.gmail_archive is True
     assert result.batch.targets("succeeded") == ["7"]
     assert result.batch.reconciliation_needed is projection_fails
     assert fake.labels == {"work", "keep"}
-    assert [c for c in fake.commands if c[0] == "STORE"] == [("STORE", "7", "-X-GM-LABELS", r"(\Inbox)")]
+    assert fake.writes == [("All", "12", "-X-GM-LABELS", r"(\Inbox)")]
     projection.invalidate.assert_awaited_once_with(("INBOX",))
+
+
+@pytest.mark.asyncio
+async def test_gmail_archive_summary_names_inbox_label_removal(monkeypatch):
+    import mcp_email_server.app as app
+    from mcp_email_server.application.mutations import (
+        ArchiveMutationOutcome,
+        BatchMutationOutcome,
+        TargetMutationOutcome,
+    )
+
+    outcome = ArchiveMutationOutcome(
+        BatchMutationOutcome((TargetMutationOutcome("7", "succeeded"),)), "INBOX", gmail_archive=True
+    )
+    monkeypatch.setattr(app, "archive_emails_command", AsyncMock(return_value=outcome))
+
+    assert await app.archive_emails("test", ["7"]) == "Successfully archived 1 email(s): removed the Inbox label"
 
 
 def load_proxy():
@@ -856,3 +1175,34 @@ async def test_real_proxy_session_spam_rescue_after_source_disappears(monkeypatc
     assert any("BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]" in wire for wire, _ in proxy.wire)
     assert not any(re.search(r"COPY|EXPUNGE|CLOSE|X-GM-RAW|ENABLE|\\Deleted", wire) for wire, _ in proxy.wire)
     proxy.server.appended_drafts.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("no_op_ok", [False, True])
+async def test_real_proxy_all_mail_archive_and_restore_contract(monkeypatch, no_op_ok):
+    proxy = ProxyIMAP(load_proxy(), monkeypatch)
+    proxy.fake.labels = {r"\Inbox"}
+    proxy.fake.ignore_removals = no_op_ok
+    client = client_for(monkeypatch, proxy)
+    try:
+        result = await client._gmail_mutate(["7"], "INBOX", None, "archive")
+
+        assert result.targets("unknown" if no_op_ok else "succeeded") == ["7"]
+        assert len(proxy.fake.writes) == 1
+        assert proxy.fake.writes[0][:3] == ("All", "12", "-X-GM-LABELS")
+        assert (r"T UID STORE 12 -X-GM-LABELS (\Inbox)", None) in proxy.wire
+        if not no_op_ok:
+            assert proxy.fake.labels == set()
+            result = await client.move_emails_with_outcome(["12"], "All", "INBOX")
+            assert result.targets("succeeded") == ["12"]
+            assert proxy.fake.labels == {r"\Inbox"}
+            proxy.fake.labels.update({"work", "keep"})
+            result = await client.move_emails_with_outcome(["99"], "work", "INBOX")
+            assert result.targets("succeeded") == ["99"]
+            assert proxy.fake.labels == {r"\Inbox", "keep"}
+            assert proxy.fake.writes[-1] == ("All", "12", "-X-GM-LABELS", '("work")')
+        assert not any(
+            "SEARCH ALL" in wire or re.search(r"COPY|EXPUNGE|CLOSE|\\Deleted", wire) for wire, _ in proxy.wire
+        )
+    finally:
+        proxy.server.appended_drafts.close()

@@ -259,8 +259,15 @@ possibility does not add placeholders or generic abstractions now.
 The explicit Gmail dispatch gate requires `tests/test_gateway_gmail.py`: synthetic
 alias UIDs, decimal-string identity, existing user labels, localized Drafts/Trash,
 protected overlap, partial two-step move, changed identity/epoch, edited draft,
-lost completion, and missing MOVE/UIDPLUS. Archive service dispatch and deduplicated
-invalidation MUST be covered alongside Spam rescue with immediate source-UID
+lost completion, and missing MOVE/UIDPLUS. The fake upstream MUST hide the
+selected organizing view's own label and return no-op OK for its removal.
+Archive, move, and label removal MUST prove identity-bound All Mail STORE and
+post-condition verification, including no-op OK, changed identity, lost
+confirmation, localized All Mail, preserved user labels, All Mail-to-INBOX
+restoration without user labels, correct archive summary, and the literal
+`Labels/gateway-test-b` source with UID `1` through the application boundary.
+Archive service dispatch and deduplicated invalidation MUST be covered alongside
+Spam rescue with immediate source-UID
 removal, a large Inbox with no SEARCH ALL, pre-write Message-ID retrieval,
 bounded HEADER search hits checked against X-GM-MSGID, missing Message-ID and
 same-Message-ID/different-X-GM-MSGID refusals, destination membership confirmation,
