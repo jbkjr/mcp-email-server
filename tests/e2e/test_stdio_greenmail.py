@@ -292,13 +292,22 @@ async def _assert_empty_recipient_policy_allows_compose(
     await _call_tool(
         session, "forward_email", {"account_name": account_name, "recipients": [BOB[0]], "email_id": source_uid}
     )
-    draft_subject = f"empty-policy-draft-{uuid.uuid4().hex}"
+    # Not Drafts: callers assert exact Drafts totals to catch duplicated saves.
+    saved_before = _message_count(ALICE, "WildcardDrafts")
+    saved_subject = f"empty-policy-save-{uuid.uuid4().hex}"
     await _call_tool(
         session,
         "save_to_mailbox",
-        {"account_name": account_name, "recipients": [BOB[0]], "subject": draft_subject, "body": "Synthetic body"},
+        {
+            "account_name": account_name,
+            "recipients": [BOB[0]],
+            "subject": saved_subject,
+            "mailbox": "WildcardDrafts",
+            "body": "Synthetic body",
+        },
     )
-    _wait_for_message(ALICE, "Drafts", draft_subject)
+    _wait_for_message(ALICE, "WildcardDrafts", saved_subject)
+    assert _message_count(ALICE, "WildcardDrafts") == saved_before + 1
 
 
 async def _metadata_for_subject_in_mailbox(
@@ -1040,9 +1049,9 @@ async def test_legacy_empty_recipient_policy_is_unrestricted_against_greenmail(
     tmp_path: Path, policy_source: str
 ) -> None:
     _wait_until_ready()
-    _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts"])
+    _ensure_empty_mailboxes(ALICE, ["INBOX", "Drafts", "WildcardDrafts"])
     _ensure_empty_mailboxes(BOB, ["INBOX"])
-    subject = f"denied-forward-source-{uuid.uuid4().hex}"
+    subject = f"empty-policy-forward-source-{uuid.uuid4().hex}"
     _seed_message_as(BOB, ALICE[0], subject, "Synthetic forward source")
     source = _wait_for_message(ALICE, "INBOX", subject)
     config = CONFIG_TEMPLATE
@@ -2447,9 +2456,11 @@ async def test_markdown_rendering_and_quoted_reply_against_greenmail(tmp_path: P
                     "in_reply_to": original_message_id,
                 },
             )
-            assert quoted["result"] == f"Email sent successfully to {BOB[0]}"
 
             delivered = _wait_for_message(BOB, "INBOX", reply_subject)
+            assert quoted["result"] == (
+                f"Email sent successfully to {BOB[0]}. Message-Id: {delivered.message['Message-ID']}"
+            )
             html = delivered.message.get_body(preferencelist=("html",)).get_content()
 
             # The note is rendered from Markdown rather than delivered literally.
@@ -2482,8 +2493,10 @@ async def test_markdown_rendering_and_quoted_reply_against_greenmail(tmp_path: P
                     "quote_reply": False,
                 },
             )
-            assert unquoted["result"] == f"Email sent successfully to {BOB[0]}"
             plain_reply = _wait_for_message(BOB, "INBOX", unquoted_subject)
+            assert unquoted["result"] == (
+                f"Email sent successfully to {BOB[0]}. Message-Id: {plain_reply.message['Message-ID']}"
+            )
             plain_html = plain_reply.message.get_body(preferencelist=("html",)).get_content()
             assert "No quote please" in plain_html
             assert "<blockquote" not in plain_html
@@ -2502,8 +2515,10 @@ async def test_markdown_rendering_and_quoted_reply_against_greenmail(tmp_path: P
                     "in_reply_to": f"<absent-{run_id}@example.test>",
                 },
             )
-            assert missing["result"] == f"Email sent successfully to {BOB[0]}"
             missing_reply = _wait_for_message(BOB, "INBOX", missing_subject)
+            assert missing["result"] == (
+                f"Email sent successfully to {BOB[0]}. Message-Id: {missing_reply.message['Message-ID']}"
+            )
             missing_html = missing_reply.message.get_body(preferencelist=("html",)).get_content()
             assert "Original is gone" in missing_html
             assert "<blockquote" not in missing_html
