@@ -485,3 +485,22 @@ port = 1
     assert completed.stdout == b""
     assert expected in stderr
     assert "@example.test" not in stderr
+
+
+def test_server_does_not_read_a_dotenv_in_cwd(tmp_path: Path) -> None:
+    # A malformed value is the observable effect: FastMCP's constructor arguments
+    # outrank well-formed .env values, but parsing this one stops the server starting.
+    (tmp_path / ".env").write_text("FASTMCP_DEPENDENCIES=not-json\n", encoding="utf-8")
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("FASTMCP_")}
+
+    completed = subprocess.run(
+        [sys.executable, "-c", "from mcp_email_server.app import mcp; print(mcp.settings.dependencies)"],
+        capture_output=True,
+        cwd=tmp_path,
+        env=environment,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8")
+    assert completed.stdout.decode("utf-8").strip() == "[]"

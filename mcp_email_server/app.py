@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import Settings as FastMCPSettings
 from mcp.types import BlobResourceContents, CallToolResult, EmbeddedResource, TextContent, ToolAnnotations
 from pydantic import Field, ValidationError
 
@@ -330,6 +331,8 @@ class EmailMCP(FastMCP):
         return await _execute_protocol_request(request)
 
 
+# FastMCP would otherwise parse FASTMCP_* from a .env in whatever directory the client started us in.
+FastMCPSettings.model_config["env_file"] = None
 mcp = EmailMCP("email", instructions=MCP_SERVER_INSTRUCTIONS, lifespan=_application_lifespan)
 # FastMCP 1.x does not expose its low-level server version in the constructor.
 mcp._mcp_server.version = version("mcp-email-server")  # pyright: ignore[reportPrivateUsage]
