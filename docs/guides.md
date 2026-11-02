@@ -60,7 +60,8 @@ settings retain read/write access; an account null/omitted override inherits.
 the one being deleted from, the messages are moved there and stay recoverable,
 and the result names the mailbox. Deletion is permanent only when the account
 has no trash mailbox at all, or when the selected mailbox is the trash mailbox
-itself; the result says so in those cases. See
+itself. Those cases are refused unless the call passes `permanent=true`, and the
+result says when a delete was permanent. See
 [`delete_emails`](tools.md#delete_emails) for how the trash mailbox is
 resolved.
 

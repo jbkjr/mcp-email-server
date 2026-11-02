@@ -51,6 +51,10 @@ class RecipientPolicyDeniedError(PermissionError):
     """Current account authority denies one or more message recipients."""
 
 
+class PermanentDeleteNotRequestedError(ValueError):
+    """A delete could only be permanent, and the caller didn't ask for that."""
+
+
 async def _bounded_provider_effect(operation: Awaitable[ProviderResultT]) -> ProviderResultT:
     async with asyncio.timeout(APPLICATION_LIMITS.provider_timeout_seconds):
         return await operation
@@ -258,6 +262,7 @@ class DeleteCommand:
     account_name: str
     email_ids: tuple[str, ...]
     mailbox: str = "INBOX"
+    permanent: bool = False
 
     def validate(self) -> None:
         _validate_account_name(self.account_name)
@@ -1448,7 +1453,8 @@ class DeleteService(_MutationWorkflow):
     out or fails aborts before anything is touched, and only an authoritative
     "this account has no distinct Trash mailbox" answer reaches the permanent
     path. Deleting from inside Trash is that same authoritative answer — there
-    is nowhere further to move to — and is therefore permanent by design.
+    is nowhere further to move to. Either way the permanent path also needs the
+    caller's explicit ``permanent=True``; without it the delete is refused.
     """
 
     async def execute(self, command: DeleteCommand) -> DeleteMutationOutcome:
@@ -1461,6 +1467,11 @@ class DeleteService(_MutationWorkflow):
             trash_mailbox = await _bounded_provider_effect(discovery.provider.find_trash_mailbox(command.mailbox))
         except TimeoutError:
             raise MutationProviderError("trash mailbox discovery timed out") from None
+        if trash_mailbox is None and not command.permanent:
+            raise PermanentDeleteNotRequestedError(
+                "Refused: this delete would be permanent, because the account has no Trash mailbox or the emails "
+                "are already in it. Nothing was deleted. Pass permanent=true to delete them permanently."
+            )
         move: MoveCommand | None = None
         if trash_mailbox is not None:
             move = MoveCommand(

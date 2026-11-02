@@ -314,7 +314,11 @@ whether the effect is reversible, so it is not permitted to fail open. Only an
 authoritative "no distinct trash mailbox" answer may reach the expunge strategy.
 A discovery that fails or exceeds its bound aborts the workflow before authority
 is re-resolved and before any message is touched, because an unresolved lookup
-carries no evidence that permanent removal is what the caller asked for. The
+carries no evidence that permanent removal is what the caller asked for. An
+authoritative answer doesn't supply that evidence either: reaching the expunge
+strategy also needs the caller's explicit `permanent=true`, and without it the
+workflow refuses before authority is re-resolved. The flag doesn't bypass an
+available trash mailbox. The
 result distinguishes the two strategies explicitly, naming the destination
 mailbox for a move and stating permanence otherwise, so a caller never has to
 infer which one ran.
@@ -631,7 +635,8 @@ enter public errors.
     selected mailbox already is it. Discovery runs as its own provider access with
     authority re-resolved before the effect. Tests prove that a failed or timed-out
     discovery aborts without deleting or moving anything rather than falling through
-    to permanent removal, that the move carries the same sender allowlist and
+    to permanent removal, that the permanent path without `permanent=true` refuses
+    and touches nothing, that the move carries the same sender allowlist and
     blocked-mutation policy as any other move, that the move invalidates both the
     source and trash projections while permanent removal invalidates only the
     source, that special-use matching accepts the `\Trash` attribute ahead of

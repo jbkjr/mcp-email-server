@@ -872,9 +872,11 @@ the RFC 6154 `\Trash` mailbox flag and then falls back to the common names
 messages are moved into it under the same native-MOVE or safe UIDPLUS fallback
 rules as `move_emails`, and the result names the mailbox they went to.
 
-Deletion is permanent in exactly two cases: the account has no trash mailbox, or
+Deletion can be permanent in exactly two cases: the account has no trash mailbox, or
 the selected mailbox is the trash mailbox itself, because emptying the trash has
-nowhere further to move to. A permanent delete requires `UIDPLUS`: the server
+nowhere further to move to. In both cases the call is refused, with nothing
+touched, unless it passes `permanent=true`. That argument doesn't bypass an
+available trash mailbox: those messages still move there. A permanent delete requires `UIDPLUS`: the server
 flags and expunges only the requested UIDs with `UID EXPUNGE` and never sends
 mailbox-wide `EXPUNGE`. Without `UIDPLUS`, it fails before adding the `\Deleted`
 flag. The result says explicitly that the messages were deleted permanently, so

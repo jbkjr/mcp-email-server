@@ -555,6 +555,14 @@ class TestMcpTools:
         assert result == "Delete result [succeeded: 12345; failed: 12346, 12347; mailbox: [Gmail]/Trash]"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("arguments", "expected"), [({}, False), ({"permanent": True}, True)])
+    async def test_delete_emails_passes_permanent_explicitly(self, arguments, expected):
+        command_handler = AsyncMock(return_value=DeleteMutationOutcome(_batch_outcome(succeeded=("12345",)), "Trash"))
+        with patch("mcp_email_server.app.delete_emails_command", command_handler):
+            await delete_emails("test_account", ["12345"], **arguments)
+        assert command_handler.await_args.args[0].permanent is expected
+
+    @pytest.mark.asyncio
     async def test_delete_emails_from_trash_reports_a_permanent_delete(self):
         """The caller is told the messages are gone, not merely moved somewhere."""
         command_handler = AsyncMock(return_value=DeleteMutationOutcome(_batch_outcome(succeeded=("12345",)), None))

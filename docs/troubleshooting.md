@@ -694,7 +694,8 @@ an explicit destination when the provider uses another name.
 
 `delete_emails` normally moves messages to the account's trash mailbox, so it
 needs whatever `move_emails` needs. Permanent deletion — no trash mailbox, or
-deleting from the trash mailbox itself — is message-scoped: it requires IMAP
+deleting from the trash mailbox itself — is refused unless the call passes
+`permanent=true`, and is message-scoped: it requires IMAP
 `UIDPLUS` and uses target-scoped `UID EXPUNGE`. It deliberately never falls back
 to mailbox-wide `EXPUNGE`, because that could remove unrelated messages already
 marked `\Deleted` by another client.

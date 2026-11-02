@@ -1064,9 +1064,9 @@ async def save_draft(
     description=(
         "Delete one or more emails by email_id. Deletion is recoverable where the account allows it: the emails "
         "are moved to the Trash mailbox, auto-detected via the RFC 6154 \\Trash flag (falling back to common names "
-        "like Trash, Deleted Items, or [Gmail]/Trash). When the account has no Trash mailbox, and when the emails "
-        "are already in Trash, they are instead removed permanently using target-scoped UID EXPUNGE. The result "
-        "says which happened. Use list_emails_metadata first. Partial or ambiguous effects report per-ID "
+        "like Trash, Deleted Items, or [Gmail]/Trash). When the account has no Trash mailbox, or the emails are "
+        "already in Trash, the only option is permanent removal using target-scoped UID EXPUNGE, and the call is "
+        "refused unless permanent=true. The result says which happened. Use list_emails_metadata first. Partial or ambiguous effects report per-ID "
         "succeeded/failed/unknown status and are not retried automatically."
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
@@ -1091,8 +1091,18 @@ async def delete_emails(
             description="The mailbox to delete emails from.",
         ),
     ] = "INBOX",
+    permanent: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Allow permanent removal when there is no Trash mailbox to move to, or mailbox is the Trash mailbox. "
+                "Refused without it. Emails with a Trash mailbox to move to still go there."
+            ),
+        ),
+    ] = False,
 ) -> str:
-    outcome = await delete_emails_command(DeleteCommand(account_name, tuple(email_ids), mailbox))
+    outcome = await delete_emails_command(DeleteCommand(account_name, tuple(email_ids), mailbox, permanent))
     succeeded = outcome.batch.targets("succeeded")
     complete = len(succeeded) == len(email_ids) and not outcome.batch.reconciliation_needed
     if outcome.trash_mailbox is None:

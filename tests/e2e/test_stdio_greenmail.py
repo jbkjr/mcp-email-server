@@ -1899,8 +1899,8 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
             still_pending = _wait_for_message(BOB, "INBOX", pending_subject)
             assert r"\Deleted" in still_pending.flags
 
-            # Deleting from inside Trash has nowhere further to move to, so it is
-            # permanent — and permanent still means target-scoped UID EXPUNGE, which
+            # Deleting from inside Trash has nowhere further to move to, so it needs
+            # permanent=true — and permanent still means target-scoped UID EXPUNGE, which
             # must not commit another client's pending deletion sitting beside it.
             trash_pending_subject = f"mcp-e2e-trash-pending-{run_id}"
             trash_purge_subject = f"mcp-e2e-trash-purge-{run_id}"
@@ -1926,6 +1926,7 @@ async def test_current_stdio_server_against_greenmail(tmp_path: Path) -> None:
                     "account_name": "bob",
                     "email_ids": [purge_metadata["email_id"]],
                     "mailbox": "Trash",
+                    "permanent": True,
                 },
             )
             assert purged["result"] == "Successfully deleted 1 email(s) permanently"
