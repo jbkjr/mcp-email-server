@@ -558,12 +558,16 @@ class ForwardCommand(ComposeCommand):
 
 @dataclass(frozen=True)
 class ReplySource:
-    """Unverified threading evidence read from the raw headers of a reply's source."""
+    """Unverified threading evidence read from the raw headers of a reply's source.
+
+    ``sender`` is retained solely as policy evidence, as on ``ForwardSource``.
+    """
 
     message_id: str
     references: str | None
     in_reply_to: str | None
     subject: str
+    sender: str = ""
 
 
 @dataclass(frozen=True)
@@ -1014,9 +1018,9 @@ def _validate_forward_source(source: ForwardSource) -> None:
         raise ValueError("source sender must be a string")  # noqa: TRY004 - stable validation contract
 
 
-def _validate_forward_sender_policy(
-    command: ForwardCommand,
-    source: ForwardSource,
+def _validate_source_sender_policy(
+    command: ForwardCommand | ReplyCommand,
+    source: ForwardSource | ReplySource,
     account: MutationAccountSnapshot,
 ) -> None:
     """Apply the current sender policy without turning a blocked UID into an oracle."""
@@ -1788,7 +1792,7 @@ class ForwardService(_MutationWorkflow):
         # The provider blocks disallowed sources before reading their body. Keep
         # the application boundary fail-closed as well if a provider returns
         # evidence that does not satisfy the snapshot used for that read.
-        _validate_forward_sender_policy(command, source, incoming.account)
+        _validate_source_sender_policy(command, source, incoming.account)
         forwarded = replace(
             command,
             subject=_forwarded_subject(source.subject),
@@ -1837,6 +1841,8 @@ class ReplyService(_MutationWorkflow):
             source = await _bounded_provider_effect(incoming.provider.fetch_reply_source(command, incoming.account))
         except TimeoutError:
             raise MutationProviderError("reply source retrieval timed out") from None
+        # Resolved again so a list tightened during the read still stops the subject going out.
+        _validate_source_sender_policy(command, source, self._resolve(command.account_name))
         parent = _source_thread_ids(source.message_id, single=True)
         # RFC 5322 section 3.6.4: the parent's References, else its single In-Reply-To.
         ancestors = ()

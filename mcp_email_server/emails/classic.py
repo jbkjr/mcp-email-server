@@ -3124,7 +3124,7 @@ class EmailClient:
             headers = BytesParser(policy=default).parsebytes(raw, headersonly=True)
             if headers.defects:
                 raise ValueError("Reply source headers are malformed")
-            for name in ("Message-ID", "References", "In-Reply-To", "Subject"):
+            for name in ("From", "Message-ID", "References", "In-Reply-To", "Subject"):
                 values = headers.get_all(name, [])
                 if len(values) > 1 or any(value.defects for value in values):
                     raise ValueError("Reply source headers are ambiguous or malformed")
@@ -3132,7 +3132,9 @@ class EmailClient:
                 message_id=str(headers.get("Message-ID", "")),
                 references=str(headers["References"]) if "References" in headers else None,
                 in_reply_to=str(headers["In-Reply-To"]) if "In-Reply-To" in headers else None,
-                subject=str(headers.get("Subject", "")),
+                # A folded Subject keeps its tab, which composing would refuse as a control character.
+                subject=re.sub(r"[\t\r\n]+", " ", str(headers.get("Subject", ""))),
+                sender=str(headers.get("From", "")),
             )
         finally:
             try:

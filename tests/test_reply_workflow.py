@@ -195,6 +195,7 @@ def workflow(source, **changes):
     authority = MagicMock(resolve=MagicMock(return_value=account))
     factory = MagicMock(open=MagicMock(return_value=MutationProviderAccess(account, provider)))
     projections = MagicMock(open=AsyncMock(return_value=MagicMock(invalidate=AsyncMock())))
+    provider.authority = authority
     return MutationServices.compose(authority, factory, projections), provider
 
 
@@ -383,6 +384,8 @@ async def test_reply_source_unfolds_a_folded_chain(email_server):
         b"Message-ID: <x@example.test>\r\nMessage-ID: <y@example.test>\r\n\r\n",
         b"Message-ID: <x@example.test>\r\nReferences: <a@example.test>\r\nReferences: <b@example.test>\r\n\r\n",
         b"Subject: one\r\nSubject: two\r\n\r\n",
+        pytest.param(b"From: a@example.test\r\nFrom: b@example.test\r\n\r\n", id="two-froms"),
+        pytest.param(b"From: <unterminated@example.test\r\n\r\n", id="malformed-from"),
         b"not a header\r\n\r\n",
         pytest.param(b"X-Large: " + b"x" * 100000 + b"\r\n\r\n", id="oversized"),
     ],
@@ -401,6 +404,33 @@ async def test_reply_source_missing_or_other_uid_is_not_resolved(email_server, d
     imap = imap_session(*data)
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)), pytest.raises(ValueError):
         await client.fetch_reply_source("42", "Archive")
+
+
+async def test_reply_source_keeps_sender_and_unfolds_a_tab_folded_subject(email_server):
+    client = EmailClient(email_server)
+    raw = b"From: Someone <a@example.test>\r\nMessage-ID: <x@example.test>\r\nSubject: Long\r\n\tSubject\r\n\r\n"
+    imap = imap_session(b"1 FETCH (UID 42 BODY[HEADER] {100}", bytearray(raw), b")")
+    with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
+        result = await client.fetch_reply_source("42", "Archive")
+    assert result.subject == "Long Subject"
+    assert "a@example.test" in result.sender
+
+
+@pytest.mark.parametrize("draft_mailbox", [None, "Drafts"])
+async def test_reply_rechecks_the_sender_against_current_policy_before_its_effect(draft_mailbox):
+    source = ReplySource("<parent@example.test>", None, None, "Private", "a@example.test")
+    services, provider = workflow(source, allowed_senders=("a@example.test",))
+
+    async def tightened_during_the_read(*_):
+        account = provider.authority.resolve.return_value
+        provider.authority.resolve.return_value = replace(account, allowed_senders=("other@example.test",))
+        return source
+
+    provider.fetch_reply_source.side_effect = tightened_during_the_read
+    with pytest.raises(ValueError, match="Failed to fetch email with UID"):
+        await services.reply.execute(reply(draft_mailbox=draft_mailbox))
+    provider.send.assert_not_called()
+    provider.save_to_mailbox.assert_not_called()
 
 
 async def test_reply_source_allowlist_runs_before_header_read(email_server):
