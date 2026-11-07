@@ -9,8 +9,7 @@ EMAIL_SAFE_EXTENSIONS = ["tables", "fenced_code", "nl2br"]
 EMAIL_BODY_STYLE = (
     "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, "
     "'Helvetica Neue', Arial, sans-serif; "
-    "line-height: 1.6; "
-    "color: #333;"
+    "line-height: 1.6;"
 )
 
 
