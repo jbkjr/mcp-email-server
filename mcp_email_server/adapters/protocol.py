@@ -46,6 +46,12 @@ def require_protocol_access(resolved: LocalAccountResolution, protocol: Protocol
         )
     grants = account.allowed_mutations if account.allowed_mutations is not None else settings.allowed_mutations
     if protocol == "imap":
+        # Raw COPY/MOVE/APPEND/CREATE/RENAME/DELETE could fill or reshape a reserved
+        # mailbox under any spelling; refusing the whole surface is the simple safe rule.
+        if account.reserved_mailboxes:
+            raise ProtocolFailure(
+                "policy_conflict: IMAP protocol commands are unavailable for an account with reserved_mailboxes; use focused tools"
+            )
         if (
             not {"organize", "delete", "append"}.issubset(grants)
             or settings.allowed_senders

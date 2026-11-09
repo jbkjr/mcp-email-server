@@ -23,6 +23,7 @@ from mcp_email_server.application.mutation_policy import (
     require_append_permissions,
     require_mutation,
 )
+from mcp_email_server.application.reserved_mailboxes import require_unreserved
 from mcp_email_server.imap_keywords import ImapKeywordRegistry
 from mcp_email_server.log import logger
 
@@ -79,6 +80,8 @@ class MutationAccountSnapshot:
     tag_registry: ImapKeywordRegistry = field(default_factory=ImapKeywordRegistry)
     allowed_mutations: tuple[MutationClass, ...] = DEFAULT_ALLOWED_MUTATIONS
     drafts_mailbox: str | None = None
+    # Mailboxes no mutation may fill or reshape; empty reserves nothing.
+    reserved_mailboxes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -859,6 +862,16 @@ def validate_mailbox_name(mailbox: str) -> None:
     )
 
 
+def _require_unreserved(
+    account: MutationAccountSnapshot,
+    *,
+    destinations: tuple[str, ...] = (),
+    shapes: tuple[str, ...] = (),
+) -> None:
+    """Refuse, before any effect, a message placement into or shape change of a reserved mailbox."""
+    require_unreserved(account.account_name, account.reserved_mailboxes, destinations=destinations, shapes=shapes)
+
+
 def _validate_email_ids(email_ids: tuple[str, ...]) -> None:
     if not email_ids:
         raise ValueError("email_ids must not be empty")
@@ -1431,9 +1444,11 @@ class SaveToMailboxService(_MutationWorkflow):
         account = self._resolve(command.account_name)
         require_append_permissions(account.allowed_mutations, command.flags)
         _validate_recipient_policy(command, account)
+        _require_unreserved(account, destinations=(command.mailbox,))
         access = self._open(account)
         require_append_permissions(access.account.allowed_mutations, command.flags)
         _validate_recipient_policy(command, access.account)
+        _require_unreserved(access.account, destinations=(command.mailbox,))
         _preflight_attachment_sizes(command.attachments)
         try:
             outcome = _validate_append_result(
@@ -1490,12 +1505,14 @@ class SaveDraftService(_MutationWorkflow):
         if mailbox is None:
             mailbox = await _bounded_provider_effect(access.provider.find_drafts_mailbox())
         validate_mailbox_name(mailbox)
+        _require_unreserved(account, destinations=(mailbox,))
         # Discovery is a read; reopen fresh authority before the independent APPEND.
         access = self._open(account)
         require_mutation(access.account.allowed_mutations, "draft")
         if access.account.drafts_mailbox != account.drafts_mailbox:
             raise PermissionError("Draft mailbox authority changed; retry")
         _validate_recipient_policy(command, access.account)
+        _require_unreserved(access.account, destinations=(mailbox,))
         _preflight_attachment_sizes(command.attachments)
         append = DraftAppendCommand(**vars(command), mailbox=mailbox, flags=(r"\Draft",))
         try:
@@ -1549,6 +1566,7 @@ class DeleteService(_MutationWorkflow):
                 destination_mailbox=trash_mailbox,
             )
             move.validate()
+            _require_unreserved(account, destinations=(trash_mailbox,))
         # Re-resolve selected-mode authority immediately before the delete effect.
         access = self._providers.open(
             command.account_name,
@@ -1556,6 +1574,8 @@ class DeleteService(_MutationWorkflow):
             purpose="incoming",
         )
         require_mutation(access.account.allowed_mutations, "delete")
+        if trash_mailbox is not None:
+            _require_unreserved(access.account, destinations=(trash_mailbox,))
         # Trash-first is still a delete: the move into Trash is authorized by the
         # delete grant, so an account without ``organize`` can still delete.
         effect = (
@@ -1597,6 +1617,8 @@ class MoveService(_MutationWorkflow):
         command.validate()
         account = self._resolve(command.account_name)
         require_mutation(account.allowed_mutations, "organize")
+        if command.destination_mailbox is not None:
+            _require_unreserved(account, destinations=(command.destination_mailbox,))
         access = self._open(account)
         require_mutation(access.account.allowed_mutations, "organize")
         if command.destination_role == "junk":
@@ -1610,6 +1632,7 @@ class MoveService(_MutationWorkflow):
             access = self._open(account)
             require_mutation(access.account.allowed_mutations, "organize")
         destination_mailbox = cast(str, command.destination_mailbox)
+        _require_unreserved(access.account, destinations=(destination_mailbox,))
         try:
             outcome = _validate_batch_result(
                 await _bounded_provider_effect(access.provider.move(command, access.account))
@@ -1657,6 +1680,7 @@ class ArchiveService(_MutationWorkflow):
             destination_mailbox=archive_mailbox,
         )
         move.validate()
+        _require_unreserved(account, destinations=(archive_mailbox,))
         # Re-resolve selected-mode authority immediately before the move effect.
         access = self._providers.open(
             command.account_name,
@@ -1664,6 +1688,7 @@ class ArchiveService(_MutationWorkflow):
             purpose="incoming",
         )
         require_mutation(access.account.allowed_mutations, "organize")
+        _require_unreserved(access.account, destinations=(archive_mailbox,))
         try:
             outcome = _validate_batch_result(await _bounded_provider_effect(access.provider.move(move, access.account)))
         except TimeoutError:
@@ -1698,8 +1723,10 @@ class CreateMailboxService(_MutationWorkflow):
         command.validate()
         account = self._resolve(command.account_name)
         require_mutation(account.allowed_mutations, "organize")
+        _require_unreserved(account, shapes=(command.mailbox,))
         access = self._open(account)
         require_mutation(access.account.allowed_mutations, "organize")
+        _require_unreserved(access.account, shapes=(command.mailbox,))
         status: MailboxCreationStatus
         try:
             status = await _bounded_provider_effect(access.provider.create_mailbox(command, access.account))
@@ -1835,6 +1862,8 @@ class ReplyService(_MutationWorkflow):
             self._require_send_capability(account)
         else:
             require_append_permissions(account.allowed_mutations, None)
+            # The delegated save checks again; refusing here keeps the source unread.
+            _require_unreserved(account, destinations=(command.draft_mailbox,))
         _validate_recipient_policy(command, account)
 
     async def execute(self, command: ReplyCommand) -> SendMutationOutcome | AppendMutationOutcome:
@@ -1883,8 +1912,10 @@ class CopyService(_MutationWorkflow):
         command.validate()
         account = self._resolve(command.account_name)
         require_mutation(account.allowed_mutations, "organize")
+        _require_unreserved(account, destinations=(command.destination_mailbox,))
         access = self._open(account)
         require_mutation(access.account.allowed_mutations, "organize")
+        _require_unreserved(access.account, destinations=(command.destination_mailbox,))
         try:
             outcome = _validate_batch_result(
                 await _bounded_provider_effect(access.provider.copy(command, access.account))
@@ -1928,14 +1959,16 @@ class _FolderShapeService(_MutationWorkflow):
         if not account.enable_folder_management:
             raise PermissionError(cls._FOLDER_MANAGEMENT_DENIED)
 
-    def _authorize(self, account_name: str) -> MutationProviderAccess:
+    def _authorize(self, account_name: str, mailboxes: tuple[str, ...]) -> MutationProviderAccess:
         account = self._resolve(account_name)
         self._require_folder_management(account)
         require_mutation(account.allowed_mutations, self._grant)
+        _require_unreserved(account, shapes=mailboxes)
         # Re-resolve selected-mode authority immediately before the shape effect.
         access = self._open(account)
         self._require_folder_management(access.account)
         require_mutation(access.account.allowed_mutations, self._grant)
+        _require_unreserved(access.account, shapes=mailboxes)
         return access
 
     async def _settle(
@@ -1959,7 +1992,7 @@ class _FolderShapeService(_MutationWorkflow):
 class CreateFolderService(_FolderShapeService):
     async def execute(self, command: CreateFolderCommand) -> FolderMutationOutcome:
         command.validate()
-        access = self._authorize(command.account_name)
+        access = self._authorize(command.account_name, (command.folder_name,))
         try:
             outcome = _validate_folder_result(
                 await _bounded_provider_effect(access.provider.create_folder(command, access.account))
@@ -1974,7 +2007,7 @@ class DeleteFolderService(_FolderShapeService):
 
     async def execute(self, command: DeleteFolderCommand) -> FolderMutationOutcome:
         command.validate()
-        access = self._authorize(command.account_name)
+        access = self._authorize(command.account_name, (command.folder_name,))
         try:
             outcome = _validate_folder_result(
                 await _bounded_provider_effect(access.provider.delete_folder(command, access.account))
@@ -1987,7 +2020,7 @@ class DeleteFolderService(_FolderShapeService):
 class RenameFolderService(_FolderShapeService):
     async def execute(self, command: RenameFolderCommand) -> FolderMutationOutcome:
         command.validate()
-        access = self._authorize(command.account_name)
+        access = self._authorize(command.account_name, (command.old_name, command.new_name))
         try:
             outcome = _validate_folder_result(
                 await _bounded_provider_effect(access.provider.rename_folder(command, access.account))

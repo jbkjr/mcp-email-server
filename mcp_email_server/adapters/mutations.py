@@ -51,6 +51,7 @@ from mcp_email_server.application.mutations import (
     SetEmailTagsCommand,
     _validate_recipient_policy,
 )
+from mcp_email_server.application.reserved_mailboxes import require_unreserved
 from mcp_email_server.config import EmailSettings, Settings
 from mcp_email_server.emails.classic import ClassicEmailHandler, _validate_flags
 from mcp_email_server.imap_keywords import ImapKeywordRegistry
@@ -100,12 +101,18 @@ class ClassicMutationProvider:
         command: ComposeCommand | None = None,
         *,
         check_tags: bool = False,
+        destinations: tuple[str, ...] = (),
+        shapes: tuple[str, ...] = (),
     ) -> None:
         def check() -> None:
             try:
                 current = self._fresh_authority() if self._fresh_authority is not None else account
             except (ValueError, RuntimeError) as exc:
                 raise PermissionError("Mutation account authority is unavailable; retry") from exc
+            # Fresh authority, immediately before each IMAP mutation command.
+            require_unreserved(
+                current.account_name, current.reserved_mailboxes, destinations=destinations, shapes=shapes
+            )
             if grant == "append" and isinstance(command, SaveToMailboxCommand):
                 require_append_permissions(current.allowed_mutations, command.flags)
             else:
@@ -165,7 +172,12 @@ class ClassicMutationProvider:
         command: SaveToMailboxCommand,
         account: MutationAccountSnapshot,
     ) -> AppendMutationOutcome:
-        self._guard(account, "draft" if isinstance(command, DraftAppendCommand) else "append", command)
+        self._guard(
+            account,
+            "draft" if isinstance(command, DraftAppendCommand) else "append",
+            command,
+            destinations=(command.mailbox,),
+        )
         message = self._handler.incoming_client.compose_message(
             list(command.recipients),
             command.subject,
@@ -214,7 +226,7 @@ class ClassicMutationProvider:
             raise ValueError("Move destination must be resolved before provider access")
         if grant not in ("organize", "delete"):
             raise ValueError("Move must be authorized by the organize or delete grant")
-        self._guard(account, grant)
+        self._guard(account, grant, destinations=(command.destination_mailbox,))
         return await _bounded_mutation_call(
             self._handler.incoming_client.move_emails_with_outcome(
                 list(command.email_ids),
@@ -230,7 +242,7 @@ class ClassicMutationProvider:
         command: CopyCommand,
         account: MutationAccountSnapshot,
     ) -> BatchMutationOutcome:
-        self._guard(account, "organize")
+        self._guard(account, "organize", destinations=(command.destination_mailbox,))
         return await _bounded_mutation_call(
             self._handler.incoming_client.copy_emails_with_outcome(
                 list(command.email_ids),
@@ -259,7 +271,7 @@ class ClassicMutationProvider:
         command: CreateFolderCommand,
         account: MutationAccountSnapshot,
     ) -> FolderMutationOutcome:
-        self._guard(account, "organize")
+        self._guard(account, "organize", shapes=(command.folder_name,))
         return await self._mailbox_shape_effect(
             self._handler.incoming_client.create_mailbox_with_outcome(command.folder_name)
         )
@@ -269,7 +281,7 @@ class ClassicMutationProvider:
         command: DeleteFolderCommand,
         account: MutationAccountSnapshot,
     ) -> FolderMutationOutcome:
-        self._guard(account, "delete")
+        self._guard(account, "delete", shapes=(command.folder_name,))
         return await self._mailbox_shape_effect(
             self._handler.incoming_client.delete_mailbox_with_outcome(command.folder_name)
         )
@@ -279,7 +291,7 @@ class ClassicMutationProvider:
         command: RenameFolderCommand,
         account: MutationAccountSnapshot,
     ) -> FolderMutationOutcome:
-        self._guard(account, "organize")
+        self._guard(account, "organize", shapes=(command.old_name, command.new_name))
         return await self._mailbox_shape_effect(
             self._handler.incoming_client.rename_mailbox_with_outcome(command.old_name, command.new_name)
         )
@@ -305,7 +317,7 @@ class ClassicMutationProvider:
         command: CreateMailboxCommand,
         account: MutationAccountSnapshot,
     ) -> MailboxCreationStatus:
-        self._guard(account, "organize")
+        self._guard(account, "organize", shapes=(command.mailbox,))
         return await _bounded_mutation_call(self._handler.incoming_client.create_mailbox(command.mailbox))
 
     async def find_drafts_mailbox(self) -> str:
@@ -572,6 +584,7 @@ class LocalMutationBackend:
                     else resolved.account.allowed_mutations
                 ),
                 drafts_mailbox=resolved.account.drafts_mailbox,
+                reserved_mailboxes=tuple(resolved.account.reserved_mailboxes),
             ),
         )
 

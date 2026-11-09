@@ -39,6 +39,7 @@ from mcp_email_server.application.mutation_policy import (
     parse_mutations,
     validate_mutations,
 )
+from mcp_email_server.application.reserved_mailboxes import normalize_reserved_mailboxes
 from mcp_email_server.bootstrap import (
     Bootstrap,
     Mode,
@@ -90,6 +91,11 @@ def _is_credential_storage_mode(value: str) -> TypeGuard[CredentialStorage]:
 # env-composited state (override pickup, env-account injection, allowlist/bool env
 # reads) and always attempt keyring resolution regardless of credential_storage.
 _MIGRATION_LOAD = False
+
+
+def _parse_csv_env(name: str) -> list[str]:
+    """Split a comma-separated environment value, dropping blank items; unset is empty."""
+    return [item for item in os.getenv(name, "").split(",") if item.strip()]
 
 
 def _parse_bool_env(value: str | None, default: bool = False) -> bool:
@@ -424,12 +430,21 @@ class EmailSettings(AccountAttributes):
     allowed_mutations: list[MutationClass] | None = None
     drafts_mailbox: str | None = None
     allow_protocol_commands: bool = False
+    # Mailboxes the account owner keeps for their own use (for example a label
+    # whose application is their approval signal). No mutation may place a message
+    # in one or reshape one; see application/reserved_mailboxes.py. Legacy only.
+    reserved_mailboxes: list[str] = []
     # None inherits MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH, which defaults to auto.
     # Managed accounts leave this unset; auto still quotes imap.qq.com by host.
     imap_non_ascii_search: ImapNonAsciiSearchMode | None = None
     # None inherits MCP_EMAIL_SERVER_IMAP_SEARCH_MODE, which defaults to server.
     # Managed accounts leave this unset and follow that same process default.
     imap_search_mode: ImapSearchMode | None = None
+
+    @field_validator("reserved_mailboxes")
+    @classmethod
+    def validate_reserved_mailboxes(cls, value: list[str]) -> list[str]:
+        return normalize_reserved_mailboxes(value)
 
     @model_validator(mode="after")
     def validate_tags(self) -> EmailSettings:
@@ -478,6 +493,7 @@ class EmailSettings(AccountAttributes):
         allowed_mutations: list[MutationClass] | None = None,
         drafts_mailbox: str | None = None,
         allow_protocol_commands: bool = False,
+        reserved_mailboxes: Iterable[str] = (),
     ) -> EmailSettings:
         for candidate in (password, imap_password, smtp_password):
             if candidate == keyring_store.SENTINEL:
@@ -523,6 +539,7 @@ class EmailSettings(AccountAttributes):
             allowed_mutations=allowed_mutations,
             drafts_mailbox=drafts_mailbox,
             allow_protocol_commands=allow_protocol_commands,
+            reserved_mailboxes=list(reserved_mailboxes),
         )
 
     @classmethod
@@ -551,6 +568,7 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_SMTP_USER_AGENT (default: mcp-email-server; empty omits the header)
         - MCP_EMAIL_SERVER_SMTP_X_MAILER (default: mcp-email-server; empty omits the header)
         - MCP_EMAIL_SERVER_ALLOW_PROTOCOL_COMMANDS (default: false)
+        - MCP_EMAIL_SERVER_RESERVED_MAILBOXES (comma-separated; default: none)
         """
         # Check if minimum required environment variables are set
         email_address = os.getenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS")
@@ -599,6 +617,7 @@ class EmailSettings(AccountAttributes):
                 smtp_x_mailer=os.getenv("MCP_EMAIL_SERVER_SMTP_X_MAILER", DEFAULT_SMTP_X_MAILER),
                 drafts_mailbox=os.getenv("MCP_EMAIL_SERVER_DRAFTS_MAILBOX"),
                 allow_protocol_commands=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_ALLOW_PROTOCOL_COMMANDS"), False),
+                reserved_mailboxes=_parse_csv_env("MCP_EMAIL_SERVER_RESERVED_MAILBOXES"),
                 allowed_mutations=(
                     list(
                         parse_mutations([
@@ -761,6 +780,9 @@ class Settings(BaseSettings):
             env_email.save_to_sent = effective_save_to_sent(stored.save_to_sent)
             if "MCP_EMAIL_SERVER_SENT_FOLDER_NAME" not in os.environ:
                 env_email.sent_folder_name = stored.sent_folder_name
+            # Replacing endpoints must never silently drop the owner's reservation.
+            if "MCP_EMAIL_SERVER_RESERVED_MAILBOXES" not in os.environ:
+                env_email.reserved_mailboxes = list(stored.reserved_mailboxes)
             self.emails[existing_account] = env_email
             logger.info(f"Overriding email account '{env_email.account_name}' with environment variables")
         else:
