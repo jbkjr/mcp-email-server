@@ -753,7 +753,13 @@ sent_folder_name = "INBOX.Sent"
 
 Set `save_to_sent = false` to disable the IMAP append after sending. The
 environment equivalents are `MCP_EMAIL_SERVER_SAVE_TO_SENT` and
-`MCP_EMAIL_SERVER_SENT_FOLDER_NAME`.
+`MCP_EMAIL_SERVER_SENT_FOLDER_NAME`. When environment variables override a
+stored account with the same name and `MCP_EMAIL_SERVER_SAVE_TO_SENT` is
+omitted, the stored account's `save_to_sent` value is kept, so supplying
+credentials through the environment cannot switch a disabled Sent copy back on.
+An omitted `MCP_EMAIL_SERVER_SENT_FOLDER_NAME` likewise keeps the stored
+`sent_folder_name`. An account defined only by environment variables keeps the
+default, `true`.
 
 ## Quoted reply markup
 
@@ -878,7 +884,7 @@ after changing legacy TOML.
 | `MCP_EMAIL_SERVER_SMTP_VERIFY_SSL`           | `true`                    | No       | Verify the SMTP TLS certificate.                                                                                                            |
 | `MCP_EMAIL_SERVER_SMTP_USER_NAME`            | Shared username           | No       | SMTP-specific username.                                                                                                                     |
 | `MCP_EMAIL_SERVER_SMTP_PASSWORD`             | Shared password           | No       | Non-empty SMTP-specific password; empty uses shared.                                                                                        |
-| `MCP_EMAIL_SERVER_SAVE_TO_SENT`              | `true`                    | No       | Append sent messages to an IMAP Sent folder.                                                                                                |
+| `MCP_EMAIL_SERVER_SAVE_TO_SENT`              | `true` (env-only account) | No       | Append sent messages to an IMAP Sent folder. Omitted: a same-name stored account keeps its value.                                           |
 | `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`          | Auto-detected             | No       | Override the Sent folder name.                                                                                                              |
 | `MCP_EMAIL_SERVER_EMAIL_SERVICE`             | Auto-detected             | No       | Quoted-reply markup: `protonmail`, `gmail`, or `generic`.                                                                                   |
 | `MCP_EMAIL_SERVER_SMTP_USER_AGENT`           | `mcp-email-server`        | No       | Outgoing `User-Agent`; empty omits the header.                                                                                              |

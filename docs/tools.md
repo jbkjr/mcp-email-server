@@ -138,8 +138,11 @@ capability records. Each record contains `account_name`, `account_type`,
 descriptions are limited to 4 KiB of UTF-8 data and expose the same structural
 bound in the output schema. In managed mode, disabled accounts are omitted before any credential lookup or provider
 access. Use only an account with `can_receive=true` for mail reads and
-`can_send=true` for `send_email` and `forward_email`. Text content, structured
-content, and the output schema describe the same fields.
+`can_send=true` for `send_email`, `forward_email`, and a `reply_email` that
+sends. A `reply_email` draft (`draft_mailbox` set) reads the source and appends
+over IMAP, so it needs `can_receive=true` and the `append` grant rather than
+`can_send`. Text content, structured content, and the output schema describe the
+same fields.
 
 If the result is empty, account setup is unavailable over MCP. The agent should
 ask the user to run `mcp-email-server ui` or the documented interactive CLI in
@@ -732,15 +735,16 @@ same as for `send_email`, and draft reporting is the same as for
 
 ### Markdown message bodies
 
-Every composed message body — `send_email`, `forward_email`, and
-`save_to_mailbox` alike — is written in Markdown and rendered to email-safe HTML
+Every composed message body — `send_email`, `reply_email`, `forward_email`,
+`save_to_mailbox`, and `save_draft` alike — is written in Markdown and rendered to email-safe HTML
 before the MIME container is built. Headings, bold and italic text, links,
 bullet and numbered lists, tables, and fenced code blocks are all supported, and
 single newlines become line breaks so ordinary prose keeps the shape you wrote
 it in. The rendered document carries minimal inline styles rather than CSS
 classes, because mail clients cannot be relied on to keep a stylesheet.
 
-Set `html=true` on `send_email` or `save_to_mailbox` when the body is already
+Set `html=true` on `send_email`, `reply_email`, `save_to_mailbox`, or
+`save_draft` when the body is already
 pre-formatted raw HTML. That suppresses rendering and sends the body exactly as
 supplied; it is not a way to ask for a plain-text message. `forward_email` has
 no `html` parameter: its note is always Markdown.
@@ -1221,8 +1225,10 @@ static for the lifetime of a server process. `send_email`,
 `list_allowed_recipients`, `list_allowed_senders`, and `download_attachment` are
 always advertised. Account existence, enabled state, SMTP capability, and
 current policies are enforced when each tool is called. An unset or empty
-recipient list leaves `send_email`, `forward_email`, and `save_to_mailbox`
-unrestricted, and `list_allowed_recipients` reports it as `*`. An empty sender list
+recipient list leaves every send and save path (`send_email`, `forward_email`,
+`reply_email`, `save_to_mailbox`, and `save_draft`) unrestricted, and
+`list_allowed_recipients` reports it as `*`; a non-empty list applies to all of
+them. An empty sender list
 does not restrict reading. A recipientless `save_draft` remains permitted by `draft`;
 under a non-empty list any supplied recipient requires a match. Recipient entries support case-insensitive, whole-address glob
 matching (`*`, `?`, and bracket expressions), such as `*@example.com`.
@@ -1240,6 +1246,10 @@ the selected configuration authority.
 
 ## Reply threading
 
+`reply_email` derives both threading headers from the source message itself;
+prefer it when the message being answered is in a mailbox. The steps below are
+the explicit-header workflow for `send_email`.
+
 To preserve conversation threading:
 
 1. Fetch the original message with `get_emails_content`.
@@ -1251,8 +1261,8 @@ To preserve conversation threading:
 Simple Message-IDs may be bare or already enclosed in angle brackets; the compose
 path emits the required bracketed RFC form for both headers.
 
-`send_email` and `forward_email` name the delivered message's own `Message-Id` in
-their response, so a follow-up in the same thread can be built from it without
+`send_email`, `reply_email`, and `forward_email` name the delivered message's own
+`Message-Id` in their response, so a follow-up in the same thread can be built from it without
 first locating the message again over IMAP.
 
 For a complete example, see [Reply with proper threading](guides.md#reply-with-proper-threading).

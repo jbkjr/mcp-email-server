@@ -401,7 +401,9 @@ async def get_account(account_name: str) -> AvailableAccount | None:
 @mcp.tool(
     description=(
         "List configured accounts as stable non-secret capability records. Use only accounts with "
-        "can_receive=true for mail reads and can_send=true for send_email and forward_email. If the result is "
+        "can_receive=true for mail reads and can_send=true for send_email, forward_email, and reply_email when "
+        "it sends; a reply_email draft (draft_mailbox) needs can_receive=true and the append grant instead. "
+        "If the result is "
         "empty, ask the user to run `mcp-email-server ui` or the user-operated CLI; never ask for credentials "
         "in chat."
     ),
@@ -651,8 +653,9 @@ async def get_emails_content(
 
 @mcp.tool(
     description=(
-        "List the configured recipient allowlist — the address patterns that send_email and forward_email are "
-        "permitted to send to and save_to_mailbox is permitted to address. Matching is case-insensitive and "
+        "List the configured recipient allowlist — the address patterns that every send and save path checks: "
+        "send_email, forward_email, and reply_email may send only to them, and save_to_mailbox, save_draft, "
+        "and reply_email drafts may address only them. Matching is case-insensitive and "
         "supports glob patterns such as *@example.com; * allows all recipients. An unset or empty configured "
         "list leaves recipients unrestricted and is reported here as *. A non-empty list restricts recipients "
         "to its patterns; configure it through the user-operated CLI/UI."
@@ -667,7 +670,8 @@ async def list_allowed_recipients() -> PolicyDiscoveryResult:
     description=(
         "List the configured inbound sender allowlist — the address patterns whose mail the server "
         "will read or act on. When configured, only these senders' mail is visible to the read tools "
-        "(list_emails_metadata, get_emails_content, download_attachment, and forward_email's source read) "
+        "(list_emails_metadata, get_emails_content, download_attachment, and the source reads of "
+        "forward_email and reply_email) "
         "and eligible for the mutation "
         "tools (delete_emails, set_email_flags, mark_emails_as_read, move_emails, archive_emails, "
         "copy_emails, apply_label, remove_label). Returns an "

@@ -531,8 +531,9 @@ responsibility.
 ## Recipient allowlist
 
 Sending is unrestricted when the allowed-recipient collection is unset or empty.
-Restrict `send_email`, `forward_email`, and `save_to_mailbox` by adding exact
-addresses or bare glob patterns:
+Restrict every send and save path (`send_email`, `forward_email`, `reply_email`
+whether it sends or saves a draft, `save_to_mailbox`, and `save_draft`) by adding
+exact addresses or bare glob patterns:
 
 ```toml
 allowed_recipients = [
@@ -641,6 +642,9 @@ The allowlist protects:
 - The `forward_email` source read and SMTP handoff. A blocked source is
   indistinguishable from a missing message, and a sender policy tightened after
   the read is rechecked before SMTP, so a forward never reveals or delivers it.
+- The `reply_email` source read, its SMTP handoff, and its draft save. A
+  blocked source is indistinguishable from a missing message, and the policy is
+  rechecked after the read, before either effect.
 - Deletion and approved flag/read-state mutations.
 - Move and archive operations.
 - Copy operations, including applying a label.
