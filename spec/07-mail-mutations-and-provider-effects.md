@@ -613,7 +613,13 @@ enter public errors.
     that every other read failure — unreadable, unparseable, oversized, timed out —
     aborts before any SMTP session opens rather than sending unquoted, that an
     allowlist-blocked source is indistinguishable from an absent one, and that the
-    body carrying the appended quote is revalidated against the body bound.
+    caller's body plus the quote is revalidated against the body bound. The quote
+    block is carried to composition separately from the caller's body and is
+    appended only after that body is rendered, so the original's HTML never passes
+    through the Markdown renderer. Tests prove, for every quote markup shape, that a
+    malformed original (a stray closing tag followed by reference definitions,
+    indented lines, or `#` lines) cannot add links to the caller's text or turn
+    quoted lines into code blocks or headings.
 18. Outgoing sender-software identification is configuration, not a constant: each
     identification header is separately configurable, an empty value omits that
     header, and the defaults carry no account-specific information. A value

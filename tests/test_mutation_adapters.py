@@ -404,6 +404,8 @@ async def test_mutation_adapter_submits_forward_body_verbatim_with_reattached_pa
         None,
         None,
         extra_parts=[part],
+        # A forward's block was escaped into the body above; it never carries a reply quote.
+        quote_html=None,
     )
 
 

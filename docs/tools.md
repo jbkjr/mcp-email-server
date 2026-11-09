@@ -768,8 +768,16 @@ session is opened. The two outcomes are deliberately different:
 When a sender allowlist is configured, a blocked sender's message is treated as
 absent, so the allowlist cannot be used to probe which messages exist.
 
-The merged body is revalidated against the 1 MiB body bound after the quote is
-appended, so a large quote is rejected rather than silently truncated.
+The quote never passes through the Markdown renderer. Only your body is rendered;
+the quote block is appended to the rendered HTML afterwards, and the document is
+wrapped once. A Markdown pass over the original's HTML would let a malformed or
+hostile original (for example one with a stray closing tag) define reference
+links that change bracketed text in your reply, or turn quoted lines into code
+blocks and headings. With `html=true` the quote is appended to your HTML body as
+before.
+
+Your body and the quote together are checked against the 1 MiB body bound before
+anything is sent, so a large quote is rejected rather than silently truncated.
 
 The quote's markup follows the account's mail service, because clients only
 collapse a quote block they recognize. The service is detected from the IMAP

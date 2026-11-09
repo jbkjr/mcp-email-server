@@ -355,11 +355,13 @@ class ClassicMutationProvider:
         *,
         reply_to: str | None,
         extra_parts: list[Message] | None = None,
+        quote_html: str | None = None,
     ) -> DeliveryMutationOutcome:
         """One SMTP submission shape shared by send and forward.
 
         A change to the delivery call lands here once, so forwards can never
-        silently diverge from sends.
+        silently diverge from sends. ``quote_html`` stays separate from the body
+        all the way to composition, which appends it after rendering the body.
         """
         client = self._handler.outgoing_client
         if client is None:
@@ -377,6 +379,7 @@ class ClassicMutationProvider:
                 command.references,
                 reply_to,
                 extra_parts=extra_parts,
+                quote_html=quote_html,
             )
         )
 
@@ -409,7 +412,7 @@ class ClassicMutationProvider:
         account: MutationAccountSnapshot,
     ) -> DeliveryMutationOutcome:
         self._guard(account, "send", command)
-        return await self._submit(command, reply_to=command.reply_to)
+        return await self._submit(command, reply_to=command.reply_to, quote_html=command.quote_html)
 
     async def _read_forward_source(
         self,

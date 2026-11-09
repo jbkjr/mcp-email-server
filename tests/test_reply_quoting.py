@@ -2,20 +2,23 @@
 
 import asyncio
 from datetime import UTC, datetime
+from email.parser import BytesParser
+from email.policy import default
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import tomli_w
 
-from mcp_email_server.adapters.mutations import ClassicMutationProvider
+from mcp_email_server.adapters.mutations import ClassicMutationProvider, LocalMutationBackend
 from mcp_email_server.application.mutations import (
     MutationAccountSnapshot,
     MutationProviderError,
+    MutationServices,
     QuoteSource,
     SendCommand,
     SendService,
-    _quoted_body,
 )
-from mcp_email_server.config import EmailServer, EmailSettings, Settings
+from mcp_email_server.config import CONFIG_PATH, EmailServer, EmailSettings, Settings
 from mcp_email_server.emails.classic import (
     MAX_QUOTED_BODY_LENGTH,
     MAX_RAW_EMAIL_BYTES,
@@ -25,7 +28,6 @@ from mcp_email_server.emails.classic import (
     _format_quoted_reply_html,
     _strip_html_wrappers,
 )
-from mcp_email_server.emails.markdown_utils import markdown_to_email_html
 
 
 def _make_settings(
@@ -288,19 +290,10 @@ class TestServiceAwareQuoteFormat:
             assert "<br>" in result
 
 
-class TestQuotedBodyMerge:
-    """The merged body is what actually reaches composition."""
+class TestQuoteComposition:
+    """The quote is appended to the rendered body, never rendered with it."""
 
-    def test_quote_follows_the_caller_body(self):
-        merged = _quoted_body("my reply", "<div>quote</div>")
-
-        assert merged == "my reply\n\n<div>quote</div>"
-
-    def test_empty_body_leaves_the_quote_alone(self):
-        assert _quoted_body("", "<div>quote</div>") == "<div>quote</div>"
-
-    def test_quote_markup_survives_markdown_rendering(self):
-        """Markdown passes block-level HTML through, so the quote arrives intact."""
+    def test_markdown_body_is_rendered_and_the_quote_appended_once(self, email_client):
         original = {
             "from": "Alice <alice@example.com>",
             "date": datetime(2024, 3, 15, 14, 30, tzinfo=UTC),
@@ -308,11 +301,28 @@ class TestQuotedBodyMerge:
             "html_body": "",
         }
         quote = _format_quoted_reply_html(original, service="generic")
-        rendered = markdown_to_email_html(_quoted_body("My **reply**", quote), wrap_in_html=False)
 
-        assert "<strong>reply</strong>" in rendered
-        assert '<blockquote type="cite"' in rendered
-        assert "Original body" in rendered
+        message = email_client.compose_message(["alice@example.com"], "Re: hi", "My **reply**", quote_html=quote)
+        document = message.get_payload(decode=True).decode()
+
+        assert "<strong>reply</strong>" in document
+        assert quote in document
+        assert document.index("<strong>reply</strong>") < document.index(quote)
+        assert document.count("<!DOCTYPE html>") == 1
+
+    def test_empty_body_carries_only_the_quote(self, email_client):
+        message = email_client.compose_message(["alice@example.com"], "Re: hi", "", quote_html="<div>quote</div>")
+        document = message.get_payload(decode=True).decode()
+
+        assert "<div>quote</div>" in document
+        assert "<p>" not in document
+
+    def test_raw_html_body_gets_the_quote_appended_unwrapped(self, email_client):
+        message = email_client.compose_message(
+            ["alice@example.com"], "Re: hi", "<p>raw</p>", html=True, quote_html="<div>quote</div>"
+        )
+
+        assert message.get_payload(decode=True).decode() == "<p>raw</p>\n\n<div>quote</div>"
 
 
 def _snapshot(allowed_senders: tuple[str, ...] = ()) -> MutationAccountSnapshot:
@@ -361,7 +371,7 @@ class TestSendServiceQuoting:
     """The workflow decides whether to quote, and never sends a silently unquoted reply."""
 
     @pytest.mark.asyncio
-    async def test_reply_appends_the_quote_before_sending(self):
+    async def test_reply_carries_the_quote_beside_the_body(self):
         provider = _StubProvider(QuoteSource(quote_html="<div>QUOTE</div>"))
         command = SendCommand(
             account_name="test",
@@ -374,7 +384,9 @@ class TestSendServiceQuoting:
         await _service_with(provider).execute(command)
 
         assert provider.sent is not None
-        assert provider.sent.body == "my reply\n\n<div>QUOTE</div>"
+        # The quote travels beside the caller's body, so only the body is Markdown.
+        assert provider.sent.body == "my reply"
+        assert provider.sent.quote_html == "<div>QUOTE</div>"
 
     @pytest.mark.asyncio
     async def test_quote_reply_false_never_reads_the_original(self):
@@ -393,6 +405,7 @@ class TestSendServiceQuoting:
         assert provider.quote_calls == 0
         assert provider.sent is not None
         assert provider.sent.body == "my reply"
+        assert provider.sent.quote_html is None
 
     @pytest.mark.asyncio
     async def test_a_send_that_is_not_a_reply_never_reads_anything(self):
@@ -424,6 +437,7 @@ class TestSendServiceQuoting:
         assert provider.quote_calls == 1
         assert provider.sent is not None
         assert provider.sent.body == "my reply"
+        assert provider.sent.quote_html is None
 
     @pytest.mark.asyncio
     async def test_unreadable_original_aborts_before_smtp(self):
@@ -453,6 +467,23 @@ class TestSendServiceQuoting:
         )
 
         with pytest.raises(MutationProviderError):
+            await _service_with(provider).execute(command)
+
+        assert provider.sent is None
+
+    @pytest.mark.asyncio
+    async def test_body_and_quote_together_must_fit_the_body_bound(self):
+        """Each piece alone fits, but the reply they compose would not."""
+        provider = _StubProvider(QuoteSource(quote_html="<div>" + "q" * 600_000 + "</div>"))
+        command = SendCommand(
+            account_name="test",
+            recipients=("alice@example.com",),
+            subject="Re: hello",
+            body="r" * 600_000,
+            in_reply_to="<original@example.com>",
+        )
+
+        with pytest.raises(ValueError, match="body exceeds"):
             await _service_with(provider).execute(command)
 
         assert provider.sent is None
@@ -808,3 +839,164 @@ class TestEmailServiceConfiguration:
         assert from_env is not None
         assert from_env.email_service is None
         assert _detect_email_service(from_env) == "gmail"
+
+
+# A sender controls the HTML of the message being quoted. A stray closing tag ends
+# the quote's block-level element early; if the quote were rendered as Markdown
+# together with the caller's body, the reference definitions after it would turn
+# bracketed text in the caller's own reply into links of the sender's choosing.
+_MALICIOUS_ORIGINAL_HTML = (
+    "<p>hello</p></div>\n"
+    "\n"
+    "[1]: https://attacker.example/login\n"
+    "[the invoice]: https://attacker.example/pay\n"
+    "\n"
+    "<p>bye</p>"
+)
+_WELL_FORMED_ORIGINAL_HTML = (
+    "<p>hello</p>\n\n[1]: https://attacker.example/login\n[the invoice]: https://attacker.example/pay\n\n<p>bye</p>"
+)
+_STRUCTURAL_ORIGINAL_HTML = "<p>hello</p></div>\n\n    indented line\n\n# heading line\n\n<p>bye</p>"
+_BRACKETED_REPLY = "Thanks. Details are in [1], and [the invoice] is attached."
+
+
+def _quote_of(html_body: str, service: str) -> str:
+    original = {
+        "from": "Mallory <mallory@example.test>",
+        "date": datetime(2026, 11, 9, 9, 0, tzinfo=UTC),
+        "body": "",
+        "html_body": html_body,
+    }
+    return _format_quoted_reply_html(original, service=service)
+
+
+def _smtp_session():
+    smtp = AsyncMock()
+    smtp.__aenter__.return_value = smtp
+    smtp.__aexit__.return_value = False
+    smtp.supports_extension = MagicMock(return_value=True)
+    return smtp
+
+
+async def _send_quoted_through_composer(
+    monkeypatch,
+    quote_html: str | None,
+    *,
+    body: str = _BRACKETED_REPLY,
+    html: bool = False,
+    attachments: tuple[str, ...] = (),
+):
+    """Run send_email's workflow from SendService to the composed SMTP DATA bytes.
+
+    Only the network edges are faked: the quote read returns provider-formatted
+    HTML and SMTP records the one DATA payload. Composition is the real one.
+    """
+    stored = _make_settings().model_copy(update={"save_to_sent": False})
+    CONFIG_PATH.write_text(tomli_w.dumps({"emails": [stored.model_dump(exclude_none=True)]}))
+    settings = Settings()
+    monkeypatch.setattr("mcp_email_server.adapters.authority.get_settings", lambda: settings)
+    backend = LocalMutationBackend()
+    projections = MagicMock()
+    projections.open = AsyncMock(return_value=MagicMock(invalidate=AsyncMock()))
+    services = MutationServices.compose(backend, backend, projections)
+    smtp = _smtp_session()
+    quote = AsyncMock(return_value=quote_html)
+    with (
+        patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp),
+        patch("mcp_email_server.emails.classic.ClassicEmailHandler.fetch_quote_source", quote),
+    ):
+        await services.send.execute(
+            SendCommand(
+                stored.account_name,
+                ("recipient@example.test",),
+                "Re: Topic",
+                body,
+                html=html,
+                attachments=attachments,
+                in_reply_to="<parent@example.test>",
+            )
+        )
+    quote.assert_awaited_once()
+    smtp.data.assert_awaited_once()
+    wire = BytesParser(policy=default).parsebytes(smtp.data.await_args.args[0])
+    assert str(wire["In-Reply-To"]) == "<parent@example.test>"
+    html_part = wire.get_body(preferencelist=("html",))
+    assert html_part is not None
+    return wire, html_part.get_content()
+
+
+def _reply_paragraph(document: str) -> str:
+    start = document.index("<p>")
+    return document[start : document.index("</p>", start) + len("</p>")]
+
+
+class TestQuotedHtmlNeverReachesTheMarkdownRenderer:
+    """Only the caller's body is Markdown; the original's HTML is appended after rendering."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("service", ["generic", "protonmail", "gmail"])
+    async def test_stray_close_cannot_define_links_in_the_reply(self, monkeypatch, service):
+        quote_html = _quote_of(_MALICIOUS_ORIGINAL_HTML, service)
+
+        _, document = await _send_quoted_through_composer(monkeypatch, quote_html)
+
+        reply = _reply_paragraph(document)
+        assert reply == f"<p>{_BRACKETED_REPLY}</p>"
+        assert "attacker.example" not in reply
+        assert "<a " not in reply
+        assert quote_html in document
+        assert document.index(reply) < document.index(quote_html)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("service", ["generic", "protonmail", "gmail"])
+    async def test_well_formed_original_leaves_the_reply_literal(self, monkeypatch, service):
+        quote_html = _quote_of(_WELL_FORMED_ORIGINAL_HTML, service)
+
+        _, document = await _send_quoted_through_composer(monkeypatch, quote_html)
+
+        assert _reply_paragraph(document) == f"<p>{_BRACKETED_REPLY}</p>"
+        assert quote_html in document
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("service", ["generic", "protonmail", "gmail"])
+    async def test_stray_close_does_not_turn_quoted_lines_into_markup(self, monkeypatch, service):
+        quote_html = _quote_of(_STRUCTURAL_ORIGINAL_HTML, service)
+
+        _, document = await _send_quoted_through_composer(monkeypatch, quote_html, body="My **reply**")
+
+        assert "<strong>reply</strong>" in document
+        assert "<pre>" not in document
+        assert "<code>" not in document
+        assert "<h1>" not in document
+        assert quote_html in document
+
+    @pytest.mark.asyncio
+    async def test_raw_html_body_still_gets_the_quote_appended(self, monkeypatch):
+        quote_html = _quote_of(_MALICIOUS_ORIGINAL_HTML, "generic")
+
+        _, document = await _send_quoted_through_composer(
+            monkeypatch, quote_html, body="<p>Raw [1] reply</p>", html=True
+        )
+
+        assert document.startswith("<p>Raw [1] reply</p>")
+        assert document.rstrip("\n").endswith(quote_html)
+        assert "<!DOCTYPE html>" not in document
+
+    @pytest.mark.asyncio
+    async def test_attachments_and_quote_travel_together(self, monkeypatch, tmp_path):
+        attachment = tmp_path / "synthetic.txt"
+        attachment.write_text("Synthetic attachment")
+        quote_html = _quote_of(_MALICIOUS_ORIGINAL_HTML, "generic")
+
+        wire, document = await _send_quoted_through_composer(monkeypatch, quote_html, attachments=(str(attachment),))
+
+        assert [part.get_filename() for part in wire.iter_attachments()] == ["synthetic.txt"]
+        assert _reply_paragraph(document) == f"<p>{_BRACKETED_REPLY}</p>"
+        assert quote_html in document
+
+    @pytest.mark.asyncio
+    async def test_missing_original_sends_the_rendered_body_alone(self, monkeypatch):
+        _, document = await _send_quoted_through_composer(monkeypatch, None)
+
+        assert _reply_paragraph(document) == f"<p>{_BRACKETED_REPLY}</p>"
+        assert "blockquote" not in document

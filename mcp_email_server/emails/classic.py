@@ -78,7 +78,7 @@ from mcp_email_server.config import (
 )
 from mcp_email_server.emails import EmailHandler, charsets
 from mcp_email_server.emails.html_utils import html_to_text
-from mcp_email_server.emails.markdown_utils import markdown_to_email_html
+from mcp_email_server.emails.markdown_utils import markdown_to_email_html, wrap_html_document
 from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailBodyResponse,
@@ -435,6 +435,24 @@ def _format_quoted_reply_html(original_email: dict[str, Any], service: str = "ge
         f"</blockquote>"
         f"</div>"
     )
+
+
+def _compose_html_body(body: str, *, html: bool, quote_html: str | None) -> str:
+    """Return the HTML body part: the caller's body, then any quoted-reply block.
+
+    Only the caller's body is Markdown. A quote is third-party HTML and is
+    appended after rendering, never rendered itself, then the fragment is
+    wrapped once. A raw-HTML body (``html=True``) is used as given, with the
+    quote appended.
+    """
+    if html:
+        if not quote_html:
+            return body
+        return f"{body}\n\n{quote_html}" if body else quote_html
+    fragment = markdown_to_email_html(body, wrap_in_html=False)
+    if quote_html:
+        fragment = f"{fragment}\n{quote_html}" if fragment else quote_html
+    return wrap_html_document(fragment)
 
 
 class _LiteralSearchCommand(aioimaplib.Command):
@@ -3497,6 +3515,7 @@ class EmailClient:
         reply_to: str | None = None,
         *,
         extra_parts: list[Message] | None = None,
+        quote_html: str | None = None,
     ) -> MIMEText | MIMEMultipart:
         """Compose an email message without sending it.
 
@@ -3521,12 +3540,20 @@ class EmailClient:
         part is UTF-8 ``text/html`` either way, which is the same shape the plain
         branch produced, so RFC 6532 detection is unaffected (it inspects headers,
         never the body).
+
+        ``quote_html`` is a quoted-reply block built from another message's HTML.
+        It never passes through the Markdown renderer: only the caller's body is
+        rendered, the quote is appended to that fragment, and the result is
+        wrapped once. A Markdown pass over third-party HTML would let a stray
+        closing tag in the original end the quote's HTML block early, after which
+        the sender's text could define reference links in the caller's reply or
+        turn quoted lines into code blocks and headings. A raw-HTML body simply
+        has the quote appended.
         """
         envelope_sender = self.envelope_sender
 
-        if not html:
-            body = markdown_to_email_html(body, wrap_in_html=True)
-            html = True
+        body = _compose_html_body(body, html=html, quote_html=quote_html)
+        html = True
 
         if attachments or extra_parts:
             msg = self._create_message_with_attachments(body, html, attachments, extra_parts)
@@ -3594,6 +3621,7 @@ class EmailClient:
         reply_to: str | None = None,
         *,
         extra_parts: list[Message] | None = None,
+        quote_html: str | None = None,
     ) -> DeliveryMutationOutcome:
         """Run one SMTP transaction and preserve phase-specific delivery evidence."""
         msg = self.compose_message(
@@ -3609,6 +3637,7 @@ class EmailClient:
             False,
             reply_to,
             extra_parts=extra_parts,
+            quote_html=quote_html,
         )
         all_recipients = [*recipients, *(cc or []), *(bcc or [])]
         envelope_recipients = [email.utils.parseaddr(recipient)[1] for recipient in all_recipients]

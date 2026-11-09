@@ -482,10 +482,22 @@ class SaveDraftCommand(ComposeCommand):
 class SendCommand(ComposeCommand):
     reply_to: str | None = None
     quote_reply: bool = True
+    # Internal evidence set only by ``SendService`` from the provider's quote read,
+    # never from MCP input. It is carried beside ``body`` rather than merged into
+    # it because ``body`` may be rendered as Markdown and quoted third-party HTML
+    # must never be: a stray closing tag in the original would end the quote's
+    # HTML block early and let the sender's text define links in the reply.
+    quote_html: str | None = None
 
     def validate(self) -> None:
         super().validate()
         _validate_optional_header("reply_to", self.reply_to)
+        if self.quote_html is not None:
+            if not isinstance(self.quote_html, str):
+                raise ValueError("quote_html must be a string")
+            # The body bound covers the reply as composed: caller body plus quote.
+            if len(self.body.encode("utf-8")) + len(self.quote_html.encode("utf-8")) > APPLICATION_LIMITS.body_bytes:
+                raise ValueError(f"body exceeds {APPLICATION_LIMITS.body_bytes} bytes")
 
     @property
     def quotes_original(self) -> bool:
@@ -499,8 +511,9 @@ class QuoteSource:
 
     ``quote_html`` is the provider-composed quote block: attribution line plus the
     styled blockquote, in whichever markup shape the account's service collapses
-    correctly. The application only joins it below the caller's body and never
-    formats it, exactly as it does for a forward's composed block.
+    correctly. The application never formats or renders it: it travels to the
+    provider as ``SendCommand.quote_html``, beside the caller's body, and is
+    appended only after that body has been rendered.
     """
 
     quote_html: str
@@ -973,18 +986,6 @@ def _forwarded_body(note: str, block: str) -> str:
 
     quoted = html.escape(block)
     return f"{note}\n\n{quoted}" if note else quoted
-
-
-def _quoted_body(body: str, quote_html: str) -> str:
-    """Join the caller's body with the provider-composed quote block.
-
-    The block is inserted verbatim as an HTML element. A Markdown body carries it
-    through rendering untouched, because block-level HTML is passed through rather
-    than escaped; a raw-HTML body simply has it appended. Either way the merged
-    result is revalidated against the body bound before anything is sent.
-    """
-
-    return f"{body}\n\n{quote_html}" if body else quote_html
 
 
 def _validate_forward_source(source: ForwardSource) -> None:
@@ -1741,7 +1742,7 @@ class SendService(_MutationWorkflow):
         command: SendCommand,
         account: MutationAccountSnapshot,
     ) -> SendCommand:
-        """Return the command to submit, with the quoted original appended when asked.
+        """Return the command to submit, carrying the quoted original when asked.
 
         The read runs before the outgoing provider is opened, so a reply that cannot
         read what it is quoting fails before any SMTP session exists. Reading is not
@@ -1762,7 +1763,9 @@ class SendService(_MutationWorkflow):
         if source is None:
             return command
 
-        quoted = replace(command, body=_quoted_body(command.body, source.quote_html))
+        # Kept out of ``body``: the provider renders only the caller's text and
+        # appends the quote afterwards. Revalidated so the composed size is bounded.
+        quoted = replace(command, quote_html=source.quote_html)
         quoted.validate()
         return quoted
 
