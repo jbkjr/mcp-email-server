@@ -495,8 +495,11 @@ class SendCommand(ComposeCommand):
         if self.quote_html is not None:
             if not isinstance(self.quote_html, str):
                 raise ValueError("quote_html must be a string")
-            # The body bound covers the reply as composed: caller body plus quote.
-            if len(self.body.encode("utf-8")) + len(self.quote_html.encode("utf-8")) > APPLICATION_LIMITS.body_bytes:
+            # The body bound covers the reply as composed: caller body, the
+            # two-byte separator that joins them, and the quote.
+            separator = 2 if self.body and self.quote_html else 0
+            composed = len(self.body.encode("utf-8")) + separator + len(self.quote_html.encode("utf-8"))
+            if composed > APPLICATION_LIMITS.body_bytes:
                 raise ValueError(f"body exceeds {APPLICATION_LIMITS.body_bytes} bytes")
 
     @property

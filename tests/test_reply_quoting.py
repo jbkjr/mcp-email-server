@@ -11,6 +11,7 @@ import tomli_w
 
 from mcp_email_server.adapters.mutations import ClassicMutationProvider, LocalMutationBackend
 from mcp_email_server.application.mutations import (
+    APPLICATION_LIMITS,
     MutationAccountSnapshot,
     MutationProviderError,
     MutationServices,
@@ -487,6 +488,32 @@ class TestSendServiceQuoting:
             await _service_with(provider).execute(command)
 
         assert provider.sent is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("html", [False, True])
+    @pytest.mark.parametrize("quote", ["<div>q</div>", "<div>caf\u00e9 \u2603</div>"])
+    async def test_the_body_bound_counts_the_separator_between_body_and_quote(self, html, quote):
+        """The largest reply that fits is sent; one more byte is refused before sending."""
+        room = APPLICATION_LIMITS.body_bytes - len(quote.encode("utf-8")) - 2
+
+        def command(size):
+            return SendCommand(
+                account_name="test",
+                recipients=("alice@example.com",),
+                subject="Re: hello",
+                body="r" * size,
+                html=html,
+                in_reply_to="<original@example.com>",
+            )
+
+        fits = _StubProvider(QuoteSource(quote_html=quote))
+        await _service_with(fits).execute(command(room))
+        assert fits.sent is not None and fits.sent.quote_html == quote
+
+        over = _StubProvider(QuoteSource(quote_html=quote))
+        with pytest.raises(ValueError, match="body exceeds"):
+            await _service_with(over).execute(command(room + 1))
+        assert over.sent is None
 
     @pytest.mark.asyncio
     async def test_merged_body_is_revalidated_against_the_body_bound(self):
