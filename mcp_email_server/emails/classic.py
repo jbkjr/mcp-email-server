@@ -12,6 +12,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email import encoders
+from email.errors import ObsoleteHeaderDefect
 from email.header import Header
 from email.headerregistry import Address, AddressHeader, BaseHeader, HeaderRegistry, UnstructuredHeader
 from email.message import EmailMessage, Message
@@ -453,6 +454,47 @@ def _compose_html_body(body: str, *, html: bool, quote_html: str | None) -> str:
     if quote_html:
         fragment = f"{fragment}\n{quote_html}" if fragment else quote_html
     return wrap_html_document(fragment)
+
+
+# CPython reports a period in an unquoted display name ("John Q. Public",
+# "Acme Inc.") as obsolete syntax. RFC 5322 section 4.1 defines it as obs-phrase,
+# which receivers must accept, and ordinary mailers emit it. Whitespace after a
+# phrase-final period ("Jr. <") is then reported as a comment without an atom.
+_DISPLAY_NAME_PERIOD_DEFECT = "period in 'phrase'"
+_DISPLAY_NAME_PERIOD_DEFECTS = frozenset({_DISPLAY_NAME_PERIOD_DEFECT, "comment found without atom"})
+
+
+def _is_single_mailbox_with_display_name_period(value: BaseHeader) -> bool:
+    """Whether a From header's only defect is a period in its display name.
+
+    It must also hold exactly one mailbox, outside any group, with both a local
+    part and a domain. Every other defect, and every ambiguous shape, stays fatal.
+    """
+    defects = [str(defect) for defect in value.defects]
+    if (
+        _DISPLAY_NAME_PERIOD_DEFECT not in defects
+        or not all(type(defect) is ObsoleteHeaderDefect for defect in value.defects)
+        or not set(defects) <= _DISPLAY_NAME_PERIOD_DEFECTS
+        or not isinstance(value, AddressHeader)
+        or len(value.groups) != 1
+        or value.groups[0].display_name is not None
+        or len(value.addresses) != 1
+    ):
+        return False
+    address = value.addresses[0]
+    return bool(address.username and address.domain)
+
+
+def _reply_source_header_is_defective(name: str, value: BaseHeader) -> bool:
+    """Whether a reply source header carries a defect the reply must not rely on.
+
+    The one tolerated defect is a period in the From display name: From is only
+    sender-policy evidence, and that obsolete syntax does not make its single
+    address ambiguous. Threading and subject headers tolerate no defect at all.
+    """
+    if not value.defects:
+        return False
+    return name != "From" or not _is_single_mailbox_with_display_name_period(value)
 
 
 class _LiteralSearchCommand(aioimaplib.Command):
@@ -3144,7 +3186,7 @@ class EmailClient:
                 raise ValueError("Reply source headers are malformed")
             for name in ("From", "Message-ID", "References", "In-Reply-To", "Subject"):
                 values = headers.get_all(name, [])
-                if len(values) > 1 or any(value.defects for value in values):
+                if len(values) > 1 or any(_reply_source_header_is_defective(name, value) for value in values):
                     raise ValueError("Reply source headers are ambiguous or malformed")
             return ReplySource(
                 message_id=str(headers.get("Message-ID", "")),

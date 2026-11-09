@@ -1,8 +1,10 @@
 """Regression coverage for environment Sent policy and server-derived reply threading."""
 
 from dataclasses import replace
+from email.errors import ObsoleteHeaderDefect
 from email.parser import BytesParser
 from email.policy import default
+from email.utils import getaddresses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,7 +29,11 @@ from mcp_email_server.application.mutations import (
     TargetMutationOutcome,
 )
 from mcp_email_server.config import CONFIG_PATH, Settings
-from mcp_email_server.emails.classic import EmailClient, _serialize_message_for_imap_append
+from mcp_email_server.emails.classic import (
+    EmailClient,
+    _reply_source_header_is_defective,
+    _serialize_message_for_imap_append,
+)
 
 
 def environment_account(monkeypatch, name):
@@ -498,3 +504,165 @@ async def test_tool_reports_draft_like_save_to_mailbox_and_denied_recipients():
 async def test_reply_annotations_match_send_email():
     tools = {tool.name: tool for tool in await app_module.mcp.list_tools()}
     assert tools["reply_email"].annotations == tools["send_email"].annotations
+
+
+# RFC 5322 section 4.1 obs-phrase: a period in an unquoted display name. CPython
+# flags it as an ObsoleteHeaderDefect; it is the only From defect a reply tolerates.
+PERIOD_DISPLAY_NAMES = [
+    pytest.param("John Q. Public <john@example.test>", "john@example.test", id="middle-initial"),
+    pytest.param("John B. Smith Jr. <j@example.test>", "j@example.test", id="suffix"),
+    pytest.param("Acme Inc. <billing@example.test>", "billing@example.test", id="company"),
+]
+
+
+def reply_source_headers(sender: bytes, **extra: bytes) -> bytes:
+    headers = {"From": sender, "Message-ID": b"<parent@example.test>", "Subject": b"Topic", **extra}
+    return b"".join(name.encode() + b": " + value + b"\r\n" for name, value in headers.items()) + b"\r\n"
+
+
+async def read_reply_source(email_server, raw, allowed_senders=None, from_seen_by_allowlist=None):
+    """Run the real source read against a mocked IMAP session.
+
+    The allowlist check is the real ``_enforce_sender_allowlist``; only its IMAP
+    fetch of the From header is answered here.
+    """
+    client = EmailClient(email_server)
+    imap = imap_session(b"1 FETCH (UID 42 BODY[HEADER]<0> {100}", bytearray(raw), b")")
+    senders = AsyncMock(return_value={"42": from_seen_by_allowlist or ""})
+    with (
+        patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
+        patch.object(client, "_batch_fetch_senders", senders),
+    ):
+        try:
+            return await client.fetch_reply_source("42", "Archive", allowed_senders), imap
+        finally:
+            imap.logout.assert_awaited_once()
+
+
+@pytest.mark.parametrize("sender,address", PERIOD_DISPLAY_NAMES)
+@pytest.mark.parametrize("allowed_senders", [None, ["*@example.test"]], ids=["no-allowlist", "matching"])
+async def test_reply_source_accepts_a_period_in_an_unquoted_display_name(
+    email_server, sender, address, allowed_senders
+):
+    result, _ = await read_reply_source(
+        email_server, reply_source_headers(sender.encode()), allowed_senders, from_seen_by_allowlist=sender
+    )
+    assert result == ReplySource("<parent@example.test>", None, None, "Topic", result.sender)
+    # The parser re-renders the obsolete phrase as a quoted display name.
+    assert [found for _, found in getaddresses([result.sender])] == [address]
+
+
+@pytest.mark.parametrize("sender,address", PERIOD_DISPLAY_NAMES)
+async def test_reply_source_with_a_period_name_is_still_refused_by_a_nonmatching_allowlist(
+    email_server, sender, address
+):
+    del address
+    with pytest.raises(ValueError, match="Failed to fetch email with UID 42"):
+        await read_reply_source(
+            email_server,
+            reply_source_headers(sender.encode()),
+            ["someone@other.test"],
+            from_seen_by_allowlist=sender,
+        )
+    # The application-level recheck refuses it too, before either effect.
+    source = ReplySource("<parent@example.test>", None, None, "Topic", sender)
+    for draft_mailbox in (None, "Drafts"):
+        services, provider = workflow(source, allowed_senders=("someone@other.test",))
+        with pytest.raises(ValueError, match="Failed to fetch email with UID"):
+            await services.reply.execute(reply(draft_mailbox=draft_mailbox))
+        provider.send.assert_not_called()
+        provider.save_to_mailbox.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(reply_source_headers(b"Smith, John <a@example.test>"), id="unquoted-comma"),
+        pytest.param(reply_source_headers(b"J\xc3\xb6hn Q. Public <j@example.test>"), id="raw-8bit-with-period"),
+        pytest.param(reply_source_headers(b"J\xc3\xb6hn Public <j@example.test>"), id="raw-8bit"),
+        pytest.param(
+            reply_source_headers(b"John Q. Public <john@example.test>, b@example.test"), id="period-two-addresses"
+        ),
+        pytest.param(
+            reply_source_headers(b"John Q. Public <john@example.test> <x@example.test>"), id="period-two-angle-addrs"
+        ),
+        pytest.param(reply_source_headers(b"Group Q.: a@example.test;"), id="period-group"),
+        pytest.param(reply_source_headers(b"John Q. Public <john@example.test"), id="period-unterminated"),
+        pytest.param(reply_source_headers(b"John Q. Public <john.@example.test>"), id="period-bad-local-part"),
+        pytest.param(reply_source_headers(b"John Q. Public"), id="period-no-address"),
+        pytest.param(
+            b"From: John Q. Public <john@example.test>\r\nFrom: John Q. Public <john@example.test>\r\n"
+            b"Message-ID: <parent@example.test>\r\n\r\n",
+            id="period-duplicate-from",
+        ),
+        pytest.param(reply_source_headers(b"a@example.test", **{"Message-ID": b"<parent@example.test"}), id="mid"),
+        pytest.param(
+            reply_source_headers(b"a@example.test", **{"Message-ID": b"John Q. <parent@example.test>"}),
+            id="mid-period-phrase",
+        ),
+        pytest.param(reply_source_headers(b"a@example.test", References=b"<root@example.test"), id="references"),
+        pytest.param(
+            reply_source_headers(b"a@example.test", References=b"J. Q. <root@example.test>"),
+            id="references-period-phrase",
+        ),
+        pytest.param(reply_source_headers(b"a@example.test", **{"In-Reply-To": b"<root@example.test"}), id="irt"),
+    ],
+)
+@pytest.mark.parametrize("allowed_senders", [None, ["*@example.test"]], ids=["no-allowlist", "allowlist"])
+async def test_reply_source_still_rejects_other_header_defects(email_server, raw, allowed_senders):
+    with pytest.raises(ValueError, match="malformed"):
+        await read_reply_source(email_server, raw, allowed_senders, from_seen_by_allowlist="a@example.test")
+
+
+@pytest.mark.parametrize("name", ["Message-ID", "References", "In-Reply-To", "Subject"])
+def test_the_display_name_period_exception_applies_to_from_only(name):
+    header = MagicMock(defects=[ObsoleteHeaderDefect("period in 'phrase'")])
+    assert _reply_source_header_is_defective(name, header) is True
+
+
+@pytest.mark.parametrize("sender,address", PERIOD_DISPLAY_NAMES)
+@pytest.mark.parametrize("allowed_senders", [(), ("*@example.test",)], ids=["no-allowlist", "matching"])
+@pytest.mark.parametrize("draft_mailbox", [None, "Drafts"])
+async def test_reply_with_a_period_name_derives_threading_before_either_effect(
+    email_server, sender, address, allowed_senders, draft_mailbox
+):
+    del address
+    raw = reply_source_headers(sender.encode(), References=b"<root@example.test>")
+    services, provider = workflow(None, allowed_senders=allowed_senders)
+    imap = imap_session(b"1 FETCH (UID 42 BODY[HEADER]<0> {100}", bytearray(raw), b")")
+    client = EmailClient(email_server)
+
+    async def real_source_read(command, account):
+        with (
+            patch.object(client, "_connect_imap", AsyncMock(return_value=imap)),
+            patch.object(client, "_batch_fetch_senders", AsyncMock(return_value={"42": sender})),
+        ):
+            return await client.fetch_reply_source(
+                command.source_email_id, command.source_mailbox, list(account.allowed_senders)
+            )
+
+    provider.fetch_reply_source.side_effect = real_source_read
+    provider.send.return_value = DeliveryMutationOutcome(
+        (TargetMutationOutcome("recipient@example.test", "succeeded"),), None
+    )
+    provider.save_to_mailbox.return_value = AppendMutationOutcome("succeeded", "<draft@example.test>", mailbox="Drafts")
+    await services.reply.execute(reply(draft_mailbox=draft_mailbox))
+    effect = provider.send if draft_mailbox is None else provider.save_to_mailbox
+    other = provider.save_to_mailbox if draft_mailbox is None else provider.send
+    effect.assert_awaited_once()
+    other.assert_not_called()
+    composed = effect.await_args.args[0]
+    assert composed.in_reply_to == "<parent@example.test>"
+    assert composed.references == "<root@example.test> <parent@example.test>"
+    assert composed.subject == "Re: Topic"
+
+
+@pytest.mark.parametrize("draft_mailbox", [None, "Drafts"])
+async def test_denied_recipient_stops_a_period_name_reply_before_the_source_read(draft_mailbox):
+    source = ReplySource("<parent@example.test>", None, None, "Topic", "John Q. Public <john@example.test>")
+    services, provider = workflow(source, allowed_recipients=("other@example.test",))
+    with pytest.raises(RecipientPolicyDeniedError):
+        await services.reply.execute(reply(draft_mailbox=draft_mailbox))
+    provider.fetch_reply_source.assert_not_called()
+    provider.send.assert_not_called()
+    provider.save_to_mailbox.assert_not_called()

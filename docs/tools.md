@@ -716,6 +716,13 @@ The call fails before any SMTP or APPEND effect when the source is missing or
 blocked, or when its headers are incomplete, larger than 64 KiB, malformed,
 duplicated, or use Message-ID syntax beyond the simple form the server can
 normalize, such as comments. It does not fall back to an unthreaded message.
+The one tolerated irregularity is a period in an unquoted `From` display name,
+such as `John Q. Public <john@example.com>` or `Acme Inc. <billing@example.com>`:
+RFC 5322 accepts this obsolete syntax and many mailers send it. It is accepted
+only when `From` still holds exactly one complete address, and the sender
+allowlist applies to that address as usual. Any other `From` defect (an unquoted
+comma, undecodable 8-bit text, several or incomplete addresses), and any defect
+in `Message-ID`, `References`, `In-Reply-To`, or `Subject`, still fails the call.
 
 Sending requires the `send` mutation class. Setting `draft_mailbox` requires
 `append` instead, and saves the message with the `\Draft` and `\Seen` flags like
