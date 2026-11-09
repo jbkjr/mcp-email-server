@@ -89,7 +89,8 @@ not delivery to an inbox.
 
 - A user must explicitly enable per-account `allow_protocol_commands`; it is
   off by default and never inherited. See [advanced access](configuration.md#advanced-protocol-access)
-  for the required compatible policy. MCP cannot enable it.
+  for the required compatible policy. MCP cannot enable it. IMAP execution is
+  refused for an account with [reserved mailboxes](#reserved-mailboxes).
 - IMAP supports mailbox discovery, selection, CREATE/DELETE/RENAME,
   subscriptions, SEARCH/FETCH/STORE/COPY/MOVE, CHECK/CLOSE/EXPUNGE and ordinary
   APPEND. UID variants cover SEARCH/FETCH/STORE/COPY/MOVE/EXPUNGE.
@@ -183,6 +184,19 @@ non-marking read option for a read-only account. Organization cannot perform
 unrestricted expunge. Sending does not grant arbitrary APPEND, and draft-only
 access does not permit caller-selected mailbox/flags. Recipient, sender,
 attachment, account lifecycle, and provider constraints still apply.
+
+### Reserved mailboxes
+
+An account's `reserved_mailboxes` are refused, independently of grants, as the
+destination of `apply_label`, `copy_emails`, `move_emails`, `archive_emails`,
+the Trash move of `delete_emails`, `save_to_mailbox`, `save_draft`, and
+`reply_email` with `draft_mailbox`, and as the target of `create_mailbox`,
+`create_folder`, `create_label`, `delete_folder`, `delete_label`, and either
+name of `rename_folder` (including a parent or child of a reserved mailbox).
+The call fails with a permission error naming the reserved entry before any
+IMAP session opens, and nothing changes. `remove_label`, reads, and mutations
+whose _source_ is a reserved mailbox are unaffected. See
+[configuration](configuration.md#reserved-mailboxes) for matching rules.
 
 ## Agent planning annotations
 
@@ -1133,7 +1147,9 @@ it adds a second copy rather than failing, because IMAP COPY is additive.
 Per-ID results preserve caller order and distinguish success, failure, and
 `unknown`, and the sender allowlist applies exactly as it does to `copy_emails`:
 when the allowlist is active and `report_blocked_mutations` is off, a blocked ID
-is reported as a successful no-op and nothing is copied.
+is reported as a successful no-op and nothing is copied. A label whose mailbox
+is one of the account's [reserved mailboxes](#reserved-mailboxes) cannot be
+applied, created, or deleted; it can still be removed.
 
 `create_label`, `delete_label`, and `apply_label` name the label in their
 results, never the `Labels/` mailbox they derive from it, so a caller works in

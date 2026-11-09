@@ -388,6 +388,16 @@ _FILESYSTEM_WRITE = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=True,
 )
+# Tools that place a message in a mailbox, or change mailbox shape, refuse an
+# account's reserved_mailboxes before any effect (application/reserved_mailboxes.py).
+_RESERVED_DESTINATION_NOTE = (
+    " Refused, with nothing changed, when the destination is or is inside one of the account's "
+    "reserved_mailboxes, which the account owner keeps for their own use."
+)
+_RESERVED_SHAPE_NOTE = (
+    " Refused, with nothing changed, when the mailbox is, is inside, or contains one of the account's "
+    "reserved_mailboxes, which the account owner keeps for their own use."
+)
 
 
 @mcp.resource(
@@ -964,7 +974,8 @@ async def reply_email(
         Field(
             default=None,
             max_length=APPLICATION_LIMITS.mailbox_bytes,
-            description="Save the threaded message to this IMAP folder instead of sending it.",
+            description="Save the threaded message to this IMAP folder instead of sending it. Refused when it "
+            "is or is inside one of the account's reserved_mailboxes.",
         ),
     ] = None,
 ) -> str:
@@ -1005,7 +1016,7 @@ async def reply_email(
     "adds mailbox and flags, and does not support reply_to. "
     "Default folder is Drafts with \\Draft and \\Seen flags. "
     "Pure IMAP operation — works without SMTP configuration. An ambiguous APPEND is reported as unknown "
-    "and is not retried automatically.",
+    "and is not retried automatically." + _RESERVED_DESTINATION_NOTE,
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )
 async def save_to_mailbox(
@@ -1105,7 +1116,8 @@ async def save_to_mailbox(
 
 
 @mcp.tool(
-    description="Compose and save an unsent draft to the configured drafts mailbox or unique special-use Drafts mailbox. Requires draft permission, not append or send. Recipients may be omitted; supplied recipients obey the recipient allowlist. The Draft flag is fixed; no arbitrary target or flags.",
+    description="Compose and save an unsent draft to the configured drafts mailbox or unique special-use Drafts mailbox. Requires draft permission, not append or send. Recipients may be omitted; supplied recipients obey the recipient allowlist. The Draft flag is fixed; no arbitrary target or flags."
+    + _RESERVED_DESTINATION_NOTE,
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
 )
 async def save_draft(
@@ -1191,6 +1203,7 @@ async def save_draft(
         "already in Trash, the only option is permanent removal using target-scoped UID EXPUNGE, and the call is "
         "refused unless permanent=true. The result says which happened. Use list_emails_metadata first. Partial or ambiguous effects report per-ID "
         "succeeded/failed/unknown status and are not retried automatically."
+        " The move to Trash is refused, with nothing changed, if Trash is one of the account's reserved_mailboxes."
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1389,6 +1402,8 @@ async def mark_emails_as_read(
         "no folder is created. To restore from Junk, list it again for current UIDs and move to INBOX with "
         "that explicit source_mailbox. This requests a move, not guaranteed spam training or reporting. "
         "Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried."
+        + _RESERVED_DESTINATION_NOTE
+        + " Moving out of a reserved mailbox is allowed."
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1438,7 +1453,7 @@ async def move_emails(
     description="Archive one or more emails by moving them to the account's Archive folder, "
     "auto-detected via the RFC 6154 \\Archive flag (falling back to common names like Archive or "
     "[Gmail]/All Mail). Use list_emails_metadata first. Partial or ambiguous effects report per-ID "
-    "succeeded/failed/unknown status and are not retried automatically.",
+    "succeeded/failed/unknown status and are not retried automatically." + _RESERVED_DESTINATION_NOTE,
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
 async def archive_emails(
@@ -1504,7 +1519,7 @@ async def list_mailboxes(
     "reported by list_mailboxes (for example 'Archive/Projects' or 'INBOX.Projects'). Requires the "
     "organize permission. Idempotent: an existing mailbox reports already_exists without changes. "
     "Parent levels are created only if the server does so itself. An unknown status is not retried "
-    "automatically; verify with list_mailboxes.",
+    "automatically; verify with list_mailboxes." + _RESERVED_SHAPE_NOTE,
     annotations=_IDEMPOTENT_REMOTE_MUTATION,
 )
 async def create_mailbox(
@@ -1682,7 +1697,7 @@ def _tagged_folder_result(outcome: FolderMutationOutcome) -> str:
     description=(
         "Copy one or more emails into another IMAP folder by email_id, leaving the originals in place. "
         "Use list_emails_metadata and list_mailboxes first. Partial or ambiguous effects report per-ID "
-        "succeeded/failed/unknown status and are not retried automatically."
+        "succeeded/failed/unknown status and are not retried automatically." + _RESERVED_DESTINATION_NOTE
     ),
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1726,7 +1741,7 @@ async def copy_emails(
 @mcp.tool(
     description=(
         "Create a new IMAP folder/mailbox. Requires enable_folder_management=true in settings or "
-        "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it."
+        "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it." + _RESERVED_SHAPE_NOTE
     ),
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1752,7 +1767,7 @@ async def create_folder(
     description=(
         "Delete an IMAP folder/mailbox. Most servers require the folder to be empty and refuse to delete a "
         "folder that still has children. Requires enable_folder_management=true in settings or "
-        "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it."
+        "MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it." + _RESERVED_SHAPE_NOTE
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1778,7 +1793,7 @@ async def delete_folder(
     description=(
         "Rename an IMAP folder/mailbox, carrying its messages and child folders with it. Requires "
         "enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; "
-        "managed-mode accounts never allow it."
+        "managed-mode accounts never allow it." + _RESERVED_SHAPE_NOTE + " Both names are checked."
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1909,7 +1924,8 @@ async def get_email_labels(
         "in the 'Labels/<label_name>' mailbox by Message-ID and deleted there with a target-scoped "
         "UID EXPUNGE; the message in source_mailbox is never modified. Use list_labels and "
         "list_emails_metadata first. Partial or ambiguous effects report per-ID "
-        "succeeded/failed/unknown status and are not retried automatically."
+        "succeeded/failed/unknown status and are not retried automatically. Removing a label is allowed even "
+        "when its mailbox is one of the account's reserved_mailboxes."
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1964,7 +1980,7 @@ async def apply_label_command(command: ApplyLabelCommand) -> BatchMutationOutcom
         "Create a new label. A label is an IMAP mailbox named 'Labels/<label_name>', so this creates "
         "that mailbox; pass the label name without the 'Labels/' prefix. Requires "
         "enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; "
-        "managed-mode accounts never allow it."
+        "managed-mode accounts never allow it." + _RESERVED_SHAPE_NOTE
     ),
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -1988,7 +2004,7 @@ async def create_label(
         "Delete a label and the label's own copies of every message it holds; the messages in their "
         "own mailboxes are not affected. Pass the label name without the 'Labels/' prefix. Requires "
         "enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; "
-        "managed-mode accounts never allow it."
+        "managed-mode accounts never allow it." + _RESERVED_SHAPE_NOTE
     ),
     annotations=_DESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -2012,7 +2028,7 @@ async def delete_label(
         "Apply one label to one or more emails by copying each message into the 'Labels/<label_name>' "
         "mailbox; the message in source_mailbox stays exactly where it is. The label mailbox must "
         "already exist — use list_labels or create_label first. Partial or ambiguous effects report "
-        "per-ID succeeded/failed/unknown status and are not retried automatically."
+        "per-ID succeeded/failed/unknown status and are not retried automatically." + _RESERVED_DESTINATION_NOTE
     ),
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -2054,7 +2070,8 @@ async def apply_label(
         "Execute IMAP or SMTP primitives when a focused email tool does not cover the operation. "
         "Existing tools, including create_mailbox, remain the simpler policy-aware route. "
         'Start with commands=[{"command":"HELP"}] or HELP UID COPY for local syntax and examples; no account is needed for help. '
-        "Execution requires account_name and user-enabled allow_protocol_commands with compatible policy. "
+        "Execution requires account_name and user-enabled allow_protocol_commands with compatible policy; "
+        "IMAP execution is refused for an account with reserved_mailboxes. "
         "Commands run in order on one automatically authenticated connection; state lasts only for this call. "
         "For example SELECT a mailbox, then UID COPY known UIDs to an existing destination. "
         "Put APPEND/DATA message content in data, never in command lines. No login commands, passwords, hosts, "

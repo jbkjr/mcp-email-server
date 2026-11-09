@@ -336,7 +336,7 @@ def local_help(protocol: ProtocolName, command: ParsedCommand) -> ProtocolResult
             "UID variants: SEARCH, FETCH, STORE, COPY, MOVE, EXPUNGE. Prefer UIDs over sequence numbers. UID EXPUNGE uid-set requires UIDPLUS.",
             'Example: [{"command":"SELECT \\"INBOX\\""},{"command":"UID COPY 123,456 \\"Bills\\""}]. Destination must already exist; originals remain.',
             "Mailbox names are exact Unicode names (quoted with escaped quotes/backslashes when needed), not pre-encoded Modified UTF-7. SEARCH expressions are ASCII; caller literals, IDLE, ENABLE, MULTIAPPEND and arbitrary extensions are unsupported.",
-            "Admission: account opt-in, organize/delete/append grants, no sender filter, attachment content enabled. Raw flag/keyword and expunge semantics are broader than focused tools.",
+            "Admission: account opt-in, organize/delete/append grants, no sender filter, attachment content enabled, no reserved_mailboxes. Raw flag/keyword and expunge semantics are broader than focused tools.",
         ])
     else:
         lines.extend([

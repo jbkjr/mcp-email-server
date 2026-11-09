@@ -226,6 +226,14 @@ MCP destination parameter for this tool. Missing or ambiguous discovery fails
 with guidance to configure `drafts_mailbox`. The management UI and CLI expose
 these fields without adding a mail composer or mutation route.
 
+Legacy accounts may list `reserved_mailboxes`: mailbox paths, stripped and
+de-duplicated, each required to name at least one hierarchy segment, at most
+the policy-entry limit. Omission or an empty list reserves nothing. The
+environment-composited account reads the comma-separated
+`MCP_EMAIL_SERVER_RESERVED_MAILBOXES`; when it replaces a same-name stored
+account, an unset variable keeps the stored list. Managed accounts do not persist
+the field and legacy import does not carry it. Spec 07 owns its enforcement.
+
 Legacy accounts may set `imap_non_ascii_search` to `literal`, `quoted`, or
 `auto`. Omission inherits `MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH`, whose
 default is `auto`. Managed accounts do not persist the field; they use that

@@ -212,6 +212,16 @@ def test_a_configured_entry_matches_however_it_was_spelled() -> None:
         assert reserved_entry("Labels/Send", (configured,)) == configured
 
 
+@pytest.mark.parametrize("mailbox", ["Labels/&AFM", "Labels/&!!!-end", "Labels/&AFMA-nd"])
+def test_malformed_modified_utf7_is_compared_literally(mailbox: str) -> None:
+    assert reserved_entry(mailbox, RESERVED) is None
+
+
+def test_an_entry_naming_no_segment_is_ignored_rather_than_reserving_everything() -> None:
+    assert reserved_entry("INBOX", ("/",)) is None
+    assert reserved_entry("Labels/Send", ("/", "Labels/Send")) == "Labels/Send"
+
+
 def test_an_empty_reservation_never_matches() -> None:
     assert reserved_entry("Labels/Send", ()) is None
     assert reserved_entry("Labels", (), include_ancestors=True) is None

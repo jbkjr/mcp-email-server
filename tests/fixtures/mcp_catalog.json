@@ -1241,7 +1241,7 @@
                             }
                         ],
                         "default": null,
-                        "description": "Save the threaded message to this IMAP folder instead of sending it.",
+                        "description": "Save the threaded message to this IMAP folder instead of sending it. Refused when it is or is inside one of the account's reserved_mailboxes.",
                         "title": "Draft Mailbox"
                     }
                 },
@@ -1276,7 +1276,7 @@
         },
         {
             "name": "save_to_mailbox",
-            "description": "Compose an email and save it to an IMAP folder (e.g., Drafts). Shares recipient, body, attachment, and threading parameters with send_email; adds mailbox and flags, and does not support reply_to. Default folder is Drafts with \\Draft and \\Seen flags. Pure IMAP operation — works without SMTP configuration. An ambiguous APPEND is reported as unknown and is not retried automatically.",
+            "description": "Compose an email and save it to an IMAP folder (e.g., Drafts). Shares recipient, body, attachment, and threading parameters with send_email; adds mailbox and flags, and does not support reply_to. Default folder is Drafts with \\Draft and \\Seen flags. Pure IMAP operation — works without SMTP configuration. An ambiguous APPEND is reported as unknown and is not retried automatically. Refused, with nothing changed, when the destination is or is inside one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -1446,7 +1446,7 @@
         },
         {
             "name": "save_draft",
-            "description": "Compose and save an unsent draft to the configured drafts mailbox or unique special-use Drafts mailbox. Requires draft permission, not append or send. Recipients may be omitted; supplied recipients obey the recipient allowlist. The Draft flag is fixed; no arbitrary target or flags.",
+            "description": "Compose and save an unsent draft to the configured drafts mailbox or unique special-use Drafts mailbox. Requires draft permission, not append or send. Recipients may be omitted; supplied recipients obey the recipient allowlist. The Draft flag is fixed; no arbitrary target or flags. Refused, with nothing changed, when the destination is or is inside one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -1598,7 +1598,7 @@
         },
         {
             "name": "delete_emails",
-            "description": "Delete one or more emails by email_id. Deletion is recoverable where the account allows it: the emails are moved to the Trash mailbox, auto-detected via the RFC 6154 \\Trash flag (falling back to common names like Trash, Deleted Items, or [Gmail]/Trash). When the account has no Trash mailbox, or the emails are already in Trash, the only option is permanent removal using target-scoped UID EXPUNGE, and the call is refused unless permanent=true. The result says which happened. Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "description": "Delete one or more emails by email_id. Deletion is recoverable where the account allows it: the emails are moved to the Trash mailbox, auto-detected via the RFC 6154 \\Trash flag (falling back to common names like Trash, Deleted Items, or [Gmail]/Trash). When the account has no Trash mailbox, or the emails are already in Trash, the only option is permanent removal using target-scoped UID EXPUNGE, and the call is refused unless permanent=true. The result says which happened. Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically. The move to Trash is refused, with nothing changed, if Trash is one of the account's reserved_mailboxes.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -1855,7 +1855,7 @@
         },
         {
             "name": "move_emails",
-            "description": "Move emails between IMAP folders using UIDs from list_emails_metadata in source_mailbox. Specify exactly one of destination_mailbox or destination_role='junk' to discover the Junk folder via \\Junk, then common names. Missing or ambiguous discovery requires an explicit destination; no folder is created. To restore from Junk, list it again for current UIDs and move to INBOX with that explicit source_mailbox. This requests a move, not guaranteed spam training or reporting. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried.",
+            "description": "Move emails between IMAP folders using UIDs from list_emails_metadata in source_mailbox. Specify exactly one of destination_mailbox or destination_role='junk' to discover the Junk folder via \\Junk, then common names. Missing or ambiguous discovery requires an explicit destination; no folder is created. To restore from Junk, list it again for current UIDs and move to INBOX with that explicit source_mailbox. This requests a move, not guaranteed spam training or reporting. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried. Refused, with nothing changed, when the destination is or is inside one of the account's reserved_mailboxes, which the account owner keeps for their own use. Moving out of a reserved mailbox is allowed.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -1936,7 +1936,7 @@
         },
         {
             "name": "archive_emails",
-            "description": "Archive one or more emails by moving them to the account's Archive folder, auto-detected via the RFC 6154 \\Archive flag (falling back to common names like Archive or [Gmail]/All Mail). Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "description": "Archive one or more emails by moving them to the account's Archive folder, auto-detected via the RFC 6154 \\Archive flag (falling back to common names like Archive or [Gmail]/All Mail). Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically. Refused, with nothing changed, when the destination is or is inside one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2065,7 +2065,7 @@
         },
         {
             "name": "create_mailbox",
-            "description": "Create one mailbox/folder by its exact server name, including the hierarchy delimiter reported by list_mailboxes (for example 'Archive/Projects' or 'INBOX.Projects'). Requires the organize permission. Idempotent: an existing mailbox reports already_exists without changes. Parent levels are created only if the server does so itself. An unknown status is not retried automatically; verify with list_mailboxes.",
+            "description": "Create one mailbox/folder by its exact server name, including the hierarchy delimiter reported by list_mailboxes (for example 'Archive/Projects' or 'INBOX.Projects'). Requires the organize permission. Idempotent: an existing mailbox reports already_exists without changes. Parent levels are created only if the server does so itself. An unknown status is not retried automatically; verify with list_mailboxes. Refused, with nothing changed, when the mailbox is, is inside, or contains one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2252,7 +2252,7 @@
         },
         {
             "name": "copy_emails",
-            "description": "Copy one or more emails into another IMAP folder by email_id, leaving the originals in place. Use list_emails_metadata and list_mailboxes first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "description": "Copy one or more emails into another IMAP folder by email_id, leaving the originals in place. Use list_emails_metadata and list_mailboxes first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically. Refused, with nothing changed, when the destination is or is inside one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2315,7 +2315,7 @@
         },
         {
             "name": "create_folder",
-            "description": "Create a new IMAP folder/mailbox. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "description": "Create a new IMAP folder/mailbox. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it. Refused, with nothing changed, when the mailbox is, is inside, or contains one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2355,7 +2355,7 @@
         },
         {
             "name": "delete_folder",
-            "description": "Delete an IMAP folder/mailbox. Most servers require the folder to be empty and refuse to delete a folder that still has children. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "description": "Delete an IMAP folder/mailbox. Most servers require the folder to be empty and refuse to delete a folder that still has children. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it. Refused, with nothing changed, when the mailbox is, is inside, or contains one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2395,7 +2395,7 @@
         },
         {
             "name": "rename_folder",
-            "description": "Rename an IMAP folder/mailbox, carrying its messages and child folders with it. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "description": "Rename an IMAP folder/mailbox, carrying its messages and child folders with it. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it. Refused, with nothing changed, when the mailbox is, is inside, or contains one of the account's reserved_mailboxes, which the account owner keeps for their own use. Both names are checked.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2558,7 +2558,7 @@
         },
         {
             "name": "remove_label",
-            "description": "Remove one label from one or more emails. The label's own copy of each message is located in the 'Labels/<label_name>' mailbox by Message-ID and deleted there with a target-scoped UID EXPUNGE; the message in source_mailbox is never modified. Use list_labels and list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "description": "Remove one label from one or more emails. The label's own copy of each message is located in the 'Labels/<label_name>' mailbox by Message-ID and deleted there with a target-scoped UID EXPUNGE; the message in source_mailbox is never modified. Use list_labels and list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically. Removing a label is allowed even when its mailbox is one of the account's reserved_mailboxes.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2617,7 +2617,7 @@
         },
         {
             "name": "create_label",
-            "description": "Create a new label. A label is an IMAP mailbox named 'Labels/<label_name>', so this creates that mailbox; pass the label name without the 'Labels/' prefix. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "description": "Create a new label. A label is an IMAP mailbox named 'Labels/<label_name>', so this creates that mailbox; pass the label name without the 'Labels/' prefix. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it. Refused, with nothing changed, when the mailbox is, is inside, or contains one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2657,7 +2657,7 @@
         },
         {
             "name": "delete_label",
-            "description": "Delete a label and the label's own copies of every message it holds; the messages in their own mailboxes are not affected. Pass the label name without the 'Labels/' prefix. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it.",
+            "description": "Delete a label and the label's own copies of every message it holds; the messages in their own mailboxes are not affected. Pass the label name without the 'Labels/' prefix. Requires enable_folder_management=true in settings or MCP_EMAIL_SERVER_ENABLE_FOLDER_MANAGEMENT=true; managed-mode accounts never allow it. Refused, with nothing changed, when the mailbox is, is inside, or contains one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2697,7 +2697,7 @@
         },
         {
             "name": "apply_label",
-            "description": "Apply one label to one or more emails by copying each message into the 'Labels/<label_name>' mailbox; the message in source_mailbox stays exactly where it is. The label mailbox must already exist — use list_labels or create_label first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically.",
+            "description": "Apply one label to one or more emails by copying each message into the 'Labels/<label_name>' mailbox; the message in source_mailbox stays exactly where it is. The label mailbox must already exist — use list_labels or create_label first. Partial or ambiguous effects report per-ID succeeded/failed/unknown status and are not retried automatically. Refused, with nothing changed, when the destination is or is inside one of the account's reserved_mailboxes, which the account owner keeps for their own use.",
             "inputSchema": {
                 "properties": {
                     "account_name": {
@@ -2756,7 +2756,7 @@
         },
         {
             "name": "email_command",
-            "description": "Execute IMAP or SMTP primitives when a focused email tool does not cover the operation. Existing tools, including create_mailbox, remain the simpler policy-aware route. Start with commands=[{\"command\":\"HELP\"}] or HELP UID COPY for local syntax and examples; no account is needed for help. Execution requires account_name and user-enabled allow_protocol_commands with compatible policy. Commands run in order on one automatically authenticated connection; state lasts only for this call. For example SELECT a mailbox, then UID COPY known UIDs to an existing destination. Put APPEND/DATA message content in data, never in command lines. No login commands, passwords, hosts, shell scripts or local paths. Stops on the first error. Inspect every result: prior effects may exist and unknown completion must not be replayed automatically. HELP lists supported syntax; server CAPABILITY alone does not imply client support for arbitrary extensions.",
+            "description": "Execute IMAP or SMTP primitives when a focused email tool does not cover the operation. Existing tools, including create_mailbox, remain the simpler policy-aware route. Start with commands=[{\"command\":\"HELP\"}] or HELP UID COPY for local syntax and examples; no account is needed for help. Execution requires account_name and user-enabled allow_protocol_commands with compatible policy; IMAP execution is refused for an account with reserved_mailboxes. Commands run in order on one automatically authenticated connection; state lasts only for this call. For example SELECT a mailbox, then UID COPY known UIDs to an existing destination. Put APPEND/DATA message content in data, never in command lines. No login commands, passwords, hosts, shell scripts or local paths. Stops on the first error. Inspect every result: prior effects may exist and unknown completion must not be replayed automatically. HELP lists supported syntax; server CAPABILITY alone does not imply client support for arbitrary extensions.",
             "inputSchema": {
                 "$defs": {
                     "ProtocolCommand": {

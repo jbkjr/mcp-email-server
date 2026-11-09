@@ -328,6 +328,66 @@ Under a non-empty recipient allowlist, every supplied To/CC/BCC address requires
 a match. General `save_to_mailbox` continues to enforce its
 recipient policy and requires `append`, even when saving to a Drafts folder.
 
+### Reserved mailboxes
+
+`reserved_mailboxes` is a per-account list of mailboxes the account owner keeps
+for their own use. It suits a mailbox whose contents are a signal to something
+outside this server, such as a label whose application approves a message for
+another process. It is empty by default, which reserves nothing and changes no
+behavior.
+
+```toml
+[[emails]]
+account_name = "personal"
+# A label is the mailbox Labels/<label name>; list the mailbox path.
+reserved_mailboxes = ["Labels/Approved"]
+```
+
+For each reserved mailbox the server refuses, before any change, every workflow
+that would place a message in it or change its shape:
+
+- `apply_label`, `copy_emails`, `move_emails` (including a discovered Junk
+  destination), `archive_emails`, and the Trash move of `delete_emails`, when
+  the destination is reserved;
+- `save_to_mailbox`, `save_draft`, and `reply_email` with `draft_mailbox`, when
+  the message would be saved there;
+- `create_mailbox`, `create_folder`, `create_label`, `delete_folder`,
+  `delete_label`, and `rename_folder` (old or new name), when the mailbox is
+  reserved, is inside a reserved mailbox, or contains one;
+- IMAP execution through `email_command`, which is refused outright for the
+  account (SMTP admission is unchanged).
+
+Reading a reserved mailbox stays allowed, and so does taking a message out of
+one: `remove_label`, and moving, copying, archiving or deleting with the
+reserved mailbox as the source. The refusal is a permission error that names the
+reserved entry. Other accounts are unaffected.
+
+Entries are mailbox paths, not label names: write `Labels/Approved`, not
+`Approved`. A child of a reserved mailbox is reserved too. Matching is
+deliberately broader than the server's own name resolution, so another spelling
+of the same mailbox cannot slip through. Both the entry and the requested
+mailbox are compared segment by segment after modified UTF-7 decoding (the raw
+spelling is compared as well), Unicode NFKC normalization, removal of invisible
+format characters, and case folding; `/` and `.` both count as hierarchy
+delimiters, whitespace around each segment is ignored, and empty segments are
+dropped. So `labels/approved`, `Labels/Approved`, `Labels.Approved` and
+`Labels/Approved/Later` all match the example above, while `Labels/Approvals`
+does not. Over-matching can only refuse a request.
+
+Each entry must name a mailbox: blank, control-character or delimiter-only
+entries, and lists over 1,000 entries, are rejected when configuration loads.
+Entries are stripped and de-duplicated. The environment-composited account reads
+`MCP_EMAIL_SERVER_RESERVED_MAILBOXES`, a comma-separated list in which blank
+items are ignored. When that account replaces a same-name TOML account, an
+unset variable keeps the TOML list, and a set variable (even an empty one)
+replaces it.
+
+This is a legacy-mode setting. Managed-mode accounts reserve nothing, and
+importing a legacy account into the managed catalog does not carry the list;
+keep such an account in legacy mode. The setting binds only this server: mail
+clients and other IMAP sessions are unaffected. See
+[Reserved mailboxes](security.md#reserved-mailboxes).
+
 Endpoint ports must be between 1 and 65535, and implicit TLS cannot be combined
 with STARTTLS. `account add` checks the selected catalog and these non-secret
 endpoint rules before prompting or reading a credential; application services
@@ -364,10 +424,10 @@ expunge, arbitrary flags and keywords, and raw MIME access without focused-tool
 filtering, semantic tags or destination safeguards. Existing tools retain their
 current restrictions. The executor rejects incompatible profiles:
 
-| Protocol | Required in addition to the opt-in                                                                                            |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| IMAP     | Enabled incoming account; effective `organize`, `delete`, `append`; empty `allowed_senders`; `enable_attachment_content=true` |
-| SMTP     | Enabled outgoing account; effective `send`; explicit `*` in `allowed_recipients` (empty denies all)                           |
+| Protocol | Required in addition to the opt-in                                                                                                                        |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| IMAP     | Enabled incoming account; effective `organize`, `delete`, `append`; empty `allowed_senders`; `enable_attachment_content=true`; empty `reserved_mailboxes` |
+| SMTP     | Enabled outgoing account; effective `send`; explicit `*` in `allowed_recipients` (empty denies all)                                                       |
 
 The server never changes grants or filters to satisfy this gate. An organize-only
 account must use focused tools even for a raw read or COPY. MCP cannot enable
@@ -891,6 +951,7 @@ after changing legacy TOML.
 | `MCP_EMAIL_SERVER_SMTP_X_MAILER`             | `mcp-email-server`        | No       | Outgoing `X-Mailer`; empty omits the header.                                                                                                |
 | `MCP_EMAIL_SERVER_ACCOUNT_ALLOWED_MUTATIONS` | Inherit global            | No       | CSV grants for the environment-created account; empty means read-only. Omit to inherit; `inherit` is a CLI value, not an environment value. |
 | `MCP_EMAIL_SERVER_DRAFTS_MAILBOX`            | Unique special-use Drafts | No       | Exact existing draft mailbox for the environment-created account; omit for discovery.                                                       |
+| `MCP_EMAIL_SERVER_RESERVED_MAILBOXES`        | None                      | No       | CSV mailbox paths no mutation may fill or reshape. Omitted: a same-name stored account keeps its list.                                      |
 
 Boolean values accept `true`, `1`, `yes`, or `on` as true, ignoring case. Other
 values are treated as false. Do not add surrounding whitespace to these values.

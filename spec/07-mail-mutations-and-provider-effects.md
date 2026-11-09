@@ -288,6 +288,40 @@ The tool is idempotent by contract: repeating it for an existing mailbox reports
 reconciles with `list_mailboxes`. Creation does not SUBSCRIBE the mailbox. The
 mailbox list is not projected, so creation requires no metadata invalidation.
 
+## Reserved Mailboxes
+
+An account may list `reserved_mailboxes` (spec 04 owns the field): mailboxes its
+owner keeps for their own use, typically because a message's presence there is
+the owner's signal to some other process. Mutation grants cannot express this,
+because the `organize` grant that files ordinary mail also copies into any
+mailbox. A reservation is therefore a destination and shape policy that applies
+independently of grants:
+
+- No workflow may place a message in a reserved mailbox or a mailbox inside one:
+  copy, label application, move (including a discovered Junk destination),
+  archive and trash-move destinations, caller-selected and reply-draft APPEND,
+  and draft APPEND to the configured or discovered Drafts mailbox.
+- No mailbox-shape workflow (create, delete, either name of a rename, and
+  `create_mailbox`) may act on a reserved mailbox, a mailbox inside one, or a
+  mailbox that contains one.
+- Taking a message out (label removal, and any mutation whose source is the
+  reserved mailbox) and reading stay permitted, because neither can produce the
+  owner's signal.
+- The opted-in protocol executor refuses IMAP for an account with any
+  reservation instead of filtering raw commands; SMTP admission is unchanged.
+
+The check is part of step 2 of the common pipeline: it runs on the resolved
+account before provider construction, on the opened account before the effect,
+and in the provider adapter on fresh authority before each IMAP mutation
+command, so a reservation added between phases still refuses. Matching compares
+hierarchy segments after modified UTF-7 decoding (raw spelling too), NFKC
+normalization, format-character removal and case folding, treating `/` and `.`
+as delimiters and ignoring surrounding whitespace and empty segments. It is
+intentionally broader than any server's resolution; over-matching only refuses.
+A refusal is a `PermissionError` naming the reserved entry, with no provider
+session opened. An empty list changes no behavior. Managed accounts have no
+reservation in this delivery.
+
 ## Delete and Scoped Expunge
 
 Delete marks only selected UIDs and removes only those targets with a scoped
@@ -663,3 +697,15 @@ enter public errors.
     revocation between existence check and CREATE, and that no workflow other
     than `create_mailbox` and the gated mailbox-shape `create_folder` issues CREATE. The explicitly opted-in protocol executor is a separate native
     primitive surface, not a focused workflow.
+23. Reserved mailboxes refuse, before provider access and again on the opened
+    and freshly re-resolved account, every route that places a message in a
+    reserved mailbox or its children and every create, delete, or rename (either
+    name) of a reserved mailbox, its children, or its parents. Tests prove each
+    focused route and discovered destination is refused with no IMAP session
+    opened; that case, whitespace, delimiter, modified UTF-7, compatibility-form,
+    and label-versus-path variants match; that label removal and mutations whose
+    source is reserved still reach the provider; that another account and an
+    empty list are unaffected; that environment replacement of a stored account
+    keeps its list unless the variable is set; and that raw IMAP execution is
+    refused for a reserving account, including mid-session, while SMTP
+    admission is unchanged.

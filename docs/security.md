@@ -13,9 +13,10 @@ an MCP client or network.
 
 `email_command` is a deliberately broad, per-account opt-in, disabled by default.
 It is not implied by mutation grants and cannot be enabled through MCP. IMAP
-requires organize/delete/append, no sender filter and attachment-content access;
-SMTP requires send permission and explicit `*` recipient access. Incompatible
-policy fails closed rather than silently bypassing a sender/recipient filter.
+requires organize/delete/append, no sender filter, attachment-content access and
+no [reserved mailboxes](#reserved-mailboxes); SMTP requires send permission and
+explicit `*` recipient access. Incompatible policy fails closed rather than
+silently bypassing a sender/recipient filter or a reservation.
 
 Enabling it permits server-authorized mailbox DELETE, broad EXPUNGE/CLOSE and
 arbitrary protocol flags/keywords. Semantic tag mappings and focused-tool
@@ -715,6 +716,47 @@ by default it is reported as a no-op success indistinguishable from a
 nonexistent UID. `apply_label` is ungated for the same reason and inherits that
 allowlist behavior unchanged, because it is a copy into the label's mailbox
 rather than a second implementation of one.
+
+## Reserved mailboxes
+
+Some account owners use a mailbox as a signal of their own: labelling a draft
+`Approved`, for example, may be what tells another process to send it. Mutation
+grants cannot protect such a mailbox, because the same `organize` grant that
+files ordinary mail can also COPY a message into it. An agent that can organize
+mail could then produce the owner's signal without the owner.
+
+`reserved_mailboxes` (see [configuration](configuration.md#reserved-mailboxes))
+lists those mailboxes per account. For a listed mailbox the server refuses every
+mutation that would place a message in it (COPY, MOVE, APPEND, label
+application, and the discovered Junk, Archive, Trash and Drafts destinations) and
+every mailbox-shape change (CREATE, DELETE, RENAME from or to) of the mailbox, of
+a mailbox inside it, or of a mailbox that contains it. A rename away or a parent
+delete would otherwise let an agent remove the reserved mailbox and later
+recreate it, or rename an agent-filled mailbox into its place.
+
+The check runs in the shared application mutation path on the resolved account
+before any provider is constructed, again on the freshly opened account, and in
+the classic provider adapter on freshly re-resolved authority before each IMAP
+mutation command. A refusal is a `PermissionError` that names the reserved entry
+and states that nothing changed; no IMAP session is opened. Name matching
+compares hierarchy segments after modified UTF-7 decoding, NFKC normalization,
+invisible-character removal and case folding, with `/` and `.` both treated as
+delimiters, so case, whitespace, delimiter and encoding variants of a reserved
+name are refused. Over-matching refuses; it never allows.
+
+Withdrawing is not restricted: `remove_label`, and moving, copying, archiving or
+deleting with a reserved mailbox as the source, remain allowed, as do all reads.
+The raw `email_command` IMAP surface could reach a reserved mailbox under any
+spelling, so it is refused outright for an account with any reservation rather
+than filtered per command. Raw SMTP never writes a mailbox and is unchanged.
+
+Limits: the reservation binds only this server process. It does not stop the
+account owner's own mail clients (which is the point), other IMAP clients, or a
+server instance whose configuration omits the list. It is a legacy-mode setting:
+managed accounts reserve nothing and legacy import does not carry it. The
+Sent-copy APPEND after a successful send targets the configured or discovered
+Sent mailbox, which is not checked; do not reserve your Sent mailbox. Flag and
+tag changes on messages already inside a reserved mailbox are not restricted.
 
 ## Attachment access
 

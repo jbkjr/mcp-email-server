@@ -45,6 +45,18 @@ Tools remain visible even when their calls are denied. See the
 [effect mapping](tools.md#mail-mutation-permissions). For a read-only account,
 read bodies without `mark_as_read=true`.
 
+## A mutation names a reserved mailbox
+
+`Refused: '...' is, is inside, or contains the reserved mailbox '...'` means the
+account lists that mailbox in `reserved_mailboxes`, so no tool may place a
+message in it or create, rename, or delete it or a mailbox around it. This is
+intended: the account owner uses that mailbox themselves, through their own mail
+client. Nothing was changed. Do not retry under another spelling; case,
+delimiter, whitespace, and encoding variants match too. Choose a different
+destination, or ask the account owner. `email_command` IMAP reports
+`policy_conflict` for such an account. See
+[Reserved mailboxes](security.md#reserved-mailboxes).
+
 ## Draft mailbox is missing or ambiguous
 
 `save_draft` uses the account's `drafts_mailbox` or a unique special-use
