@@ -756,7 +756,10 @@ or parsed refuses the mutation rather than serving the last good policy. No chec
 can undo a command already sent to the IMAP server: a change that lands after a
 command was transmitted applies from the next command, and earlier per-message
 results in a batch keep their real outcome. A refusal is a `PermissionError` that names the reserved entry
-and states that nothing changed; no IMAP session is opened. Name matching
+and states that nothing changed. It comes before any mutation; a named
+destination is refused before any IMAP session opens, while discovering a
+Drafts, Junk, Archive, or Trash destination, or the hierarchy delimiter, may
+first make read-only IMAP requests. Name matching
 compares hierarchy segments after modified UTF-7 decoding, NFKC normalization,
 invisible-character removal and case folding, with `/` and `.` both treated as
 delimiters, so case, whitespace, delimiter and encoding variants of a reserved

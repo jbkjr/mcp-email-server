@@ -194,7 +194,9 @@ the Trash move of `delete_emails`, `save_to_mailbox`, `save_draft`, and
 `create_folder`, `create_label`, `delete_folder`, `delete_label`, and either
 name of `rename_folder` (including a parent or child of a reserved mailbox).
 The call fails with a permission error naming the reserved entry before any
-IMAP session opens, and nothing changes. When the Sent mailbox chosen for the
+mutation, and nothing changes. A named destination is refused before any IMAP
+session opens; finding a Drafts, Junk, Archive, or Trash mailbox, and learning
+the server's hierarchy delimiter, can make read-only IMAP requests first. When the Sent mailbox chosen for the
 copy that `send_email`, `forward_email`, or a sending `reply_email` saves after
 delivery is reserved, only that copy fails: the result reports the delivery as
 it happened and `sent-copy: failed (<mailbox>; reserved-mailbox)`.

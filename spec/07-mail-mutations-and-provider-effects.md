@@ -341,8 +341,10 @@ the discovery did not cover (a reservation added after opening), refuses the
 mutation; a NIL delimiter adds nothing. The application-level checks precede any
 IMAP session and use `/` and `.` only. It is
 intentionally broader than any server's resolution; over-matching only refuses.
-A refusal is a `PermissionError` naming the reserved entry, with no provider
-session opened. An empty list changes no behavior. Managed accounts have no
+A refusal is a `PermissionError` naming the reserved entry, issued before any
+mutation command. A destination named in the request is refused before any
+provider session opens; destination discovery (Drafts, Junk, Archive, Trash)
+and hierarchy-delimiter discovery may first make read-only IMAP requests. An empty list changes no behavior. Managed accounts have no
 reservation in this delivery.
 
 ## Delete and Scoped Expunge
@@ -724,8 +726,8 @@ enter public errors.
     and freshly re-resolved account, every route that places a message in a
     reserved mailbox or its children and every create, delete, or rename (either
     name) of a reserved mailbox, its children, or its parents. Tests prove each
-    focused route and discovered destination is refused with no IMAP session
-    opened; that case, whitespace, delimiter, modified UTF-7, compatibility-form,
+    focused route with a named destination is refused with no IMAP session
+    opened, and each discovered destination with no mutation command; that case, whitespace, delimiter, modified UTF-7, compatibility-form,
     and label-versus-path variants match; that on a server whose discovered
     delimiter is neither `/` nor `.`, children (CREATE, COPY, MOVE, APPEND, flag
     changes, the Sent copy) and parents (RENAME, DELETE) of a reserved mailbox
