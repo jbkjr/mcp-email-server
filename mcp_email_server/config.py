@@ -98,6 +98,24 @@ def _parse_csv_env(name: str) -> list[str]:
     return [item for item in os.getenv(name, "").split(",") if item.strip()]
 
 
+_RESERVED_ENV_UNUSABLE = (
+    "MCP_EMAIL_SERVER_RESERVED_MAILBOXES is set, but {reason}; the reservation applies only to the "
+    "environment account, so it cannot be honoured. Fix the environment account or unset the variable."
+)
+
+
+def _reserved_mailboxes_env() -> list[str]:
+    """Validate MCP_EMAIL_SERVER_RESERVED_MAILBOXES; an invalid supplied value raises.
+
+    A reservation narrows what the server may do, so a malformed one must stop
+    configuration loading rather than leave the account unprotected.
+    """
+    try:
+        return normalize_reserved_mailboxes(_parse_csv_env("MCP_EMAIL_SERVER_RESERVED_MAILBOXES"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid MCP_EMAIL_SERVER_RESERVED_MAILBOXES: {exc}") from None
+
+
 def _parse_bool_env(value: str | None, default: bool = False) -> bool:
     """Parse boolean value from environment variable."""
     if value is None:
@@ -569,12 +587,20 @@ class EmailSettings(AccountAttributes):
         - MCP_EMAIL_SERVER_SMTP_X_MAILER (default: mcp-email-server; empty omits the header)
         - MCP_EMAIL_SERVER_ALLOW_PROTOCOL_COMMANDS (default: false)
         - MCP_EMAIL_SERVER_RESERVED_MAILBOXES (comma-separated; default: none)
+
+        A supplied non-empty reservation is protective policy, so it is never
+        silently discarded: an invalid entry, or an environment account that
+        cannot be built while one is supplied, raises instead of returning
+        ``None`` and letting a stored account's unreserved policy take over.
         """
+        reserved_mailboxes = _reserved_mailboxes_env()
         # Check if minimum required environment variables are set
         email_address = os.getenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS")
         password = os.getenv("MCP_EMAIL_SERVER_PASSWORD")
 
         if not email_address or not password:
+            if reserved_mailboxes:
+                raise ValueError(_RESERVED_ENV_UNUSABLE.format(reason="the environment account is not configured"))
             return None
 
         # Get all environment variables with defaults
@@ -586,6 +612,8 @@ class EmailSettings(AccountAttributes):
 
         # Required fields check
         if not imap_host:
+            if reserved_mailboxes:
+                raise ValueError(_RESERVED_ENV_UNUSABLE.format(reason="MCP_EMAIL_SERVER_IMAP_HOST is missing"))
             logger.warning("Missing required email configuration environment variable: IMAP_HOST")
             return None
 
@@ -617,7 +645,7 @@ class EmailSettings(AccountAttributes):
                 smtp_x_mailer=os.getenv("MCP_EMAIL_SERVER_SMTP_X_MAILER", DEFAULT_SMTP_X_MAILER),
                 drafts_mailbox=os.getenv("MCP_EMAIL_SERVER_DRAFTS_MAILBOX"),
                 allow_protocol_commands=_parse_bool_env(os.getenv("MCP_EMAIL_SERVER_ALLOW_PROTOCOL_COMMANDS"), False),
-                reserved_mailboxes=_parse_csv_env("MCP_EMAIL_SERVER_RESERVED_MAILBOXES"),
+                reserved_mailboxes=reserved_mailboxes,
                 allowed_mutations=(
                     list(
                         parse_mutations([
@@ -632,6 +660,8 @@ class EmailSettings(AccountAttributes):
             )
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to create email settings from environment variables: {e}")
+            if reserved_mailboxes:
+                raise ValueError(_RESERVED_ENV_UNUSABLE.format(reason="the environment account is invalid")) from None
             return None
 
     def masked(self) -> EmailSettings:

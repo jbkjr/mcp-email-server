@@ -231,8 +231,11 @@ de-duplicated, each required to name at least one hierarchy segment, at most
 the policy-entry limit. Omission or an empty list reserves nothing. The
 environment-composited account reads the comma-separated
 `MCP_EMAIL_SERVER_RESERVED_MAILBOXES`; when it replaces a same-name stored
-account, an unset variable keeps the stored list. Managed accounts do not persist
-the field and legacy import does not carry it. Spec 07 owns its enforcement.
+account, an unset variable keeps the stored list. An invalid supplied entry, or a
+non-empty variable while the environment account cannot be built, fails
+configuration loading; it never falls back to a stored account's policy. Managed
+accounts do not persist the field and legacy import does not carry it. Spec 07
+owns its enforcement.
 
 Legacy accounts may set `imap_non_ascii_search` to `literal`, `quoted`, or
 `auto`. Omission inherits `MCP_EMAIL_SERVER_IMAP_NON_ASCII_SEARCH`, whose

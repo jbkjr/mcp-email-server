@@ -380,7 +380,10 @@ Entries are stripped and de-duplicated. The environment-composited account reads
 `MCP_EMAIL_SERVER_RESERVED_MAILBOXES`, a comma-separated list in which blank
 items are ignored. When that account replaces a same-name TOML account, an
 unset variable keeps the TOML list, and a set variable (even an empty one)
-replaces it.
+replaces it. A reservation is never silently dropped: an invalid entry in the
+variable or in TOML, or a non-empty variable while the environment account is
+incomplete or invalid, stops configuration loading with an error instead of
+falling back to a stored account's policy.
 
 This is a legacy-mode setting. Managed-mode accounts reserve nothing, and
 importing a legacy account into the managed catalog does not carry the list;

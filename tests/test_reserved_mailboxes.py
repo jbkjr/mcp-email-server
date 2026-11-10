@@ -15,6 +15,7 @@ and the raw protocol executor.
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -827,3 +828,135 @@ async def test_raw_imap_refusal_happens_before_any_connection(
     assert result.error is not None and "reserved_mailboxes" in result.error
     assert [step.status for step in result.results] == ["not_attempted", "not_attempted"]
     opened.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Real legacy resolver, real classic adapter, fake IMAP session
+# --------------------------------------------------------------------------- #
+
+_MUTATING_UID = frozenset({"copy", "move", "store", "expunge"})
+_MUTATING_COMMANDS = frozenset({
+    "append",
+    "copy",
+    "create",
+    "delete",
+    "expunge",
+    "move",
+    "rename",
+    "store",
+    "subscribe",
+    "unsubscribe",
+})
+
+
+def _mutation_commands(imap: AsyncMock) -> list[object]:
+    """Every call on the fake session that would change mailbox state on a server."""
+    found: list[object] = []
+    for call in imap.mock_calls:
+        name = call[0]
+        if (
+            (name == "uid" and call.args and str(call.args[0]).casefold() in _MUTATING_UID)
+            or name in _MUTATING_COMMANDS
+            or name == "protocol.execute"
+        ):
+            found.append(call)
+    return found
+
+
+def _real_services() -> MutationServices:
+    backend = LocalMutationBackend()
+    projections = MagicMock()
+    projections.open = AsyncMock(return_value=MagicMock(invalidate=AsyncMock()))
+    return MutationServices.compose(backend, backend, projections)
+
+
+def _fake_imap_connections(imap: AsyncMock):
+    """Route every IMAP connection the real adapter opens to one fake session."""
+    stack = ExitStack()
+    stack.enter_context(patch("mcp_email_server.emails.classic.aioimaplib.IMAP4", return_value=imap))
+    stack.enter_context(patch("mcp_email_server.emails.classic.aioimaplib.IMAP4_SSL", return_value=imap))
+    return stack
+
+
+def _write_config(text: str) -> None:
+    config_module.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config_module.CONFIG_PATH.write_text(text, encoding="utf-8")
+    config_module.clear_settings_cache()
+
+
+# R5: a supplied reservation that cannot be honoured is an error, never a fallback
+
+
+def test_an_invalid_environment_reservation_fails_configuration_load(
+    monkeypatch: pytest.MonkeyPatch, legacy_config
+) -> None:
+    """The stored ``other`` account is unreserved; a malformed list must not fall back to it."""
+    _environment_account(monkeypatch, "other")
+    monkeypatch.setenv("MCP_EMAIL_SERVER_RESERVED_MAILBOXES", "Labels/Send,/")
+
+    with pytest.raises(ValueError, match="MCP_EMAIL_SERVER_RESERVED_MAILBOXES"):
+        Settings()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["MCP_EMAIL_SERVER_IMAP_HOST", "MCP_EMAIL_SERVER_PASSWORD"],
+)
+def test_a_reservation_for_an_environment_account_that_cannot_be_built_fails_load(
+    monkeypatch: pytest.MonkeyPatch, legacy_config, missing: str
+) -> None:
+    _environment_account(monkeypatch, "other")
+    monkeypatch.delenv(missing)
+    monkeypatch.setenv("MCP_EMAIL_SERVER_RESERVED_MAILBOXES", "Labels/Send")
+
+    with pytest.raises(ValueError, match="MCP_EMAIL_SERVER_RESERVED_MAILBOXES"):
+        Settings()
+
+
+def test_a_reservation_survives_an_otherwise_invalid_environment_account_only_by_failing(
+    monkeypatch: pytest.MonkeyPatch, legacy_config
+) -> None:
+    """An unrelated environment error used to drop the account and its reservation together."""
+    _environment_account(monkeypatch, "other")
+    monkeypatch.setenv("MCP_EMAIL_SERVER_IMAP_PORT", "not-a-port")
+    monkeypatch.setenv("MCP_EMAIL_SERVER_RESERVED_MAILBOXES", "Labels/Send")
+
+    with pytest.raises(ValueError, match="MCP_EMAIL_SERVER_RESERVED_MAILBOXES"):
+        Settings()
+
+
+def test_an_explicitly_empty_environment_reservation_still_loads(
+    monkeypatch: pytest.MonkeyPatch, legacy_config
+) -> None:
+    monkeypatch.setenv("MCP_EMAIL_SERVER_RESERVED_MAILBOXES", "")
+    owner = Settings().get_account("owner")
+    assert isinstance(owner, EmailSettings) and owner.reserved_mailboxes == ["Labels/Send"]
+
+
+def test_an_invalid_toml_reservation_fails_configuration_load() -> None:
+    _write_config(_TOML.replace('reserved_mailboxes = ["Labels/Send"]', 'reserved_mailboxes = ["Labels/Send", "/"]'))
+
+    with pytest.raises(ValueError, match="reserved_mailboxes"):
+        Settings()
+
+
+@pytest.mark.parametrize("source", ["environment", "toml"])
+async def test_an_invalid_reservation_reaches_no_provider_through_the_real_resolver(
+    monkeypatch: pytest.MonkeyPatch, legacy_config, source: str
+) -> None:
+    if source == "environment":
+        _environment_account(monkeypatch, "other")
+        monkeypatch.setenv("MCP_EMAIL_SERVER_RESERVED_MAILBOXES", "Labels/Send,/")
+    else:
+        _write_config(
+            _TOML.replace(
+                '[[emails]]\naccount_name = "other"', '[[emails]]\naccount_name = "other"\nreserved_mailboxes = ["/"]'
+            )
+        )
+    imap = _mock_imap()
+
+    with _fake_imap_connections(imap), pytest.raises(ValueError, match=r"(?i)reserved_mailboxes"):
+        await _real_services().copy.execute(CopyCommand("other", ("1",), "Drafts", "Labels/Send"))
+
+    assert imap.mock_calls == []
+    assert _mutation_commands(imap) == []
