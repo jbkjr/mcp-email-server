@@ -38,8 +38,23 @@ from keyring.backend import KeyringBackend
 from keyring.backends.fail import Keyring as FailKeyring
 from keyring.errors import PasswordDeleteError
 
+from mcp_email_server import config as _config_module
 from mcp_email_server import keyring_store
 from mcp_email_server.config import EmailServer, EmailSettings, ProviderSettings, delete_settings
+
+# Guardrail: patch_env below calls delete_settings() before every test, and that
+# unlinks whatever CONFIG_PATH was bound to when mcp_email_server.config was first
+# imported. If something imported the package before this file set
+# MCP_EMAIL_SERVER_CONFIG_PATH (for example a wrapper script that imports
+# mcp_email_server and then calls pytest.main), CONFIG_PATH is the user's real
+# configuration and the first test would delete it. Refuse to run instead.
+_EXPECTED_CONFIG_PATH = Path(os.path.abspath(Path(os.environ["MCP_EMAIL_SERVER_CONFIG_PATH"]).expanduser()))
+if Path(_config_module.CONFIG_PATH) != _EXPECTED_CONFIG_PATH:
+    raise pytest.UsageError(
+        f"mcp_email_server.config was imported before the test configuration path was set, so it is "
+        f"bound to {_config_module.CONFIG_PATH} instead of {_EXPECTED_CONFIG_PATH}. The suite resets "
+        "that file before every test. Run pytest directly, without importing mcp_email_server first."
+    )
 
 
 def _harden_windows_test_directory(path: Path) -> None:
