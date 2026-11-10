@@ -1,4 +1,4 @@
-"""Mailboxes an account reserves for its owner's own use.
+r"""Mailboxes an account reserves for its owner's own use.
 
 Some owners use a mailbox as a signal: applying a label, for example, can be
 their approval for another process to act on the message. Such a mailbox is
@@ -24,6 +24,14 @@ with them (a child of a reserved mailbox is reserved too). Mailbox-shape changes
 also match a mailbox whose segments are a prefix of a reserved entry's, because
 deleting or renaming a parent takes the reserved mailbox with it. Over-matching
 only refuses a request; it never allows one.
+
+Flags and keywords are part of the signal too: another process may act on a
+message only when it also carries ``\Draft``. So, for an account with any
+reservation, adding ``\Draft`` is refused in every mailbox (servers may share one
+message's flags across all the mailboxes it appears in, so the mailbox named in
+the request does not show where the flag lands), and on a message whose source
+mailbox is reserved only read state (``\Seen``) may change. Removing a label and
+moving a message out stay allowed.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ import base64
 import binascii
 import unicodedata
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 
 from mcp_email_server.application.limits import APPLICATION_LIMITS, validate_controlled_string
 
@@ -40,6 +49,21 @@ _DELIMITERS = ("/", ".")
 
 class ReservedMailboxError(PermissionError):
     """A mutation would place a message in, or reshape, a reserved mailbox."""
+
+
+@dataclass(frozen=True)
+class FlagChange:
+    """One requested flag (``keywords=False``) or keyword (``keywords=True``) STORE."""
+
+    mailbox: str
+    operation: str
+    flags: tuple[str, ...] = ()
+    keywords: bool = False
+
+
+# Read state carries no approval signal, so it may change inside a reserved mailbox.
+_SOURCE_SAFE_FLAGS = frozenset({r"\seen"})
+_DRAFT_FLAG = r"\draft"
 
 
 def _decode_modified_utf7(name: str) -> str:
@@ -133,21 +157,45 @@ def reserved_entry(
     return None
 
 
+def _require_flag_change_allowed(account_name: str, reserved: Sequence[str], change: FlagChange) -> None:
+    if not change.keywords and change.operation == "add" and any(f.casefold() == _DRAFT_FLAG for f in change.flags):
+        raise ReservedMailboxError(
+            f"Refused: account '{account_name}' has reserved mailboxes, so this server never adds \\Draft to a "
+            "message there or anywhere else: a server may share one message's flags across every mailbox it is "
+            "in, so the flag could mark a message in a reserved mailbox as a draft. Removing \\Draft and "
+            "changing other flags outside a reserved mailbox stay allowed. Nothing was changed."
+        )
+    entry = reserved_entry(change.mailbox, reserved)
+    if entry is None:
+        return
+    if not change.keywords and all(f.casefold() in _SOURCE_SAFE_FLAGS for f in change.flags):
+        return
+    raise ReservedMailboxError(
+        f"Refused: '{change.mailbox}' is or is inside the reserved mailbox '{entry}' on account "
+        f"'{account_name}'. Only read state (\\Seen) may change on messages there; no other flag or tag. "
+        "Moving a message out, removing the label, and reading stay allowed. Nothing was changed."
+    )
+
+
 def require_unreserved(
     account_name: str,
     reserved: Sequence[str],
     *,
     destinations: Iterable[str] = (),
     shapes: Iterable[str] = (),
+    flag_change: FlagChange | None = None,
 ) -> None:
-    """Refuse before any effect when a destination or shape change touches a reserved mailbox.
+    """Refuse before any effect when a mutation touches a reserved mailbox.
 
     ``destinations`` are mailboxes a message would be placed in; ``shapes`` are
-    mailboxes that would be created, deleted, or renamed (either name).
+    mailboxes that would be created, deleted, or renamed (either name);
+    ``flag_change`` is a flag or keyword STORE and the mailbox it runs in.
     """
 
     if not reserved:
         return
+    if flag_change is not None:
+        _require_flag_change_allowed(account_name, reserved, flag_change)
     checks = [(mailbox, False) for mailbox in destinations] + [(mailbox, True) for mailbox in shapes]
     for mailbox, include_ancestors in checks:
         entry = reserved_entry(mailbox, reserved, include_ancestors=include_ancestors)

@@ -57,6 +57,12 @@ destination, or ask the account owner. `email_command` IMAP reports
 `policy_conflict` for such an account. See
 [Reserved mailboxes](security.md#reserved-mailboxes).
 
+`Refused: account '...' has reserved mailboxes, so this server never adds \Draft`
+is the same protection applied to flags: turning a message into a draft could
+make it actionable in the reserved mailbox. Save a new draft with `save_draft`
+instead. `Only read state (\Seen) may change` means the message is in a
+reserved mailbox; marking it read or unread works, other flags and tags do not.
+
 `sent-copy: failed (<mailbox>; reserved-mailbox)` after a send means the message
 was delivered as reported, but the Sent mailbox chosen for the local copy is
 reserved, so no copy was saved. Do not resend. Set `sent_folder_name` to an

@@ -735,6 +735,17 @@ a mailbox inside it, or of a mailbox that contains it. A rename away or a parent
 delete would otherwise let an agent remove the reserved mailbox and later
 recreate it, or rename an agent-filled mailbox into its place.
 
+Flags are part of such a signal too: the other process may act only on a message
+in the reserved mailbox that is also a draft. A message can sit there inert, so
+turning it into a draft would create the signal without any new placement. For
+an account with any reservation, `set_email_flags` therefore never adds
+`\Draft`, in any mailbox: label-based servers share one message's flags across
+every mailbox it is in, so the mailbox named in the request does not show where
+the flag lands. On messages in a reserved mailbox every other flag or tag change
+is refused too, except read state (`\Seen`), which carries no signal. Removing
+`\Draft` elsewhere, other flags outside reserved mailboxes, and `save_draft`
+(which APPENDs a new draft to Drafts) are unaffected.
+
 The check runs in the shared application mutation path on the resolved account
 before any provider is constructed, again on the freshly opened account, and in
 the classic provider adapter on freshly re-resolved authority before each IMAP

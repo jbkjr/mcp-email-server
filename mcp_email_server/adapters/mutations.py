@@ -51,7 +51,7 @@ from mcp_email_server.application.mutations import (
     SetEmailTagsCommand,
     _validate_recipient_policy,
 )
-from mcp_email_server.application.reserved_mailboxes import require_unreserved
+from mcp_email_server.application.reserved_mailboxes import FlagChange, require_unreserved
 from mcp_email_server.config import EmailSettings, Settings
 from mcp_email_server.emails.classic import ClassicEmailHandler, _validate_flags
 from mcp_email_server.imap_keywords import ImapKeywordRegistry
@@ -103,6 +103,7 @@ class ClassicMutationProvider:
         check_tags: bool = False,
         destinations: tuple[str, ...] = (),
         shapes: tuple[str, ...] = (),
+        flag_change: FlagChange | None = None,
     ) -> None:
         def check(selected: tuple[str, ...] = ()) -> None:
             try:
@@ -117,6 +118,7 @@ class ClassicMutationProvider:
                 current.reserved_mailboxes,
                 destinations=(*destinations, *selected),
                 shapes=shapes,
+                flag_change=flag_change,
             )
             if grant == "append" and isinstance(command, SaveToMailboxCommand):
                 require_append_permissions(current.allowed_mutations, command.flags)
@@ -144,7 +146,9 @@ class ClassicMutationProvider:
         command: SetEmailFlagsCommand,
         account: MutationAccountSnapshot,
     ) -> BatchMutationOutcome:
-        self._guard(account, "organize")
+        self._guard(
+            account, "organize", flag_change=FlagChange(command.mailbox, command.operation, tuple(command.flags))
+        )
         return await _bounded_mutation_call(
             self._handler.incoming_client.set_email_flags_with_outcome(
                 list(command.email_ids),
@@ -161,7 +165,12 @@ class ClassicMutationProvider:
         command: SetEmailTagsCommand,
         account: MutationAccountSnapshot,
     ) -> BatchMutationOutcome:
-        self._guard(account, "organize", check_tags=True)
+        self._guard(
+            account,
+            "organize",
+            check_tags=True,
+            flag_change=FlagChange(command.mailbox, command.operation, keywords=True),
+        )
         return await _bounded_mutation_call(
             self._handler.incoming_client.set_email_tags_with_outcome(
                 list(command.email_ids),

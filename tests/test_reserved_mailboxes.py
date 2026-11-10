@@ -42,6 +42,7 @@ from mcp_email_server.application.mutations import (
     DeleteFolderCommand,
     DeleteLabelCommand,
     FolderMutationOutcome,
+    MarkReadCommand,
     MoveCommand,
     MutationAccountSnapshot,
     MutationProviderAccess,
@@ -54,6 +55,8 @@ from mcp_email_server.application.mutations import (
     SaveToMailboxCommand,
     SendCommand,
     SentCopyMutationOutcome,
+    SetEmailFlagsCommand,
+    SetEmailTagsCommand,
     TargetMutationOutcome,
 )
 from mcp_email_server.application.protocol import ProtocolCommandService, ProtocolFailure, ProtocolRequest
@@ -65,6 +68,7 @@ from mcp_email_server.application.reserved_mailboxes import (
 )
 from mcp_email_server.config import EmailSettings, Settings
 from mcp_email_server.emails.classic import EmailClient
+from mcp_email_server.imap_keywords import ImapKeywordRegistry, ImapKeywordTag
 
 RESERVED = ("Labels/Send",)
 REFUSED = r"reserved mailbox 'Labels/Send'"
@@ -1138,3 +1142,164 @@ async def test_an_unreserved_sent_mailbox_still_receives_the_copy(scratch_config
     assert result.sent_copy == SentCopyMutationOutcome("succeeded", "Sent")
     imap.append.assert_awaited_once()
     assert imap.append.await_args.kwargs["mailbox"] == '"Sent"'
+
+
+# R2: no flag or keyword change can turn a message in a reserved mailbox into a signal
+
+_TAGS = ImapKeywordRegistry.from_tags((ImapKeywordTag(name="todo", keyword="$label4", writable=True),))
+_DRAFT_REFUSED = r"never adds \\Draft"
+_SOURCE_REFUSED = r"Only read state \(\\Seen\) may change"
+
+
+def _store_commands(imap: AsyncMock) -> list[tuple[object, ...]]:
+    return [call.args for call in imap.uid.await_args_list if call.args and call.args[0] == "store"]
+
+
+@pytest.mark.parametrize(
+    ("service", "command", "refusal"),
+    [
+        # Adding \Draft anywhere: providers may share one message's flags across its mailboxes.
+        ("set_flags", SetEmailFlagsCommand("primary", ("1",), "add", (r"\Draft",), "Labels/Send"), _DRAFT_REFUSED),
+        ("set_flags", SetEmailFlagsCommand("primary", ("1",), "add", (r"\Draft",), "INBOX"), _DRAFT_REFUSED),
+        ("set_flags", SetEmailFlagsCommand("primary", ("1",), "add", (r"\Draft",), "Drafts"), _DRAFT_REFUSED),
+        (
+            "set_flags",
+            SetEmailFlagsCommand("primary", ("1",), "add", (r"\Flagged", r"\Draft"), "Archive"),
+            _DRAFT_REFUSED,
+        ),
+        # Any other flag or keyword change whose source is reserved.
+        ("set_flags", SetEmailFlagsCommand("primary", ("1",), "add", (r"\Flagged",), "Labels/Send"), _SOURCE_REFUSED),
+        ("set_flags", SetEmailFlagsCommand("primary", ("1",), "remove", (r"\Draft",), "labels/send"), _SOURCE_REFUSED),
+        (
+            "set_flags",
+            SetEmailFlagsCommand("primary", ("1",), "add", (r"\Seen", r"\Answered"), "Labels/Send/Child"),
+            _SOURCE_REFUSED,
+        ),
+        ("set_tags", SetEmailTagsCommand("primary", ("1",), "add", ("todo",), "Labels/Send"), REFUSED),
+        ("set_tags", SetEmailTagsCommand("primary", ("1",), "remove", ("todo",), "Labels.Send"), REFUSED),
+    ],
+)
+async def test_flag_and_keyword_changes_that_could_create_a_signal_are_refused_before_store(
+    email_server, service: str, command: object, refusal: str
+) -> None:
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    services = _classic(client, resolved=_account(tag_registry=_TAGS))
+    with patch.object(client, "imap_class", return_value=imap):
+        with pytest.raises(ReservedMailboxError, match=refusal):
+            await getattr(services, service).execute(command)
+
+    assert _store_commands(imap) == []
+    assert _mutation_commands(imap) == []
+
+
+@pytest.mark.parametrize(
+    ("service", "command"),
+    [
+        ("set_flags", SetEmailFlagsCommand("primary", ("1",), "add", (r"\Draft",), "Labels/Send")),
+        ("set_flags", SetEmailFlagsCommand("primary", ("1",), "add", (r"\Draft",), "Drafts")),
+        ("set_flags", SetEmailFlagsCommand("primary", ("1",), "add", (r"\Flagged",), "Labels/Send")),
+        ("set_tags", SetEmailTagsCommand("primary", ("1",), "add", ("todo",), "Labels/Send")),
+    ],
+)
+async def test_the_provider_refuses_flag_changes_under_a_reservation_it_alone_can_see(
+    email_server, service: str, command: object
+) -> None:
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    unreserved = _account(reserved_mailboxes=(), tag_registry=_TAGS)
+    services = _classic(client, resolved=unreserved, opened=unreserved, fresh=_account(tag_registry=_TAGS))
+    with patch.object(client, "imap_class", return_value=imap):
+        with pytest.raises(ReservedMailboxError):
+            await getattr(services, service).execute(command)
+
+    assert _store_commands(imap) == []
+    assert _mutation_commands(imap) == []
+
+
+@pytest.mark.parametrize(
+    ("service", "command", "store"),
+    [
+        # Read state carries no signal, so reading and marking read stay possible.
+        ("mark_read", MarkReadCommand("primary", ("1",), "Labels/Send"), ("store", "1", "+FLAGS.SILENT", r"(\Seen)")),
+        (
+            "set_flags",
+            SetEmailFlagsCommand("primary", ("1",), "remove", (r"\Seen",), "Labels/Send"),
+            ("store", "1", "-FLAGS.SILENT", r"(\Seen)"),
+        ),
+        # Outside a reserved mailbox only adding \Draft is refused.
+        (
+            "set_flags",
+            SetEmailFlagsCommand("primary", ("1",), "remove", (r"\Draft",), "Drafts"),
+            ("store", "1", "-FLAGS.SILENT", r"(\Draft)"),
+        ),
+        (
+            "set_flags",
+            SetEmailFlagsCommand("primary", ("1",), "add", (r"\Flagged",), "INBOX"),
+            ("store", "1", "+FLAGS.SILENT", r"(\Flagged)"),
+        ),
+        (
+            "set_tags",
+            SetEmailTagsCommand("primary", ("1",), "add", ("todo",), "Labels/Later"),
+            ("store", "1", "+FLAGS.SILENT", "($label4)"),
+        ),
+    ],
+)
+async def test_harmless_flag_changes_still_reach_imap(
+    email_server, service: str, command: object, store: tuple[str, ...]
+) -> None:
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    services = _classic(client, resolved=_account(tag_registry=_TAGS))
+    with patch.object(client, "imap_class", return_value=imap):
+        result = await getattr(services, service).execute(command)
+
+    assert result.targets("succeeded") == ["1"]
+    assert _store_commands(imap) == [store]
+
+
+async def test_withdrawing_a_message_from_a_reserved_mailbox_into_drafts_carries_no_new_draft_flag(
+    email_server,
+) -> None:
+    """The reviewed activation chain: add \\Draft in the reserved mailbox, then copy it to Drafts."""
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    services = _classic(client, resolved=_account())
+    with patch.object(client, "imap_class", return_value=imap):
+        with pytest.raises(ReservedMailboxError, match=_DRAFT_REFUSED):
+            await services.set_flags.execute(
+                SetEmailFlagsCommand("primary", ("1",), "add", (r"\Draft",), "Labels/Send")
+            )
+        await services.copy.execute(CopyCommand("primary", ("1",), "Labels/Send", "Drafts"))
+
+    assert [call.args for call in imap.uid.await_args_list] == [("copy", "1", '"Drafts"')]
+
+
+async def test_an_unreserved_account_can_still_add_the_draft_flag(email_server) -> None:
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    services = _classic(client, resolved=_account(reserved_mailboxes=()))
+    with patch.object(client, "imap_class", return_value=imap):
+        await services.set_flags.execute(SetEmailFlagsCommand("primary", ("1",), "add", (r"\Draft",), "Labels/Send"))
+
+    assert _store_commands(imap) == [("store", "1", "+FLAGS.SILENT", r"(\Draft)")]
+
+
+async def test_mcp_set_email_flags_surfaces_the_draft_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    services, factory, provider = _services()
+    monkeypatch.setattr(app_module, "get_application_runtime", lambda: SimpleNamespace(mutations=services))
+
+    with pytest.raises(Exception, match=_DRAFT_REFUSED):
+        await app_module.mcp.call_tool(
+            "set_email_flags",
+            {
+                "account_name": "primary",
+                "email_ids": ["1"],
+                "operation": "add",
+                "flags": ["\\Draft"],
+                "mailbox": "Labels/Send",
+            },
+        )
+
+    factory.open.assert_not_called()
+    _assert_no_effect(provider)

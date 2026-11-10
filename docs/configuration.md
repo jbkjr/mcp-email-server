@@ -358,12 +358,20 @@ that would place a message in it or change its shape:
 - `create_mailbox`, `create_folder`, `create_label`, `delete_folder`,
   `delete_label`, and `rename_folder` (old or new name), when the mailbox is
   reserved, is inside a reserved mailbox, or contains one;
+- `set_email_flags` adding `\Draft`, in any mailbox of the account, because a
+  server can share one message's flags across every mailbox the message is in;
+- any other `set_email_flags` or `set_email_tags` change on messages in a
+  reserved mailbox, except read state: `mark_emails_as_read`,
+  `get_emails_content` with `mark_as_read`, and adding or removing `\Seen`
+  stay allowed there;
 - IMAP execution through `email_command`, which is refused outright for the
   account (SMTP admission is unchanged).
 
 Reading a reserved mailbox stays allowed, and so does taking a message out of
 one: `remove_label`, and moving, copying, archiving or deleting with the
-reserved mailbox as the source. The refusal is a permission error that names the
+reserved mailbox as the source. Outside reserved mailboxes, every flag change
+other than adding `\Draft` is unaffected, and `save_draft` still saves new
+drafts with `\Draft`. The refusal is a permission error that names the
 reserved entry. Other accounts are unaffected.
 
 Entries are mailbox paths, not label names: write `Labels/Approved`, not

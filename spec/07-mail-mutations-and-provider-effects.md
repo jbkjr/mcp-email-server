@@ -309,9 +309,15 @@ independently of grants:
 - No mailbox-shape workflow (create, delete, either name of a rename, and
   `create_mailbox`) may act on a reserved mailbox, a mailbox inside one, or a
   mailbox that contains one.
-- Taking a message out (label removal, and any mutation whose source is the
-  reserved mailbox) and reading stay permitted, because neither can produce the
-  owner's signal.
+- No flag or keyword STORE may make a message actionable: for an account with
+  any reservation, adding `\Draft` is refused in every mailbox, because
+  providers may share one message's flags across all the mailboxes it is in; and
+  on a source mailbox that is or is inside a reserved one, every flag change
+  other than `\Seen` and every semantic tag change is refused. Read state
+  carries no signal, so mark-read stays permitted there.
+- Taking a message out (label removal, and moving, copying, archiving or
+  deleting with the reserved mailbox as the source) and reading stay permitted,
+  because neither can produce the owner's signal.
 - The opted-in protocol executor refuses IMAP for an account with any
   reservation instead of filtering raw commands; SMTP admission is unchanged.
 
@@ -718,7 +724,10 @@ enter public errors.
     empty list are unaffected; that environment replacement of a stored account
     keeps its list unless the variable is set; that a configured, discovered,
     or fallback Sent mailbox under a reservation receives no APPEND while
-    delivery is still reported; and that raw IMAP execution is
+    delivery is still reported; that adding `\Draft` anywhere, and any flag
+    other than `\Seen` or any tag in a reserved source, issues no STORE, while
+    mark-read there and other flags elsewhere still reach IMAP; and that raw
+    IMAP execution is
     refused for a reserving account, including mid-session, while SMTP
     admission is unchanged. Scratch-file tests through the real legacy resolver
     prove that adding a reservation to, or corrupting, the policy file after the

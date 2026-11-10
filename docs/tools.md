@@ -198,9 +198,12 @@ IMAP session opens, and nothing changes. When the Sent mailbox chosen for the
 copy that `send_email`, `forward_email`, or a sending `reply_email` saves after
 delivery is reserved, only that copy fails: the result reports the delivery as
 it happened and `sent-copy: failed (<mailbox>; reserved-mailbox)`.
-`remove_label`, reads, and mutations whose _source_ is a reserved mailbox are
-unaffected. See [configuration](configuration.md#reserved-mailboxes) for
-matching rules.
+`remove_label`, reads, and moving, copying, archiving or deleting with a
+reserved mailbox as the _source_ are unaffected. Flag changes are narrower: for
+such an account `set_email_flags` never adds `\Draft` (in any mailbox), and on
+messages in a reserved mailbox only `\Seen` may change, so
+`mark_emails_as_read` works there while `set_email_tags` is refused. See
+[configuration](configuration.md#reserved-mailboxes) for matching rules.
 
 ## Agent planning annotations
 

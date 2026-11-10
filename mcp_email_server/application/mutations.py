@@ -23,7 +23,7 @@ from mcp_email_server.application.mutation_policy import (
     require_append_permissions,
     require_mutation,
 )
-from mcp_email_server.application.reserved_mailboxes import require_unreserved
+from mcp_email_server.application.reserved_mailboxes import FlagChange, require_unreserved
 from mcp_email_server.imap_keywords import ImapKeywordRegistry
 from mcp_email_server.log import logger
 
@@ -867,9 +867,16 @@ def _require_unreserved(
     *,
     destinations: tuple[str, ...] = (),
     shapes: tuple[str, ...] = (),
+    flag_change: FlagChange | None = None,
 ) -> None:
-    """Refuse, before any effect, a message placement into or shape change of a reserved mailbox."""
-    require_unreserved(account.account_name, account.reserved_mailboxes, destinations=destinations, shapes=shapes)
+    """Refuse, before any effect, a mutation that could fill, reshape, or flag a reserved mailbox."""
+    require_unreserved(
+        account.account_name,
+        account.reserved_mailboxes,
+        destinations=destinations,
+        shapes=shapes,
+        flag_change=flag_change,
+    )
 
 
 def _validate_email_ids(email_ids: tuple[str, ...]) -> None:
@@ -1371,8 +1378,11 @@ class SetEmailFlagsService(_MutationWorkflow):
         command.validate()
         account = self._resolve(command.account_name)
         require_mutation(account.allowed_mutations, "organize")
+        change = FlagChange(command.mailbox, command.operation, tuple(command.flags))
+        _require_unreserved(account, flag_change=change)
         access = self._open(account)
         require_mutation(access.account.allowed_mutations, "organize")
+        _require_unreserved(access.account, flag_change=change)
         try:
             outcome = _validate_batch_result(
                 await _bounded_provider_effect(access.provider.set_flags(command, access.account))
@@ -1397,8 +1407,11 @@ class SetEmailTagsService(_MutationWorkflow):
         # Reject invalid semantic input before provider construction, then use
         # the freshly opened authority snapshot for the actual provider keyword.
         account.tag_registry.resolve(command.tags, require_writable=True)
+        change = FlagChange(command.mailbox, command.operation, keywords=True)
+        _require_unreserved(account, flag_change=change)
         access = self._open(account)
         require_mutation(access.account.allowed_mutations, "organize")
+        _require_unreserved(access.account, flag_change=change)
         provider_command = replace(
             command,
             tags=access.account.tag_registry.resolve(command.tags, require_writable=True),

@@ -1262,7 +1262,9 @@ async def delete_emails(
         "Add or remove approved IMAP flags on one or more emails by email_id. Supported flags are \\Seen, "
         "\\Flagged, \\Answered, and \\Draft; \\Deleted and provider-specific keywords are not supported. "
         "Use list_emails_metadata first. Partial or ambiguous effects report per-ID succeeded/failed/unknown "
-        "status and are not retried automatically."
+        "status and are not retried automatically. For an account with reserved_mailboxes, adding \\Draft is "
+        "refused in every mailbox, and in a reserved mailbox only \\Seen may change; nothing is changed when "
+        "refused."
     ),
     annotations=_IDEMPOTENT_REMOTE_MUTATION,
 )
@@ -1312,7 +1314,8 @@ async def set_email_flags(
 @mcp.tool(
     description=(
         "Add or remove configured writable semantic tags on emails. Only semantic names are accepted; "
-        "standard flags and unrelated provider keywords are preserved."
+        "standard flags and unrelated provider keywords are preserved. Refused, with nothing changed, when the "
+        "mailbox is or is inside one of the account's reserved_mailboxes."
     ),
     annotations=_IDEMPOTENT_REMOTE_MUTATION,
 )
@@ -1369,7 +1372,8 @@ async def set_email_tags(
     description=(
         "Mark one or more emails as read by email_id. This is the common-workflow equivalent of adding \\Seen "
         "with set_email_flags. Use list_emails_metadata first. Partial or ambiguous effects report per-ID "
-        "succeeded/failed/unknown status and are not retried automatically."
+        "succeeded/failed/unknown status and are not retried automatically. Allowed in reserved_mailboxes, "
+        "because read state is not a signal there."
     ),
     annotations=_IDEMPOTENT_REMOTE_MUTATION,
 )
