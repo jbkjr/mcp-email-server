@@ -372,7 +372,10 @@ one: `remove_label`, and moving, copying, archiving or deleting with the
 reserved mailbox as the source. Outside reserved mailboxes, every flag change
 other than adding `\Draft` is unaffected, and `save_draft` still saves new
 drafts with `\Draft`. The refusal is a permission error that names the
-reserved entry. Other accounts are unaffected.
+reserved entry. Other accounts are unaffected, including another configured
+account that signs in to the same server as the same user: it reaches the same
+mailboxes without the reservation. List the reservation on every account entry
+that exposes the protected mailbox.
 
 Entries are mailbox paths, not label names: write `Labels/Approved`, not
 `Approved`. A child of a reserved mailbox is reserved too. Matching is

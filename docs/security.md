@@ -781,7 +781,11 @@ The raw `email_command` IMAP surface could reach a reserved mailbox under any
 spelling, so it is refused outright for an account with any reservation rather
 than filtered per command. Raw SMTP never writes a mailbox and is unchanged.
 
-Limits: the reservation binds only this server process. It does not stop the
+Limits: the reservation binds only this server process and only the account
+name it is listed on. A second account entry in the same configuration with the
+same incoming server and user name is a separate account here: without its own
+list, its copies, appends and raw `email_command` IMAP reach the same mailbox, so
+reserve the mailbox on every such entry. It does not stop the
 account owner's own mail clients (which is the point), other IMAP clients, or a
 server instance whose configuration omits the list. It is a legacy-mode setting:
 managed accounts reserve nothing and legacy import does not carry it.

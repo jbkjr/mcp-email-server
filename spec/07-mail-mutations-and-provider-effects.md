@@ -344,8 +344,11 @@ intentionally broader than any server's resolution; over-matching only refuses.
 A refusal is a `PermissionError` naming the reserved entry, issued before any
 mutation command. A destination named in the request is refused before any
 provider session opens; destination discovery (Drafts, Junk, Archive, Trash)
-and hierarchy-delimiter discovery may first make read-only IMAP requests. An empty list changes no behavior. Managed accounts have no
-reservation in this delivery.
+and hierarchy-delimiter discovery may first make read-only IMAP requests. An
+empty list changes no behavior. Managed accounts have no reservation in this
+delivery. The policy is per configured account name: another entry with the
+same incoming endpoint and user reaches the same mailboxes under its own policy,
+so an owner reserves the mailbox on every such entry.
 
 ## Delete and Scoped Expunge
 
