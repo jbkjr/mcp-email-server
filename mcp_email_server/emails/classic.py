@@ -5149,6 +5149,36 @@ class EmailClient:
 
         return mailboxes
 
+    async def discover_hierarchy_delimiters(self, references: Sequence[str]) -> dict[str, str]:
+        """Return the hierarchy delimiter of the default namespace and of each reference.
+
+        ``LIST <reference> ""`` names the delimiter of the namespace a reference
+        belongs to, whether or not that mailbox exists (RFC 3501 6.3.8). The
+        result maps ``""`` and every reference to its delimiter; ``""`` as a
+        value is a flat (``NIL``) hierarchy. Raises ``RuntimeError`` when a LIST
+        is rejected or does not report exactly one delimiter, because a guessed
+        delimiter could let a reserved mailbox's child or parent go unrecognised.
+        Read-only: no mailbox state changes.
+        """
+        imap = await self._connect_imap()
+        try:
+            await _imap_login(imap, self.email_server.user_name, self.email_server.password.get_secret_value())
+            await _send_imap_id(imap)
+            discovered: dict[str, str] = {}
+            for reference in ("", *references):
+                if reference in discovered:
+                    continue
+                quoted = _quote_mailbox(reference) if reference else '""'
+                response = await imap.list(quoted, '""')  # pyright: ignore[reportArgumentType]
+                _raise_for_imap_error(response, "LIST hierarchy delimiter")
+                roots = _parse_list_responses(response[1])
+                if len({root.delimiter for root in roots}) != 1:
+                    raise RuntimeError("LIST hierarchy delimiter returned no unique delimiter")
+                discovered[reference] = roots[0].delimiter
+            return discovered
+        finally:
+            await _best_effort_imap_logout(imap)
+
     async def create_mailbox(self, mailbox: str) -> MailboxCreationStatus:
         """Create one mailbox by exact name; report existence instead of failing.
 

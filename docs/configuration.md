@@ -380,11 +380,19 @@ deliberately broader than the server's own name resolution, so another spelling
 of the same mailbox cannot slip through. Both the entry and the requested
 mailbox are compared segment by segment after modified UTF-7 decoding (the raw
 spelling is compared as well), Unicode NFKC normalization, removal of invisible
-format characters, and case folding; `/` and `.` both count as hierarchy
-delimiters, whitespace around each segment is ignored, and empty segments are
-dropped. So `labels/approved`, `Labels/Approved`, `Labels.Approved` and
-`Labels/Approved/Later` all match the example above, while `Labels/Approvals`
-does not. Over-matching can only refuse a request.
+format characters, and case folding; `/`, `.`, and the hierarchy delimiter
+the server itself reports all count as hierarchy delimiters, whitespace around
+each segment is ignored, and empty segments are dropped. So `labels/approved`,
+`Labels/Approved`, `Labels.Approved` and `Labels/Approved/Later` all match the
+example above, while `Labels/Approvals` does not. On a server whose delimiter
+is, say, `|`, `Labels/Approved|Later` matches too. Over-matching can only
+refuse a request.
+
+To learn that delimiter, the server sends a read-only `LIST <entry> ""` for
+each reserved entry before each mailbox-bearing mutation of the account (copy,
+move, append, label application, flag or tag change, mailbox create, rename or
+delete, and the Sent copy). If the delimiter cannot be determined, the mutation
+is refused. Accounts without a reservation make no such request.
 
 Each entry must name a mailbox: blank, control-character or delimiter-only
 entries, and lists over 1,000 entries, are rejected when configuration loads.

@@ -63,6 +63,13 @@ make it actionable in the reserved mailbox. Save a new draft with `save_draft`
 instead. `Only read state (\Seen) may change` means the message is in a
 reserved mailbox; marking it read or unread works, other flags and tags do not.
 
+`Refused: account '...' has reserved mailboxes, and the server's hierarchy
+delimiter for them could not be determined` means the read-only `LIST` that
+learns the server's hierarchy delimiter was rejected or ambiguous, or the
+reservation was added while the request was in progress. Nothing was changed.
+Retry; if it persists, check that the server answers `LIST "" ""` normally. A
+Sent copy refused this way also reports `failed (<mailbox>; reserved-mailbox)`.
+
 `sent-copy: failed (<mailbox>; reserved-mailbox)` after a send means the message
 was delivered as reported, but the Sent mailbox chosen for the local copy is
 reserved, so no copy was saved. Do not resend. Set `sent_folder_name` to an

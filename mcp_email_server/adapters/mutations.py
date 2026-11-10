@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from email.message import Message
 from email.mime.multipart import MIMEMultipart
@@ -51,7 +51,12 @@ from mcp_email_server.application.mutations import (
     SetEmailTagsCommand,
     _validate_recipient_policy,
 )
-from mcp_email_server.application.reserved_mailboxes import FlagChange, require_unreserved
+from mcp_email_server.application.reserved_mailboxes import (
+    FlagChange,
+    hierarchy_delimiters,
+    require_known_hierarchy,
+    require_unreserved,
+)
 from mcp_email_server.config import EmailSettings, Settings
 from mcp_email_server.emails.classic import ClassicEmailHandler, _validate_flags
 from mcp_email_server.imap_keywords import ImapKeywordRegistry
@@ -94,6 +99,22 @@ class ClassicMutationProvider:
         self._handler = handler
         self._fresh_authority = fresh_authority
 
+    async def _hierarchy(self, account: MutationAccountSnapshot) -> dict[str, str] | None:
+        """Discover the server's hierarchy delimiters for a reserving account, read-only.
+
+        ``None`` (no reservation, or discovery failed) leaves the guard without
+        a hierarchy, and the guard then refuses any mailbox-bearing mutation of
+        an account that has a reservation rather than guess its delimiter.
+        """
+        if not account.reserved_mailboxes:
+            return None
+        try:
+            return await self._handler.incoming_client.discover_hierarchy_delimiters(list(account.reserved_mailboxes))
+        except (asyncio.CancelledError, ValueError, PermissionError):
+            raise
+        except Exception:
+            return None
+
     def _guard(
         self,
         account: MutationAccountSnapshot,
@@ -104,6 +125,7 @@ class ClassicMutationProvider:
         destinations: tuple[str, ...] = (),
         shapes: tuple[str, ...] = (),
         flag_change: FlagChange | None = None,
+        hierarchy: Mapping[str, str] | None = None,
     ) -> None:
         def check(selected: tuple[str, ...] = ()) -> None:
             try:
@@ -113,13 +135,26 @@ class ClassicMutationProvider:
                 raise PermissionError("Mutation account authority is unavailable; retry") from exc
             # Fresh authority, immediately before each IMAP mutation command.
             # ``selected`` is a destination the client chose inside its session.
+            placed = (*destinations, *selected)
             require_unreserved(
                 current.account_name,
                 current.reserved_mailboxes,
-                destinations=(*destinations, *selected),
+                destinations=placed,
                 shapes=shapes,
                 flag_change=flag_change,
             )
+            if current.reserved_mailboxes and (placed or shapes or flag_change is not None):
+                # The server's own delimiter can hide a child or parent from the
+                # slash/dot rules above, so it must be known for every entry.
+                require_known_hierarchy(current.account_name, current.reserved_mailboxes, hierarchy)
+                require_unreserved(
+                    current.account_name,
+                    current.reserved_mailboxes,
+                    destinations=placed,
+                    shapes=shapes,
+                    flag_change=flag_change,
+                    delimiters=hierarchy_delimiters(hierarchy or {}),
+                )
             if grant == "append" and isinstance(command, SaveToMailboxCommand):
                 require_append_permissions(current.allowed_mutations, command.flags)
             else:
@@ -147,7 +182,10 @@ class ClassicMutationProvider:
         account: MutationAccountSnapshot,
     ) -> BatchMutationOutcome:
         self._guard(
-            account, "organize", flag_change=FlagChange(command.mailbox, command.operation, tuple(command.flags))
+            account,
+            "organize",
+            flag_change=FlagChange(command.mailbox, command.operation, tuple(command.flags)),
+            hierarchy=await self._hierarchy(account),
         )
         return await _bounded_mutation_call(
             self._handler.incoming_client.set_email_flags_with_outcome(
@@ -170,6 +208,7 @@ class ClassicMutationProvider:
             "organize",
             check_tags=True,
             flag_change=FlagChange(command.mailbox, command.operation, keywords=True),
+            hierarchy=await self._hierarchy(account),
         )
         return await _bounded_mutation_call(
             self._handler.incoming_client.set_email_tags_with_outcome(
@@ -192,6 +231,7 @@ class ClassicMutationProvider:
             "draft" if isinstance(command, DraftAppendCommand) else "append",
             command,
             destinations=(command.mailbox,),
+            hierarchy=await self._hierarchy(account),
         )
         message = self._handler.incoming_client.compose_message(
             list(command.recipients),
@@ -241,7 +281,9 @@ class ClassicMutationProvider:
             raise ValueError("Move destination must be resolved before provider access")
         if grant not in ("organize", "delete"):
             raise ValueError("Move must be authorized by the organize or delete grant")
-        self._guard(account, grant, destinations=(command.destination_mailbox,))
+        self._guard(
+            account, grant, destinations=(command.destination_mailbox,), hierarchy=await self._hierarchy(account)
+        )
         return await _bounded_mutation_call(
             self._handler.incoming_client.move_emails_with_outcome(
                 list(command.email_ids),
@@ -257,7 +299,9 @@ class ClassicMutationProvider:
         command: CopyCommand,
         account: MutationAccountSnapshot,
     ) -> BatchMutationOutcome:
-        self._guard(account, "organize", destinations=(command.destination_mailbox,))
+        self._guard(
+            account, "organize", destinations=(command.destination_mailbox,), hierarchy=await self._hierarchy(account)
+        )
         return await _bounded_mutation_call(
             self._handler.incoming_client.copy_emails_with_outcome(
                 list(command.email_ids),
@@ -286,7 +330,7 @@ class ClassicMutationProvider:
         command: CreateFolderCommand,
         account: MutationAccountSnapshot,
     ) -> FolderMutationOutcome:
-        self._guard(account, "organize", shapes=(command.folder_name,))
+        self._guard(account, "organize", shapes=(command.folder_name,), hierarchy=await self._hierarchy(account))
         return await self._mailbox_shape_effect(
             self._handler.incoming_client.create_mailbox_with_outcome(command.folder_name)
         )
@@ -296,7 +340,7 @@ class ClassicMutationProvider:
         command: DeleteFolderCommand,
         account: MutationAccountSnapshot,
     ) -> FolderMutationOutcome:
-        self._guard(account, "delete", shapes=(command.folder_name,))
+        self._guard(account, "delete", shapes=(command.folder_name,), hierarchy=await self._hierarchy(account))
         return await self._mailbox_shape_effect(
             self._handler.incoming_client.delete_mailbox_with_outcome(command.folder_name)
         )
@@ -306,7 +350,12 @@ class ClassicMutationProvider:
         command: RenameFolderCommand,
         account: MutationAccountSnapshot,
     ) -> FolderMutationOutcome:
-        self._guard(account, "organize", shapes=(command.old_name, command.new_name))
+        self._guard(
+            account,
+            "organize",
+            shapes=(command.old_name, command.new_name),
+            hierarchy=await self._hierarchy(account),
+        )
         return await self._mailbox_shape_effect(
             self._handler.incoming_client.rename_mailbox_with_outcome(command.old_name, command.new_name)
         )
@@ -332,7 +381,7 @@ class ClassicMutationProvider:
         command: CreateMailboxCommand,
         account: MutationAccountSnapshot,
     ) -> MailboxCreationStatus:
-        self._guard(account, "organize", shapes=(command.mailbox,))
+        self._guard(account, "organize", shapes=(command.mailbox,), hierarchy=await self._hierarchy(account))
         return await _bounded_mutation_call(self._handler.incoming_client.create_mailbox(command.mailbox))
 
     async def find_drafts_mailbox(self) -> str:
@@ -530,7 +579,9 @@ class ClassicMutationProvider:
                 + bcc
             )
             evidence = SendCommand(account.account_name, recipients, "Sent copy", "Sent copy")
-            self._guard(account, "send", evidence)
+            # The Sent mailbox is chosen inside the APPEND session; the guard
+            # checks it there against this hierarchy.
+            self._guard(account, "send", evidence, hierarchy=await self._hierarchy(account))
         # BCC belongs only in the local copy and must be added after SMTP submission.
         if bcc and sent_message["Bcc"] is None:
             sent_message["Bcc"] = ", ".join(bcc)

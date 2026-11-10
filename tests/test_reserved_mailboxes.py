@@ -605,8 +605,26 @@ async def test_only_the_reserving_account_is_restricted(legacy_config) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _list_responder(delimiter: str | None = "/", listed: list[bytes] | None = None) -> AsyncMock:
+    """Answer ``LIST <reference> ""`` with the hierarchy delimiter, other LISTs with ``listed``.
+
+    ``delimiter=""`` is a flat (``NIL``) hierarchy; ``None`` rejects the discovery LIST.
+    """
+
+    async def list_(_reference: str, pattern: str) -> tuple[str, list[bytes]]:
+        if pattern == '""':
+            if delimiter is None:
+                return ("NO", [b"LIST unavailable"])
+            token = "NIL" if delimiter == "" else f'"{delimiter}"'
+            return ("OK", [f'(\\Noselect) {token} ""'.encode()])
+        return ("OK", list(listed or []))
+
+    return AsyncMock(side_effect=list_)
+
+
 def _mock_imap() -> AsyncMock:
     imap = AsyncMock()
+    imap.list = _list_responder()
     imap._client_task = asyncio.Future()
     imap._client_task.set_result(None)
     imap.wait_hello_from_server = AsyncMock()
@@ -617,6 +635,7 @@ def _mock_imap() -> AsyncMock:
     imap.create = AsyncMock(return_value=("OK", []))
     imap.delete = AsyncMock(return_value=("OK", []))
     imap.expunge = AsyncMock(return_value=("OK", []))
+    imap.append = AsyncMock(return_value=("OK", []))
     imap.logout = AsyncMock()
     imap.protocol = MagicMock(capabilities=("IMAP4rev1", "UIDPLUS", "MOVE"))
     imap.protocol.capability = AsyncMock()
@@ -1074,9 +1093,9 @@ def _smtp_session() -> AsyncMock:
     return smtp
 
 
-def _sent_copy_imap(listed: list[bytes]) -> AsyncMock:
+def _sent_copy_imap(listed: list[bytes], delimiter: str = "/") -> AsyncMock:
     imap = _mock_imap()
-    imap.list = AsyncMock(return_value=("OK", listed))
+    imap.list = _list_responder(delimiter, listed)
     imap.append = AsyncMock(return_value=("OK", []))
     return imap
 
@@ -1303,3 +1322,144 @@ async def test_mcp_set_email_flags_surfaces_the_draft_refusal(monkeypatch: pytes
 
     factory.open.assert_not_called()
     _assert_no_effect(provider)
+
+
+# R3: hierarchy matching also uses the server's own delimiter
+
+
+@pytest.mark.parametrize(
+    ("mailbox", "reserved", "include_ancestors"),
+    [
+        ("Labels/Send|Child", RESERVED, False),
+        ("labels/send|a|b", RESERVED, False),
+        ("Parent", ("Parent|Send",), True),
+        ("Parent|Send", ("Parent|Send",), False),
+    ],
+)
+def test_the_server_delimiter_is_a_hierarchy_delimiter_too(
+    mailbox: str, reserved: tuple[str, ...], include_ancestors: bool
+) -> None:
+    assert reserved_entry(mailbox, reserved, include_ancestors=include_ancestors, delimiters=("|",)) is not None
+
+
+def test_slash_and_dot_still_match_beside_a_server_delimiter() -> None:
+    assert reserved_entry("Labels.Send.Child", RESERVED, delimiters=("|",)) == "Labels/Send"
+    assert reserved_entry("Labels/Sending|Child", RESERVED, delimiters=("|",)) is None
+    assert reserved_entry("Labels/Send|Child", RESERVED, delimiters=("",)) is None
+
+
+_PIPE_ROUTES = [
+    pytest.param("create_mailbox", CreateMailboxCommand("primary", "Labels/Send|Child"), RESERVED, id="create-child"),
+    pytest.param("create_folder", CreateFolderCommand("primary", "Labels/Send|Child"), RESERVED, id="folder-child"),
+    pytest.param(
+        "rename_folder", RenameFolderCommand("primary", "Labels/Send|Child", "Elsewhere"), RESERVED, id="rename-child"
+    ),
+    pytest.param(
+        "rename_folder", RenameFolderCommand("primary", "Parent", "Elsewhere"), ("Parent|Send",), id="rename-parent"
+    ),
+    pytest.param("delete_folder", DeleteFolderCommand("primary", "Parent"), ("Parent|Send",), id="delete-parent"),
+    pytest.param("copy", CopyCommand("primary", ("1",), "Drafts", "Labels/Send|Child"), RESERVED, id="copy-child"),
+    pytest.param("move", MoveCommand("primary", ("1",), "Drafts", "Labels/Send|Child"), RESERVED, id="move-child"),
+    pytest.param(
+        "save_to_mailbox",
+        SaveToMailboxCommand("primary", ("a@example.test",), "s", "b", mailbox="Labels/Send|Child"),
+        RESERVED,
+        id="append-child",
+    ),
+    pytest.param(
+        "set_flags",
+        SetEmailFlagsCommand("primary", ("1",), "add", (r"\Flagged",), "Labels/Send|Child"),
+        RESERVED,
+        id="flag-child",
+    ),
+]
+
+
+@pytest.mark.parametrize(("service", "command", "reserved"), _PIPE_ROUTES)
+async def test_a_server_delimiter_other_than_slash_or_dot_is_honoured_before_any_mutation(
+    email_server, service: str, command: object, reserved: tuple[str, ...]
+) -> None:
+    """On a server whose hierarchy delimiter is ``|``, children and parents are recognised."""
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    imap.list = _list_responder("|")
+    services = _classic(client, resolved=_account(reserved_mailboxes=reserved))
+    with _fake_imap_connections(imap), patch.object(client, "imap_class", return_value=imap):
+        with pytest.raises(ReservedMailboxError, match="reserved mailbox"):
+            await getattr(services, service).execute(command)
+
+    assert _mutation_commands(imap) == []
+
+
+async def test_a_flat_hierarchy_adds_no_delimiter(email_server) -> None:
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    imap.list = _list_responder("")
+    services = _classic(client, resolved=_account())
+    with patch.object(client, "imap_class", return_value=imap):
+        result = await services.create_folder.execute(CreateFolderCommand("primary", "Labels/Send|Child"))
+
+    assert result.status == "succeeded"
+    assert [call.args for call in imap.create.await_args_list] == [('"Labels/Send|Child"',)]
+
+
+async def test_an_unrelated_mailbox_under_a_server_delimiter_is_still_reachable(email_server) -> None:
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    imap.list = _list_responder("|")
+    services = _classic(client, resolved=_account())
+    with patch.object(client, "imap_class", return_value=imap):
+        result = await services.copy.execute(CopyCommand("primary", ("1",), "Drafts", "Labels/Later|Child"))
+
+    assert result.targets("succeeded") == ["1"]
+    assert [call.args for call in imap.uid.await_args_list] == [("copy", "1", '"Labels/Later|Child"')]
+
+
+async def test_an_undiscoverable_hierarchy_refuses_rather_than_guessing(email_server) -> None:
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    imap.list = _list_responder(None)
+    services = _classic(client, resolved=_account())
+    with patch.object(client, "imap_class", return_value=imap):
+        with pytest.raises(ReservedMailboxError, match="hierarchy delimiter"):
+            await services.copy.execute(CopyCommand("primary", ("1",), "Drafts", "Labels/Later"))
+
+    assert _mutation_commands(imap) == []
+
+
+async def test_a_reservation_gained_after_discovery_was_skipped_refuses(email_server) -> None:
+    """An account that was unreserved when opened has no discovered hierarchy to match with."""
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    unreserved = _account(reserved_mailboxes=())
+    services = _classic(client, resolved=unreserved, opened=unreserved, fresh=_account())
+    with patch.object(client, "imap_class", return_value=imap) as connect:
+        with pytest.raises(ReservedMailboxError, match="hierarchy delimiter"):
+            await services.copy.execute(CopyCommand("primary", ("1",), "Drafts", "Labels/Later"))
+
+    connect.assert_not_called()
+    assert _mutation_commands(imap) == []
+
+
+async def test_an_unreserved_account_makes_no_hierarchy_discovery(email_server) -> None:
+    client = EmailClient(email_server)
+    imap = _mock_imap()
+    services = _classic(client, resolved=_account(reserved_mailboxes=()))
+    with patch.object(client, "imap_class", return_value=imap):
+        await services.copy.execute(CopyCommand("primary", ("1",), "Drafts", "Labels/Send"))
+
+    imap.list.assert_not_awaited()
+    assert [call.args for call in imap.uid.await_args_list] == [("copy", "1", '"Labels/Send"')]
+
+
+async def test_a_sent_mailbox_inside_a_reservation_by_the_server_delimiter_gets_no_copy(scratch_config) -> None:
+    _write_config(_send_toml("Labels/Send", "Labels/Send|Sent"))
+    imap = _sent_copy_imap([], delimiter="|")
+    smtp = _smtp_session()
+
+    with _fake_imap_connections(imap), patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await _real_services().send.execute(SendCommand("owner", ("friend@example.test",), "Hi", "Body"))
+
+    smtp.data.assert_awaited_once()
+    assert result.sent_copy == SentCopyMutationOutcome("failed", "Labels/Send|Sent", "reserved-mailbox")
+    assert _mutation_commands(imap) == []

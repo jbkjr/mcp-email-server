@@ -760,7 +760,17 @@ and states that nothing changed; no IMAP session is opened. Name matching
 compares hierarchy segments after modified UTF-7 decoding, NFKC normalization,
 invisible-character removal and case folding, with `/` and `.` both treated as
 delimiters, so case, whitespace, delimiter and encoding variants of a reserved
-name are refused. Over-matching refuses; it never allows.
+name are refused. Over-matching refuses; it never allows. A server's own
+hierarchy delimiter can be another character, which would hide a child or parent
+of a reserved mailbox from those rules, so before each mailbox-bearing mutation
+of a reserving account the provider adapter asks the server for the delimiter of
+each reserved entry's namespace (`LIST <entry> ""`, read-only) and matches with
+it as well. A rejected or ambiguous answer, or a reservation that appears after
+the account was opened, refuses the mutation instead of guessing. The
+application-level checks, which run before any IMAP session, use `/` and `.`
+only; the adapter check is the one that knows the server. Proton's `Labels/`
+prefix is a naming convention applied to label names before matching and is not
+treated as hierarchy.
 
 Withdrawing is not restricted: `remove_label`, and moving, copying, archiving or
 deleting with a reserved mailbox as the source, remain allowed, as do all reads.

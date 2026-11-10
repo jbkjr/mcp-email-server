@@ -332,7 +332,14 @@ has already received, so a policy change after transmission governs only later
 commands. Matching compares
 hierarchy segments after modified UTF-7 decoding (raw spelling too), NFKC
 normalization, format-character removal and case folding, treating `/` and `.`
-as delimiters and ignoring surrounding whitespace and empty segments. It is
+as delimiters and ignoring surrounding whitespace and empty segments. The
+provider-adapter check also treats the server's own hierarchy delimiter as one:
+before each mailbox-bearing mutation of a reserving account it discovers, with
+read-only `LIST <entry> ""`, the delimiter of the default namespace and of each
+reserved entry's namespace. A rejected or non-unique answer, or a reserved entry
+the discovery did not cover (a reservation added after opening), refuses the
+mutation; a NIL delimiter adds nothing. The application-level checks precede any
+IMAP session and use `/` and `.` only. It is
 intentionally broader than any server's resolution; over-matching only refuses.
 A refusal is a `PermissionError` naming the reserved entry, with no provider
 session opened. An empty list changes no behavior. Managed accounts have no
@@ -719,7 +726,11 @@ enter public errors.
     name) of a reserved mailbox, its children, or its parents. Tests prove each
     focused route and discovered destination is refused with no IMAP session
     opened; that case, whitespace, delimiter, modified UTF-7, compatibility-form,
-    and label-versus-path variants match; that label removal and mutations whose
+    and label-versus-path variants match; that on a server whose discovered
+    delimiter is neither `/` nor `.`, children (CREATE, COPY, MOVE, APPEND, flag
+    changes, the Sent copy) and parents (RENAME, DELETE) of a reserved mailbox
+    issue no mutation command, a flat hierarchy adds no delimiter, and an
+    undiscoverable delimiter refuses; that label removal and mutations whose
     source is reserved still reach the provider; that another account and an
     empty list are unaffected; that environment replacement of a stored account
     keeps its list unless the variable is set; that a configured, discovered,
