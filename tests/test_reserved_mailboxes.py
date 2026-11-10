@@ -884,6 +884,14 @@ def _write_config(text: str) -> None:
     config_module.clear_settings_cache()
 
 
+@pytest.fixture
+def scratch_config():
+    """Leave no policy file behind: a corrupt one would break the next test's setup."""
+    yield
+    config_module.CONFIG_PATH.unlink(missing_ok=True)
+    config_module.clear_settings_cache()
+
+
 # R5: a supplied reservation that cannot be honoured is an error, never a fallback
 
 
@@ -933,7 +941,7 @@ def test_an_explicitly_empty_environment_reservation_still_loads(
     assert isinstance(owner, EmailSettings) and owner.reserved_mailboxes == ["Labels/Send"]
 
 
-def test_an_invalid_toml_reservation_fails_configuration_load() -> None:
+def test_an_invalid_toml_reservation_fails_configuration_load(scratch_config) -> None:
     _write_config(_TOML.replace('reserved_mailboxes = ["Labels/Send"]', 'reserved_mailboxes = ["Labels/Send", "/"]'))
 
     with pytest.raises(ValueError, match="reserved_mailboxes"):
@@ -960,3 +968,62 @@ async def test_an_invalid_reservation_reaches_no_provider_through_the_real_resol
 
     assert imap.mock_calls == []
     assert _mutation_commands(imap) == []
+
+
+# R4: every focused authority check reads the policy on disk, not a cached copy
+
+_UNRESERVED_TOML = _TOML.replace('reserved_mailboxes = ["Labels/Send"]\n', "")
+_CORRUPT_TOML = "[[emails]\naccount_name = \n"
+
+
+def _rewrite_config_on_select(imap: AsyncMock, text: str) -> None:
+    """Change the policy file after the provider opened, before any mutation command."""
+
+    async def select(*_args: object, **_kwargs: object) -> tuple[str, list[bytes]]:
+        config_module.CONFIG_PATH.write_text(text, encoding="utf-8")
+        return ("OK", [])
+
+    imap.select = AsyncMock(side_effect=select)
+
+
+@pytest.mark.parametrize("change", ["reserve", "corrupt"])
+async def test_a_policy_change_on_disk_before_the_call_is_seen_by_every_check(change: str, scratch_config) -> None:
+    _write_config(_UNRESERVED_TOML)
+    config_module.get_settings()  # a running server has the old policy cached
+    config_module.CONFIG_PATH.write_text(_TOML if change == "reserve" else _CORRUPT_TOML, encoding="utf-8")
+    imap = _mock_imap()
+
+    with _fake_imap_connections(imap), pytest.raises((PermissionError, ValueError)):
+        await _real_services().copy.execute(CopyCommand("owner", ("1",), "Drafts", "Labels/Send"))
+
+    assert imap.mock_calls == []
+    assert _mutation_commands(imap) == []
+
+
+@pytest.mark.parametrize("change", ["reserve", "corrupt"])
+async def test_a_policy_change_on_disk_between_opening_and_mutation_stops_the_command(
+    change: str, scratch_config
+) -> None:
+    _write_config(_UNRESERVED_TOML)
+    config_module.get_settings()
+    imap = _mock_imap()
+    _rewrite_config_on_select(imap, _TOML if change == "reserve" else _CORRUPT_TOML)
+
+    with _fake_imap_connections(imap):
+        result = await _real_services().copy.execute(CopyCommand("owner", ("1",), "Drafts", "Labels/Send"))
+
+    imap.select.assert_awaited()  # the provider really opened before the change
+    assert result.targets("succeeded") == []
+    assert [(item.status, item.detail) for item in result.outcomes] == [("failed", "mutation-policy")]
+    assert _mutation_commands(imap) == []
+
+
+async def test_an_unchanged_unreserved_policy_still_reaches_imap(scratch_config) -> None:
+    _write_config(_UNRESERVED_TOML)
+    imap = _mock_imap()
+
+    with _fake_imap_connections(imap):
+        result = await _real_services().copy.execute(CopyCommand("owner", ("1",), "Drafts", "Labels/Send"))
+
+    assert result.targets("succeeded") == ["1"]
+    assert [call.args for call in imap.uid.await_args_list] == [("copy", "1", '"Labels/Send"')]

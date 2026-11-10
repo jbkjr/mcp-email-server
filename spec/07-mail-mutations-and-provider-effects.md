@@ -313,7 +313,12 @@ independently of grants:
 The check is part of step 2 of the common pipeline: it runs on the resolved
 account before provider construction, on the opened account before the effect,
 and in the provider adapter on fresh authority before each IMAP mutation
-command, so a reservation added between phases still refuses. Matching compares
+command, so a reservation added between phases still refuses. Every one of these
+legacy resolutions reads the TOML file and environment afresh rather than the
+process settings cache, and an unreadable or unparseable file fails closed. The
+boundary is the transmitted command: no check can retract a command the server
+has already received, so a policy change after transmission governs only later
+commands. Matching compares
 hierarchy segments after modified UTF-7 decoding (raw spelling too), NFKC
 normalization, format-character removal and case folding, treating `/` and `.`
 as delimiters and ignoring surrounding whitespace and empty segments. It is
@@ -708,4 +713,7 @@ enter public errors.
     empty list are unaffected; that environment replacement of a stored account
     keeps its list unless the variable is set; and that raw IMAP execution is
     refused for a reserving account, including mid-session, while SMTP
-    admission is unchanged.
+    admission is unchanged. Scratch-file tests through the real legacy resolver
+    prove that adding a reservation to, or corrupting, the policy file after the
+    settings cache was filled, before the call or between provider opening and
+    the mutation command, leaves zero mutation commands on the IMAP session.

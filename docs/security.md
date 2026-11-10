@@ -737,7 +737,13 @@ recreate it, or rename an agent-filled mailbox into its place.
 The check runs in the shared application mutation path on the resolved account
 before any provider is constructed, again on the freshly opened account, and in
 the classic provider adapter on freshly re-resolved authority before each IMAP
-mutation command. A refusal is a `PermissionError` that names the reserved entry
+mutation command. Each of these resolutions re-reads the legacy TOML file and
+environment instead of the server's cached settings, so a reservation added on
+disk applies to the next check without a restart, and a file that cannot be read
+or parsed refuses the mutation rather than serving the last good policy. No check
+can undo a command already sent to the IMAP server: a change that lands after a
+command was transmitted applies from the next command, and earlier per-message
+results in a batch keep their real outcome. A refusal is a `PermissionError` that names the reserved entry
 and states that nothing changed; no IMAP session is opened. Name matching
 compares hierarchy segments after modified UTF-7 decoding, NFKC normalization,
 invisible-character removal and case folding, with `/` and `.` both treated as

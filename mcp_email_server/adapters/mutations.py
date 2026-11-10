@@ -107,7 +107,8 @@ class ClassicMutationProvider:
         def check() -> None:
             try:
                 current = self._fresh_authority() if self._fresh_authority is not None else account
-            except (ValueError, RuntimeError) as exc:
+            except (ValueError, RuntimeError, OSError) as exc:
+                # Unparseable or unreadable policy fails closed.
                 raise PermissionError("Mutation account authority is unavailable; retry") from exc
             # Fresh authority, immediately before each IMAP mutation command.
             require_unreserved(
@@ -505,7 +506,7 @@ class ClassicMutationProvider:
         if self._fresh_authority is not None:
             try:
                 account = self._fresh_authority()
-            except (ValueError, RuntimeError) as exc:
+            except (ValueError, RuntimeError, OSError) as exc:
                 raise PermissionError("Mutation account authority is unavailable; retry") from exc
             recipients = (
                 tuple(
@@ -554,10 +555,15 @@ class LocalMutationBackend:
         roles: tuple[BindingRole, ...] = (),
         expected_mode: RuntimeMode | None = None,
     ) -> _ResolvedMutationAccount:
+        # ``fresh_legacy`` re-reads legacy TOML and environment policy on every
+        # call instead of the process-wide cached Settings, as the raw executor
+        # does: each focused check and each provider opening sees the policy on
+        # disk now, and an unreadable or invalid file raises instead of serving
+        # the last good copy. Only the selected role's credential is resolved.
         resolved = (
-            resolve_local_account(account_name, roles=roles, expected_mode=expected_mode)
+            resolve_local_account(account_name, roles=roles, expected_mode=expected_mode, fresh_legacy=True)
             if roles
-            else resolve_local_account(account_name, expected_mode=expected_mode)
+            else resolve_local_account(account_name, expected_mode=expected_mode, fresh_legacy=True)
         )
         return _ResolvedMutationAccount(
             account=resolved.account,
