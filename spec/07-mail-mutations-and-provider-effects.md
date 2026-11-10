@@ -339,8 +339,10 @@ read-only `LIST <entry> ""`, the delimiter of the default namespace and of each
 reserved entry's namespace. A rejected or non-unique answer, or a reserved entry
 the discovery did not cover (a reservation added after opening), refuses the
 mutation; a NIL delimiter adds nothing. The application-level checks precede any
-IMAP session and use `/` and `.` only. It is
-intentionally broader than any server's resolution; over-matching only refuses.
+IMAP session and use `/` and `.` only. Matching is
+intentionally conservative within these listed variants; over-matching only
+refuses. It does not canonicalize server-side aliases or namespace synonyms, so
+every server-exposed name of a protected mailbox must be listed.
 A refusal is a `PermissionError` naming the reserved entry, issued before any
 mutation command. A destination named in the request is refused before any
 provider session opens; destination discovery (Drafts, Junk, Archive, Trash)

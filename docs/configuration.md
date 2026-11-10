@@ -379,8 +379,10 @@ that exposes the protected mailbox.
 
 Entries are mailbox paths, not label names: write `Labels/Approved`, not
 `Approved`. A child of a reserved mailbox is reserved too. Matching is
-deliberately broader than the server's own name resolution, so another spelling
-of the same mailbox cannot slip through. Both the entry and the requested
+deliberately conservative: it covers the spelling and hierarchy variants listed
+here, and over-matching only refuses. It does not resolve server-side aliases or
+namespace synonyms, so if the server exposes the protected mailbox under another
+name, list that name too. Both the entry and the requested
 mailbox are compared segment by segment after modified UTF-7 decoding (the raw
 spelling is compared as well), Unicode NFKC normalization, removal of invisible
 format characters, and case folding; `/`, `.`, and the hierarchy delimiter
