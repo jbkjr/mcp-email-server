@@ -68,6 +68,7 @@ from mcp_email_server.application.mutations import (
     normalize_thread_message_ids,
     validate_mailbox_name,
 )
+from mcp_email_server.application.reserved_mailboxes import ReservedMailboxError
 from mcp_email_server.config import (
     EmailServer,
     EmailSettings,
@@ -1553,6 +1554,10 @@ class EmailClient:
         imap_non_ascii_search: ImapNonAsciiSearchMode | None = None,
     ):
         self.mutation_guard: Callable[[], None] | None = None
+        # Installed by the mutation adapter for effects whose destination is only
+        # chosen inside the IMAP session (the Sent copy): it checks the actual
+        # mailbox against fresh reservation policy immediately before APPEND.
+        self.mutation_destination_guard: Callable[[str], None] | None = None
         self.email_server = email_server
         self.imap_non_ascii_search: ImapNonAsciiSearchMode | None = imap_non_ascii_search
         raw_sender = sender or email_server.user_name
@@ -1585,6 +1590,10 @@ class EmailClient:
     def _check_mutation_authority(self) -> None:
         if self.mutation_guard is not None:
             self.mutation_guard()
+
+    def _check_mutation_destination(self, mailbox: str) -> None:
+        if self.mutation_destination_guard is not None:
+            self.mutation_destination_guard(mailbox)
 
     def _non_ascii_search_encoding(self) -> ImapNonAsciiSearchEncoding:
         """Choose literal or quoted non-ASCII SEARCH text for this account."""
@@ -4050,6 +4059,12 @@ class EmailClient:
                     continue
                 try:
                     self._check_mutation_authority()
+                    # The candidate actually selected, configured, discovered or
+                    # fallback, is checked here; a refusal ends the copy without
+                    # trying another name and never touches the accepted delivery.
+                    self._check_mutation_destination(folder)
+                except ReservedMailboxError:
+                    return SentCopyMutationOutcome("failed", folder, "reserved-mailbox")
                 except PermissionError:
                     return SentCopyMutationOutcome("failed", folder, "mutation-policy")
                 try:

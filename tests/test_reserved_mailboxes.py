@@ -52,6 +52,8 @@ from mcp_email_server.application.mutations import (
     ReplySource,
     SaveDraftCommand,
     SaveToMailboxCommand,
+    SendCommand,
+    SentCopyMutationOutcome,
     TargetMutationOutcome,
 )
 from mcp_email_server.application.protocol import ProtocolCommandService, ProtocolFailure, ProtocolRequest
@@ -1027,3 +1029,112 @@ async def test_an_unchanged_unreserved_policy_still_reaches_imap(scratch_config)
 
     assert result.targets("succeeded") == ["1"]
     assert [call.args for call in imap.uid.await_args_list] == [("copy", "1", '"Labels/Send"')]
+
+
+# R1: the Sent copy after an accepted send never lands in a reserved mailbox
+
+
+def _send_toml(reserved: str, sent_folder_name: str | None) -> str:
+    folder = f'sent_folder_name = "{sent_folder_name}"\n' if sent_folder_name is not None else ""
+    return f"""
+credential_storage = "plaintext"
+
+[[emails]]
+account_name = "owner"
+full_name = "Owner"
+email_address = "owner@example.test"
+save_to_sent = true
+{folder}reserved_mailboxes = ["{reserved}"]
+
+[emails.incoming]
+user_name = "owner"
+password = "synthetic"
+host = "127.0.0.1"
+port = 1143
+use_ssl = false
+
+[emails.outgoing]
+user_name = "owner"
+password = "synthetic"
+host = "127.0.0.1"
+port = 1025
+use_ssl = false
+"""
+
+
+def _smtp_session() -> AsyncMock:
+    smtp = AsyncMock()
+    smtp.__aenter__.return_value = smtp
+    smtp.__aexit__.return_value = False
+    smtp.supports_extension = MagicMock(return_value=True)
+    return smtp
+
+
+def _sent_copy_imap(listed: list[bytes]) -> AsyncMock:
+    imap = _mock_imap()
+    imap.list = AsyncMock(return_value=("OK", listed))
+    imap.append = AsyncMock(return_value=("OK", []))
+    return imap
+
+
+_SENT_ROUTES = [
+    # The configured Sent mailbox is the reserved one.
+    pytest.param("Labels/Send", "Labels/Send", [], "Labels/Send", id="configured"),
+    # The server advertises the reserved mailbox as \Sent.
+    pytest.param("Labels/Send", None, [b'(\\Sent) "/" "Labels/Send"'], "Labels/Send", id="discovered"),
+    # Nothing configured or advertised: the first fallback name is reserved.
+    pytest.param("Sent", None, [], "Sent", id="fallback"),
+]
+
+
+@pytest.mark.parametrize(("reserved", "sent_folder_name", "listed", "selected"), _SENT_ROUTES)
+async def test_the_sent_copy_is_never_appended_to_a_reserved_mailbox(
+    scratch_config, reserved: str, sent_folder_name: str | None, listed: list[bytes], selected: str
+) -> None:
+    _write_config(_send_toml(reserved, sent_folder_name))
+    imap = _sent_copy_imap(listed)
+    smtp = _smtp_session()
+
+    with _fake_imap_connections(imap), patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await _real_services().send.execute(SendCommand("owner", ("friend@example.test",), "Hi", "Body"))
+
+    # Delivery is authoritative and reported as such; nothing is resent.
+    smtp.data.assert_awaited_once()
+    assert result.recipients("succeeded") == ["friend@example.test"]
+    assert result.message_id
+    # The copy is refused at the selected candidate, before APPEND.
+    assert result.sent_copy == SentCopyMutationOutcome("failed", selected, "reserved-mailbox")
+    imap.append.assert_not_awaited()
+    assert _mutation_commands(imap) == []
+
+
+async def test_the_send_tool_reports_delivery_and_the_refused_copy(scratch_config, monkeypatch) -> None:
+    _write_config(_send_toml("Labels/Send", "Labels/Send"))
+    imap = _sent_copy_imap([])
+    smtp = _smtp_session()
+    monkeypatch.setattr(app_module, "get_application_runtime", lambda: SimpleNamespace(mutations=_real_services()))
+
+    with _fake_imap_connections(imap), patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await app_module.mcp.call_tool(
+            "send_email",
+            {"account_name": "owner", "recipients": ["friend@example.test"], "subject": "Hi", "body": "Body"},
+        )
+
+    text = str(result)
+    assert "succeeded: friend@example.test" in text
+    assert "sent-copy: failed (Labels/Send; reserved-mailbox)" in text
+    smtp.data.assert_awaited_once()
+    assert _mutation_commands(imap) == []
+
+
+async def test_an_unreserved_sent_mailbox_still_receives_the_copy(scratch_config) -> None:
+    _write_config(_send_toml("Labels/Send", None))
+    imap = _sent_copy_imap([b'(\\Sent) "/" "Sent"'])
+    smtp = _smtp_session()
+
+    with _fake_imap_connections(imap), patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp):
+        result = await _real_services().send.execute(SendCommand("owner", ("friend@example.test",), "Hi", "Body"))
+
+    assert result.sent_copy == SentCopyMutationOutcome("succeeded", "Sent")
+    imap.append.assert_awaited_once()
+    assert imap.append.await_args.kwargs["mailbox"] == '"Sent"'

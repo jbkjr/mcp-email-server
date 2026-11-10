@@ -351,6 +351,10 @@ that would place a message in it or change its shape:
   the destination is reserved;
 - `save_to_mailbox`, `save_draft`, and `reply_email` with `draft_mailbox`, when
   the message would be saved there;
+- the Sent copy that `send_email`, `forward_email`, and a sending `reply_email`
+  save after delivery, when the configured, discovered, or fallback Sent mailbox
+  chosen for it is reserved. The copy reports `failed (reserved-mailbox)`; the
+  delivery already happened, is reported as such, and is not repeated;
 - `create_mailbox`, `create_folder`, `create_label`, `delete_folder`,
   `delete_label`, and `rename_folder` (old or new name), when the mailbox is
   reserved, is inside a reserved mailbox, or contains one;

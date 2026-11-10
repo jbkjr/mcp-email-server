@@ -300,7 +300,12 @@ independently of grants:
 - No workflow may place a message in a reserved mailbox or a mailbox inside one:
   copy, label application, move (including a discovered Junk destination),
   archive and trash-move destinations, caller-selected and reply-draft APPEND,
-  and draft APPEND to the configured or discovered Drafts mailbox.
+  draft APPEND to the configured or discovered Drafts mailbox, and the Sent-copy
+  APPEND after accepted delivery. The Sent candidate (configured, `\Sent`
+  discovered, or fallback) is chosen inside the provider session, so the adapter
+  checks the selected candidate on fresh authority immediately before APPEND; a
+  refusal reports the copy `failed` with `reserved-mailbox`, tries no other
+  candidate, and leaves the authoritative delivery outcome unchanged.
 - No mailbox-shape workflow (create, delete, either name of a rename, and
   `create_mailbox`) may act on a reserved mailbox, a mailbox inside one, or a
   mailbox that contains one.
@@ -711,7 +716,9 @@ enter public errors.
     and label-versus-path variants match; that label removal and mutations whose
     source is reserved still reach the provider; that another account and an
     empty list are unaffected; that environment replacement of a stored account
-    keeps its list unless the variable is set; and that raw IMAP execution is
+    keeps its list unless the variable is set; that a configured, discovered,
+    or fallback Sent mailbox under a reservation receives no APPEND while
+    delivery is still reported; and that raw IMAP execution is
     refused for a reserving account, including mid-session, while SMTP
     admission is unchanged. Scratch-file tests through the real legacy resolver
     prove that adding a reservation to, or corrupting, the policy file after the

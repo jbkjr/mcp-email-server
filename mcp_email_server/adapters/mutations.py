@@ -104,15 +104,19 @@ class ClassicMutationProvider:
         destinations: tuple[str, ...] = (),
         shapes: tuple[str, ...] = (),
     ) -> None:
-        def check() -> None:
+        def check(selected: tuple[str, ...] = ()) -> None:
             try:
                 current = self._fresh_authority() if self._fresh_authority is not None else account
             except (ValueError, RuntimeError, OSError) as exc:
                 # Unparseable or unreadable policy fails closed.
                 raise PermissionError("Mutation account authority is unavailable; retry") from exc
             # Fresh authority, immediately before each IMAP mutation command.
+            # ``selected`` is a destination the client chose inside its session.
             require_unreserved(
-                current.account_name, current.reserved_mailboxes, destinations=destinations, shapes=shapes
+                current.account_name,
+                current.reserved_mailboxes,
+                destinations=(*destinations, *selected),
+                shapes=shapes,
             )
             if grant == "append" and isinstance(command, SaveToMailboxCommand):
                 require_append_permissions(current.allowed_mutations, command.flags)
@@ -131,6 +135,7 @@ class ClassicMutationProvider:
 
         check()
         self._handler.incoming_client.mutation_guard = check
+        self._handler.incoming_client.mutation_destination_guard = lambda mailbox: check((mailbox,))
         if self._handler.outgoing_client is not None:
             self._handler.outgoing_client.mutation_guard = check
 

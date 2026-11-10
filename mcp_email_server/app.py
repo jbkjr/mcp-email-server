@@ -186,6 +186,7 @@ _PUBLIC_SEND_DETAILS = frozenset({
 _PUBLIC_APPEND_DETAILS = frozenset({
     "append-unknown",
     "provider-timeout",
+    "reserved-mailbox",
     "utf8-append-unsupported",
 })
 
@@ -397,6 +398,11 @@ _RESERVED_DESTINATION_NOTE = (
 _RESERVED_SHAPE_NOTE = (
     " Refused, with nothing changed, when the mailbox is, is inside, or contains one of the account's "
     "reserved_mailboxes, which the account owner keeps for their own use."
+)
+# The Sent mailbox is chosen after delivery, so a reserved one fails only the copy.
+_RESERVED_SENT_COPY_NOTE = (
+    " If the Sent mailbox is or is inside one of the account's reserved_mailboxes, no Sent copy is saved and "
+    "the copy reports failed (reserved-mailbox); delivery is unaffected and is not repeated."
 )
 
 
@@ -704,7 +710,7 @@ async def list_allowed_senders() -> PolicyDiscoveryResult:
         "delivery reports per-recipient succeeded/failed/unknown status and reports the independent Sent-copy "
         "outcome separately; ambiguous effects are not retried automatically. The response names the delivered "
         "message's RFC Message-Id once the provider accepts the message data, and reports no identifier for an "
-        "ambiguous delivery."
+        "ambiguous delivery." + _RESERVED_SENT_COPY_NOTE
     ),
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -829,7 +835,7 @@ async def send_email(
         "SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the independent "
         "Sent-copy outcome separately; ambiguous effects are not retried automatically. The response names the "
         "delivered message's RFC Message-Id once the provider accepts the message data, and reports no "
-        "identifier for an ambiguous delivery."
+        "identifier for an ambiguous delivery." + _RESERVED_SENT_COPY_NOTE
     ),
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )
@@ -915,6 +921,7 @@ async def forward_email(
         "Partial or ambiguous SMTP delivery reports per-recipient succeeded/failed/unknown status and reports the "
         "independent Sent-copy outcome separately; ambiguous effects are not retried automatically. The response "
         "names the delivered message's RFC Message-Id once the provider accepts the message data."
+        + _RESERVED_SENT_COPY_NOTE
     ),
     annotations=_NONDESTRUCTIVE_REMOTE_MUTATION,
 )

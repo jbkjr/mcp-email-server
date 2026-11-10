@@ -728,7 +728,8 @@ mail could then produce the owner's signal without the owner.
 `reserved_mailboxes` (see [configuration](configuration.md#reserved-mailboxes))
 lists those mailboxes per account. For a listed mailbox the server refuses every
 mutation that would place a message in it (COPY, MOVE, APPEND, label
-application, and the discovered Junk, Archive, Trash and Drafts destinations) and
+application, the discovered Junk, Archive, Trash and Drafts destinations, and
+the Sent-copy APPEND after a send) and
 every mailbox-shape change (CREATE, DELETE, RENAME from or to) of the mailbox, of
 a mailbox inside it, or of a mailbox that contains it. A rename away or a parent
 delete would otherwise let an agent remove the reserved mailbox and later
@@ -759,10 +760,15 @@ than filtered per command. Raw SMTP never writes a mailbox and is unchanged.
 Limits: the reservation binds only this server process. It does not stop the
 account owner's own mail clients (which is the point), other IMAP clients, or a
 server instance whose configuration omits the list. It is a legacy-mode setting:
-managed accounts reserve nothing and legacy import does not carry it. The
-Sent-copy APPEND after a successful send targets the configured or discovered
-Sent mailbox, which is not checked; do not reserve your Sent mailbox. Flag and
-tag changes on messages already inside a reserved mailbox are not restricted.
+managed accounts reserve nothing and legacy import does not carry it.
+
+The Sent copy is a separate APPEND made after SMTP has accepted the message, to a
+Sent mailbox chosen inside that IMAP session (configured, discovered by
+`\Sent`, or a fallback name). The adapter checks the candidate it actually
+selected against fresh policy immediately before the APPEND. A reserved
+candidate ends the copy with `failed (reserved-mailbox)` and no other name is
+tried; delivery is already authoritative, is reported unchanged, and is never
+resent.
 
 ## Attachment access
 

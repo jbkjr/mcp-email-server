@@ -57,6 +57,12 @@ destination, or ask the account owner. `email_command` IMAP reports
 `policy_conflict` for such an account. See
 [Reserved mailboxes](security.md#reserved-mailboxes).
 
+`sent-copy: failed (<mailbox>; reserved-mailbox)` after a send means the message
+was delivered as reported, but the Sent mailbox chosen for the local copy is
+reserved, so no copy was saved. Do not resend. Set `sent_folder_name` to an
+unreserved mailbox, or `save_to_sent = false` if the server files sent mail
+itself.
+
 ## Draft mailbox is missing or ambiguous
 
 `save_draft` uses the account's `drafts_mailbox` or a unique special-use
